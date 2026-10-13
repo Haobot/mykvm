@@ -41,8 +41,8 @@ use windows::Win32::Graphics::Gdi::CreateSolidBrush;
 use windows::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{
-    OleInitialize, RegisterDragDrop, ReleaseStgMedium, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
-    DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
+    IDropTarget, IDropTarget_Impl, OleInitialize, RegisterDragDrop, ReleaseStgMedium, CF_HDROP,
+    DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
@@ -336,10 +336,7 @@ impl IDropTarget_Impl for EdgeDropTarget_Impl {
             disarm();
             return Ok(());
         }
-        let files = pdataobj
-            .as_ref()
-            .map(read_hdrop_files)
-            .unwrap_or_default();
+        let files = pdataobj.as_ref().map(read_hdrop_files).unwrap_or_default();
         if files.is_empty() {
             HOLD_CONSUMED.store(false, std::sync::atomic::Ordering::Relaxed);
             log::info!("edge catcher: DragEnter with no files (not a file drag)");
@@ -403,10 +400,7 @@ impl IDropTarget_Impl for EdgeDropTarget_Impl {
     ) -> windows::core::Result<()> {
         // Fallback: if the user actually released ON the edge band (no cross),
         // still deliver the files.
-        let files = pdataobj
-            .as_ref()
-            .map(read_hdrop_files)
-            .unwrap_or_default();
+        let files = pdataobj.as_ref().map(read_hdrop_files).unwrap_or_default();
         if !pdweffect.is_null() {
             unsafe { *pdweffect = DROPEFFECT_COPY };
         }
@@ -415,7 +409,11 @@ impl IDropTarget_Impl for EdgeDropTarget_Impl {
         disarm();
         if let (Some(device_id), Some(sink)) = (device_id, SINK.get()) {
             if !files.is_empty() {
-                log::info!("edge catcher: Drop delivered {} file(s) -> {}", files.len(), device_id);
+                log::info!(
+                    "edge catcher: Drop delivered {} file(s) -> {}",
+                    files.len(),
+                    device_id
+                );
                 sink(device_id, files);
             }
         }

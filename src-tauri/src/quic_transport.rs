@@ -406,7 +406,9 @@ async fn run_transport(
                     let outcome = tokio::time::timeout(
                         Duration::from_secs(5),
                         send_stream_task(&endpoint, &connections, &health, peer, payload),
-                    ).await.unwrap_or_else(|_| Err("QUIC stream send timed out".into()));
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("QUIC stream send timed out".into()));
                     if let Err(error) = &outcome {
                         log::warn!("QUIC stream send failed: {error}");
                     }
@@ -761,9 +763,13 @@ fn spawn_stream_reader(
                     };
                     let on_stream = Arc::clone(&on_stream);
                     tokio::spawn(async move {
-                        let payload = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(MAX_STREAM_BYTES))
-                            .await.map_err(|error| error.to_string())
-                            .and_then(|result| result.map_err(|error| error.to_string()));
+                        let payload = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            recv.read_to_end(MAX_STREAM_BYTES),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
                         match payload {
                             Ok(payload) => {
                                 // Clipboard tools, image decoding and file writes are blocking.
@@ -1242,7 +1248,10 @@ mod tests {
             PROTOCOL_VERSION,
         );
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !sender.send_datagram(peer.clone(), b"warm".to_vec()).unwrap() {
+        while !sender
+            .send_datagram(peer.clone(), b"warm".to_vec())
+            .unwrap()
+        {
             assert!(Instant::now() < deadline, "connection never became ready");
             thread::sleep(Duration::from_millis(20));
         }

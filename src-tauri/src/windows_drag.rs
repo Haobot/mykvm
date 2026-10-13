@@ -19,26 +19,26 @@
 //! the drop target — needs verification on real Windows hardware.
 #![cfg(target_os = "windows")]
 
+use crate::drag_buffer::FileBuffer;
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use crate::drag_buffer::FileBuffer;
 use std::time::{Duration, Instant};
 
 use windows::core::{implement, PCWSTR};
 use windows::Win32::Foundation::{
     DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
     DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_ABORT, E_NOTIMPL, HGLOBAL, OLE_E_ADVISENOTSUPPORTED,
-    S_OK, STG_E_ACCESSDENIED,
-};
-use windows::Win32::System::Com::{
-    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, ISequentialStream_Impl,
-    IStream, IStream_Impl, DVASPECT_CONTENT, FORMATETC, LOCKTYPE, STATFLAG, STATSTG, STGC, STGMEDIUM,
-    STGMEDIUM_0, STGTY_STREAM, STREAM_SEEK, STREAM_SEEK_CUR, STREAM_SEEK_END, STREAM_SEEK_SET,
-    TYMED_HGLOBAL, TYMED_ISTREAM,
+    STG_E_ACCESSDENIED, S_OK,
 };
 use windows::Win32::System::Com::IBindCtx;
+use windows::Win32::System::Com::{
+    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
+    ISequentialStream_Impl, IStream, IStream_Impl, DVASPECT_CONTENT, FORMATETC, LOCKTYPE, STATFLAG,
+    STATSTG, STGC, STGMEDIUM, STGMEDIUM_0, STGTY_STREAM, STREAM_SEEK, STREAM_SEEK_CUR,
+    STREAM_SEEK_END, STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
+};
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::{
@@ -118,7 +118,10 @@ fn session_for(transfer_id: &str) -> Option<Arc<DragSession>> {
 /// Clears the slot only if it still holds `session` (a newer drag may own it).
 fn clear_session(session: &Arc<DragSession>) {
     if let Ok(mut slot) = session_slot().lock() {
-        if slot.as_ref().is_some_and(|active| Arc::ptr_eq(active, session)) {
+        if slot
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, session))
+        {
             *slot = None;
         }
     }
@@ -208,9 +211,15 @@ pub fn finish_file(transfer_id: &str) -> bool {
 }
 
 pub(crate) fn abort_file(transfer_id: &str) -> bool {
-    let Some(session) = session_for(transfer_id) else { return false; };
-    if let Ok(mut cancelled) = session.cancelled.lock() { *cancelled = true; }
-    for buffer in &session.order { buffer.abort(); }
+    let Some(session) = session_for(transfer_id) else {
+        return false;
+    };
+    if let Ok(mut cancelled) = session.cancelled.lock() {
+        *cancelled = true;
+    }
+    for buffer in &session.order {
+        buffer.abort();
+    }
     inject_left_button(false);
     true
 }
@@ -245,8 +254,15 @@ pub fn cancel_session() {
 /// Begin a drag session and spawn the DoDragDrop thread. Returns false if a
 /// drag is already in flight or `files` is empty.
 pub(crate) fn start_drag_session(files: Vec<DragFileMeta>, mode: NativeDragMode) -> bool {
-    if files.is_empty() || files.len() > crate::folder_transfer::MAX_ENTRIES
-        || files.iter().any(|file| file.name.encode_utf16().count() >= 260 || crate::folder_transfer::validate_relative_path(std::path::Path::new(&file.name)).is_err() || (file.directory && file.size != 0)) {
+    if files.is_empty()
+        || files.len() > crate::folder_transfer::MAX_ENTRIES
+        || files.iter().any(|file| {
+            file.name.encode_utf16().count() >= 260
+                || crate::folder_transfer::validate_relative_path(std::path::Path::new(&file.name))
+                    .is_err()
+                || (file.directory && file.size != 0)
+        })
+    {
         return false;
     }
     // One drag at a time, and the controller starts one only after the last
@@ -275,7 +291,10 @@ pub(crate) fn start_drag_session(files: Vec<DragFileMeta>, mode: NativeDragMode)
     for meta in files {
         let buffer = match FileBuffer::new(meta.name, meta.size, meta.directory) {
             Ok(buffer) => Arc::new(buffer),
-            Err(error) => { log::warn!("native drag spool failed: {error}"); return false; }
+            Err(error) => {
+                log::warn!("native drag spool failed: {error}");
+                return false;
+            }
         };
         by_transfer_id.insert(meta.transfer_id, Arc::clone(&buffer));
         order.push(buffer);
@@ -349,7 +368,11 @@ fn run_drag_thread(session: Arc<DragSession>) {
 
         let progress_session = Arc::clone(&session);
         let overlay = crate::windows_drag_overlay::start(
-            session.order.first().map(|file| file.name.as_str()).unwrap_or(""),
+            session
+                .order
+                .first()
+                .map(|file| file.name.as_str())
+                .unwrap_or(""),
             Arc::new(move || progress_session.progress()),
         );
 
@@ -540,7 +563,12 @@ impl FileReadStream {
 }
 
 impl ISequentialStream_Impl for FileReadStream_Impl {
-    fn Read(&self, pv: *mut core::ffi::c_void, cb: u32, pcbread: *mut u32) -> windows::core::HRESULT {
+    fn Read(
+        &self,
+        pv: *mut core::ffi::c_void,
+        cb: u32,
+        pcbread: *mut u32,
+    ) -> windows::core::HRESULT {
         let mut pos = match self.pos.lock() {
             Ok(pos) => pos,
             Err(_) => return E_NOTIMPL,
@@ -580,7 +608,10 @@ impl IStream_Impl for FileReadStream_Impl {
         dworigin: STREAM_SEEK,
         plibnewposition: *mut u64,
     ) -> windows::core::Result<()> {
-        let mut pos = self.pos.lock().map_err(|_| windows::core::Error::from(E_NOTIMPL))?;
+        let mut pos = self
+            .pos
+            .lock()
+            .map_err(|_| windows::core::Error::from(E_NOTIMPL))?;
         let base = match dworigin {
             STREAM_SEEK_SET => 0i64,
             STREAM_SEEK_CUR => *pos as i64,
@@ -613,7 +644,10 @@ impl IStream_Impl for FileReadStream_Impl {
         let mut chunk = vec![0u8; 64 * 1024];
         while remaining > 0 {
             let want = remaining.min(chunk.len() as u64) as usize;
-            let pos = *self.pos.lock().map_err(|_| windows::core::Error::from(E_NOTIMPL))?;
+            let pos = *self
+                .pos
+                .lock()
+                .map_err(|_| windows::core::Error::from(E_NOTIMPL))?;
             let n = match self.buffer.read_at(pos, &mut chunk[..want]) {
                 Ok(0) => break,
                 Ok(n) => n,
@@ -658,7 +692,12 @@ impl IStream_Impl for FileReadStream_Impl {
         Err(windows::core::Error::from(E_NOTIMPL))
     }
 
-    fn UnlockRegion(&self, _liboffset: u64, _cb: u64, _dwlocktype: u32) -> windows::core::Result<()> {
+    fn UnlockRegion(
+        &self,
+        _liboffset: u64,
+        _cb: u64,
+        _dwlocktype: u32,
+    ) -> windows::core::Result<()> {
         Err(windows::core::Error::from(E_NOTIMPL))
     }
 
@@ -674,7 +713,10 @@ impl IStream_Impl for FileReadStream_Impl {
     }
 
     fn Clone(&self) -> windows::core::Result<IStream> {
-        let pos = *self.pos.lock().map_err(|_| windows::core::Error::from(E_NOTIMPL))?;
+        let pos = *self
+            .pos
+            .lock()
+            .map_err(|_| windows::core::Error::from(E_NOTIMPL))?;
         let stream: IStream = FileReadStream {
             buffer: Arc::clone(&self.buffer),
             pos: Mutex::new(pos),
@@ -820,21 +862,15 @@ impl IDataObject_Impl for DragDataObject_Impl {
         _advf: u32,
         _padvsink: windows::core::Ref<'_, IAdviseSink>,
     ) -> windows::core::Result<u32> {
-        Err(windows::core::Error::from(
-            OLE_E_ADVISENOTSUPPORTED,
-        ))
+        Err(windows::core::Error::from(OLE_E_ADVISENOTSUPPORTED))
     }
 
     fn DUnadvise(&self, _dwconnection: u32) -> windows::core::Result<()> {
-        Err(windows::core::Error::from(
-            OLE_E_ADVISENOTSUPPORTED,
-        ))
+        Err(windows::core::Error::from(OLE_E_ADVISENOTSUPPORTED))
     }
 
     fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
-        Err(windows::core::Error::from(
-            OLE_E_ADVISENOTSUPPORTED,
-        ))
+        Err(windows::core::Error::from(OLE_E_ADVISENOTSUPPORTED))
     }
 }
 
@@ -869,7 +905,10 @@ impl IDataObjectAsyncCapability_Impl for DragDataObject_Impl {
         _pbcreserved: windows::core::Ref<'_, IBindCtx>,
         _dweffects: u32,
     ) -> windows::core::Result<()> {
-        log::info!("native drag: drop target finished extracting (hr=0x{:08X})", hresult.0);
+        log::info!(
+            "native drag: drop target finished extracting (hr=0x{:08X})",
+            hresult.0
+        );
         self.session.operation_done.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -892,13 +931,27 @@ fn build_file_group_descriptor(files: &[Arc<FileBuffer>]) -> windows::core::Resu
         let descriptors = ptr.add(header) as *mut FILEDESCRIPTORW;
         for (i, file) in files.iter().enumerate() {
             let mut descriptor = FILEDESCRIPTORW {
-                dwFlags: FD_ATTRIBUTES.0 as u32 | if file.directory { 0 } else { FD_FILESIZE.0 as u32 },
-                dwFileAttributes: if file.directory { windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY } else { windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL },
+                dwFlags: FD_ATTRIBUTES.0 as u32
+                    | if file.directory {
+                        0
+                    } else {
+                        FD_FILESIZE.0 as u32
+                    },
+                dwFileAttributes: if file.directory {
+                    windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL
+                },
                 nFileSizeHigh: (file.size >> 32) as u32,
                 nFileSizeLow: (file.size & 0xFFFF_FFFF) as u32,
                 ..Default::default()
             };
-            let name: Vec<u16> = file.name.replace('/', "\\").encode_utf16().take(259).collect();
+            let name: Vec<u16> = file
+                .name
+                .replace('/', "\\")
+                .encode_utf16()
+                .take(259)
+                .collect();
             for (j, unit) in name.iter().enumerate() {
                 descriptor.cFileName[j] = *unit;
             }

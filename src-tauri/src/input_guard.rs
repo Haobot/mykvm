@@ -169,19 +169,30 @@ pub(crate) fn spawn_monitor(
             let remote = remote_active.load(Ordering::Relaxed);
             // Window/AX queries may block on another app. Keep them on this
             // monitor thread, never on the native input callback/capture loop.
-            let foreground = if cfg!(target_os = "windows") || (!protection.local_only
-                && !remote
-                && (protection.protect_fullscreen || !protection.blocked_applications.is_empty()))
+            let foreground = if cfg!(target_os = "windows")
+                || (!protection.local_only
+                    && !remote
+                    && (protection.protect_fullscreen
+                        || !protection.blocked_applications.is_empty()))
             {
                 foreground_application()
             } else {
                 ForegroundApplication::default()
             };
-            guard.screenshot_active.store(foreground.fullscreen && foreground.names.iter().any(|name| name.eq_ignore_ascii_case("snipaste.exe")), Ordering::Relaxed);
+            guard.screenshot_active.store(
+                foreground.fullscreen
+                    && foreground
+                        .names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case("snipaste.exe")),
+                Ordering::Relaxed,
+            );
             #[cfg(target_os = "windows")]
             if last_snipaste_check.elapsed() >= Duration::from_secs(2) {
                 last_snipaste_check = std::time::Instant::now();
-                guard.snipaste_running.store(platform::snipaste_is_running(), Ordering::Relaxed);
+                guard
+                    .snipaste_running
+                    .store(platform::snipaste_is_running(), Ordering::Relaxed);
             }
             if stop.load(Ordering::Relaxed) {
                 break;

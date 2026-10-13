@@ -101,7 +101,12 @@ unsafe fn run(file_name: &str, mode: &AtomicU8, progress: &dyn Fn() -> f32) {
     }
     let icon = file_icon_pixels(file_name);
     let mut shown_progress = progress();
-    render(hwnd, icon.as_deref(), shown_progress, position(mode.load(Ordering::Relaxed)));
+    render(
+        hwnd,
+        icon.as_deref(),
+        shown_progress,
+        position(mode.load(Ordering::Relaxed)),
+    );
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     SetTimer(hwnd, 1, 15, None);
 
@@ -159,7 +164,14 @@ unsafe fn render(hwnd: HWND, icon: Option<&[u32]>, progress: f32, at: (i32, i32)
     let memory = CreateCompatibleDC(screen);
     let mut info = bitmap_info(WIDTH, HEIGHT);
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let bitmap = CreateDIBSection(memory, &mut info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+    let bitmap = CreateDIBSection(
+        memory,
+        &mut info,
+        DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
     if bitmap.is_null() || bits.is_null() {
         DeleteDC(memory);
         ReleaseDC(std::ptr::null_mut(), screen);
@@ -170,7 +182,10 @@ unsafe fn render(hwnd: HWND, icon: Option<&[u32]>, progress: f32, at: (i32, i32)
     pixels.fill(0);
     paint(pixels, icon, progress);
 
-    let size = SIZE { cx: WIDTH, cy: HEIGHT };
+    let size = SIZE {
+        cx: WIDTH,
+        cy: HEIGHT,
+    };
     let source = POINT { x: 0, y: 0 };
     let destination = POINT { x: at.0, y: at.1 };
     let blend = BLENDFUNCTION {
@@ -179,7 +194,17 @@ unsafe fn render(hwnd: HWND, icon: Option<&[u32]>, progress: f32, at: (i32, i32)
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
-    UpdateLayeredWindow(hwnd, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
+    UpdateLayeredWindow(
+        hwnd,
+        screen,
+        &destination,
+        &size,
+        memory,
+        &source,
+        0,
+        &blend,
+        ULW_ALPHA,
+    );
 
     SelectObject(memory, previous);
     DeleteObject(bitmap);

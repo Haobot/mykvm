@@ -275,8 +275,8 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) -> R
     use windows_sys::Win32::UI::{
         Input::KeyboardAndMouse::{
             INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-            MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
         },
         WindowsAndMessaging::{XBUTTON1, XBUTTON2},
     };
@@ -368,8 +368,8 @@ pub fn inject_scroll(delta_x: i32, delta_y: i32) -> Result<(), u32> {
 
 pub fn inject_key(key_code: u16, down: bool) -> Result<(), u32> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        MapVirtualKeyW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
+        MapVirtualKeyW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
     };
 
     let mut dw_flags = if down { 0 } else { KEYEVENTF_KEYUP };
