@@ -2732,33 +2732,42 @@ fn send_peer_request(state: &AppRuntime, device_id: &str, protocol: &str) -> Res
 /// Ask an online peer (a client, or the paired controller) for its recent log.
 /// The log arrives asynchronously in the "MyKVM Remote Logs" folder (which this
 /// opens); returns its path.
+///
+/// 网络请求在线程池执行（分级优化方案 1.6）：send_peer_request 最长阻塞 6s，
+/// 不允许占用 Tauri 命令线程。
 #[tauri::command]
-fn fetch_client_log(
-    device_id: String,
-    state: tauri::State<'_, AppRuntime>,
-) -> Result<String, String> {
-    let state = state.inner();
-    if !state.layout_snapshot().file_transfer_enabled {
-        return Err("文件传输未开启，无法拉取日志。".into());
-    }
-    send_peer_request(state, &device_id, LOG_REQUEST_PROTOCOL)
-        .map_err(|error| format!("拉取日志失败: {error}"))?;
+async fn fetch_client_log(app: tauri::AppHandle, device_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppRuntime>();
+        let state = state.inner();
+        if !state.layout_snapshot().file_transfer_enabled {
+            return Err("文件传输未开启，无法拉取日志。".into());
+        }
+        send_peer_request(state, &device_id, LOG_REQUEST_PROTOCOL)
+            .map_err(|error| format!("拉取日志失败: {error}"))?;
 
-    let dir = client_log_dir(&state.app_handle)?;
-    let _ = fs::create_dir_all(&dir);
-    let _ = open_external_path(&dir);
-    Ok(dir.to_string_lossy().into_owned())
+        let dir = client_log_dir(&state.app_handle)?;
+        let _ = fs::create_dir_all(&dir);
+        let _ = open_external_path(&dir);
+        Ok(dir.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| format!("拉取日志任务失败: {error}"))?
 }
 
 /// Ask a client to update itself; it installs the release its own updater
 /// finds and restarts, while the controller keeps control through the hand-off.
+///
+/// 网络请求在线程池执行（分级优化方案 1.6），命令线程不等待远端应答。
 #[tauri::command]
-fn request_client_update(
-    device_id: String,
-    state: tauri::State<'_, AppRuntime>,
-) -> Result<(), String> {
-    send_peer_request(state.inner(), &device_id, REMOTE_UPDATE_PROTOCOL)
-        .map_err(|error| format!("请求客户端更新失败: {error}"))
+async fn request_client_update(app: tauri::AppHandle, device_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppRuntime>();
+        send_peer_request(state.inner(), &device_id, REMOTE_UPDATE_PROTOCOL)
+            .map_err(|error| format!("请求客户端更新失败: {error}"))
+    })
+    .await
+    .map_err(|error| format!("请求客户端更新任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -2894,92 +2903,114 @@ async fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<Discovery
     Ok(state.discovery_status())
 }
 
+/// 单点探测内部最多等待 1.8s 的 UDP 应答（分级优化方案 1.6），
+/// 在线程池执行，命令线程不等待。
 #[tauri::command]
-fn probe_lan_peer(host: String, state: tauri::State<'_, AppRuntime>) -> Result<LanPeer, String> {
-    state.start_discovery()?;
-    let layout = state
-        .layout
-        .lock()
-        .map_err(|_| "layout state lock poisoned".to_string())?
-        .clone();
-    let mut local_peer = local_peer_from_layout(&layout);
-    if let Some(transport) = state.quic_transport_handle() {
-        apply_transport_to_peer(&mut local_peer, &transport);
-    }
-    let peer = probe_for_peer(&local_peer, &host, discovery_base_port(&layout))?;
-    merge_peer(&state.peers, peer.clone());
-    sync_layout_peer_presence(&state.layout, &state.peers);
-    Ok(peer)
-}
-
-#[tauri::command]
-fn request_lan_pairing(
-    host: String,
-    state: tauri::State<'_, AppRuntime>,
-) -> Result<LanPeer, String> {
-    state.start_discovery()?;
-    let layout = state
-        .layout
-        .lock()
-        .map_err(|_| "layout state lock poisoned".to_string())?
-        .clone();
-    if layout.machine_role != "server" {
-        return Err("只有服务端可以发起配对。".into());
-    }
-
-    let mut local_peer = local_peer_from_layout(&layout);
-    if let Some(transport) = state.quic_transport_handle() {
-        apply_transport_to_peer(&mut local_peer, &transport);
-    }
-    let peer = match request_pairing_for_peer(&local_peer, &host, discovery_base_port(&layout)) {
-        Ok(peer) => peer,
-        Err(error) => {
-            log::warn!("LAN pairing request failed host={host}: {error}");
-            return Err(error);
+async fn probe_lan_peer(app: tauri::AppHandle, host: String) -> Result<LanPeer, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppRuntime>();
+        let state = state.inner();
+        state.start_discovery()?;
+        let layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?
+            .clone();
+        let mut local_peer = local_peer_from_layout(&layout);
+        if let Some(transport) = state.quic_transport_handle() {
+            apply_transport_to_peer(&mut local_peer, &transport);
         }
-    };
-    merge_peer(&state.peers, peer.clone());
-    Ok(peer)
+        let peer = probe_for_peer(&local_peer, &host, discovery_base_port(&layout))?;
+        merge_peer(&state.peers, peer.clone());
+        sync_layout_peer_presence(&state.layout, &state.peers);
+        Ok(peer)
+    })
+    .await
+    .map_err(|error| format!("探测任务失败: {error}"))?
 }
 
+/// 配对握手（UDP 挑战往返）在线程池执行（分级优化方案 1.6），
+/// 命令线程不被弱网下的重试等待拖住。
 #[tauri::command]
-fn confirm_lan_pairing(
+async fn request_lan_pairing(app: tauri::AppHandle, host: String) -> Result<LanPeer, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppRuntime>();
+        let state = state.inner();
+        state.start_discovery()?;
+        let layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?
+            .clone();
+        if layout.machine_role != "server" {
+            return Err("只有服务端可以发起配对。".into());
+        }
+
+        let mut local_peer = local_peer_from_layout(&layout);
+        if let Some(transport) = state.quic_transport_handle() {
+            apply_transport_to_peer(&mut local_peer, &transport);
+        }
+        let peer = match request_pairing_for_peer(&local_peer, &host, discovery_base_port(&layout))
+        {
+            Ok(peer) => peer,
+            Err(error) => {
+                log::warn!("LAN pairing request failed host={host}: {error}");
+                return Err(error);
+            }
+        };
+        merge_peer(&state.peers, peer.clone());
+        Ok(peer)
+    })
+    .await
+    .map_err(|error| format!("配对请求任务失败: {error}"))?
+}
+
+/// 配对确认含 QUIC stream 应答（send_stream_expect_ack 最长 6s），
+/// 在线程池执行（分级优化方案 1.6），命令线程不等待。
+#[tauri::command]
+async fn confirm_lan_pairing(
+    app: tauri::AppHandle,
     host: String,
     code: String,
-    state: tauri::State<'_, AppRuntime>,
 ) -> Result<LanPeer, String> {
-    state.start_discovery()?;
-    let layout = state
-        .layout
-        .lock()
-        .map_err(|_| "layout state lock poisoned".to_string())?
-        .clone();
-    if layout.machine_role != "server" {
-        return Err("只有服务端可以确认配对。".into());
-    }
-
-    let mut local_peer = local_peer_from_layout(&layout);
-    let transport = state
-        .quic_transport_handle()
-        .ok_or_else(|| "QUIC 传输未启动，无法安全确认配对。".to_string())?;
-    apply_transport_to_peer(&mut local_peer, &transport);
-    let peer = match confirm_pairing_for_peer(
-        &local_peer,
-        &transport,
-        &layout.pair_secret,
-        &host,
-        &code,
-        discovery_base_port(&layout),
-    ) {
-        Ok(peer) => peer,
-        Err(error) => {
-            log::warn!("LAN pairing confirm failed host={host}: {error}");
-            return Err(error);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppRuntime>();
+        let state = state.inner();
+        state.start_discovery()?;
+        let layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?
+            .clone();
+        if layout.machine_role != "server" {
+            return Err("只有服务端可以确认配对。".into());
         }
-    };
-    merge_peer(&state.peers, peer.clone());
-    sync_layout_peer_presence(&state.layout, &state.peers);
-    Ok(peer)
+
+        let mut local_peer = local_peer_from_layout(&layout);
+        let transport = state
+            .quic_transport_handle()
+            .ok_or_else(|| "QUIC 传输未启动，无法安全确认配对。".to_string())?;
+        apply_transport_to_peer(&mut local_peer, &transport);
+        let peer = match confirm_pairing_for_peer(
+            &local_peer,
+            &transport,
+            &layout.pair_secret,
+            &host,
+            &code,
+            discovery_base_port(&layout),
+        ) {
+            Ok(peer) => peer,
+            Err(error) => {
+                log::warn!("LAN pairing confirm failed host={host}: {error}");
+                return Err(error);
+            }
+        };
+        merge_peer(&state.peers, peer.clone());
+        sync_layout_peer_presence(&state.layout, &state.peers);
+        Ok(peer)
+    })
+    .await
+    .map_err(|error| format!("配对确认任务失败: {error}"))?
 }
 
 #[tauri::command]
