@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -251,22 +251,100 @@ struct ActiveTarget {
     y: f64,
 }
 
-type RemoteScreenPoints = HashMap<(String, String), (f64, f64)>;
+/// 接收端"远端光标落点"缓存的容量上限（分级优化方案 1.2：原先只增不删）。
+const REMOTE_SCREEN_POINTS_CACHE_CAP: usize = 256;
+
+/// 有界 LRU 点缓存：键 → (x, y)。命中与写入都刷新新近度，
+/// 超过容量时淘汰最久未使用的条目。容量很小（≤256），
+/// VecDeque 线性查找的代价可忽略。
+pub(crate) struct BoundedPointCache<K: Eq + std::hash::Hash + Clone> {
+    map: HashMap<K, (f64, f64)>,
+    order: VecDeque<K>,
+    capacity: usize,
+}
+
+impl<K: Eq + std::hash::Hash + Clone> BoundedPointCache<K> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn remember(&mut self, key: K, x: f64, y: f64) {
+        // 已存在的键先摘除旧位置，写入视为一次使用。
+        if self.map.remove(&key).is_some() {
+            self.order.retain(|existing| existing != &key);
+        }
+        self.map.insert(key.clone(), (x, y));
+        self.order.push_back(key);
+        while self.map.len() > self.capacity {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn recall(&mut self, key: &K) -> Option<(f64, f64)> {
+        let value = self.map.get(key).copied()?;
+        self.order.retain(|existing| existing != key);
+        self.order.push_back(key.clone());
+        Some(value)
+    }
+
+    /// 会话结束的兜底清理：整表清空。局部清理由 `forget_device` 承担。
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    /// 当前条目数；仅测试断言使用，按设备清理接线（多设备拓扑，方案 3.5）后
+    /// 可用于诊断日志。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+impl BoundedPointCache<(String, String)> {
+    /// 一个受控端下线/被移除时，清掉它在所有屏幕上的残留落点。
+    /// 行为已单测覆盖；生产接线（发现线程的 peer 剔除回调）归入多设备拓扑工作。
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn forget_device(&mut self, device_id: &str) {
+        self.order.retain(|(device, _)| device != device_id);
+        self.map.retain(|(device, _), _| device != device_id);
+    }
+}
+
+type RemoteScreenPoints = BoundedPointCache<(String, String)>;
 
 fn remote_screen_points() -> &'static Mutex<RemoteScreenPoints> {
     // Keep memory through capture restarts without writing on every mouse move.
     static POINTS: OnceLock<Mutex<RemoteScreenPoints>> = OnceLock::new();
-    POINTS.get_or_init(|| Mutex::new(HashMap::new()))
+    POINTS.get_or_init(|| Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP)))
+}
+
+/// 会话结束（停止接收远端输入）时清空远端落点缓存，
+/// 避免已下线设备的条目跨会话残留（分级优化方案 1.2）。
+pub fn clear_remote_screen_points() {
+    if let Ok(mut points) = remote_screen_points().lock() {
+        points.clear();
+    }
 }
 
 fn remember_remote_screen_point(points: &Mutex<RemoteScreenPoints>, active: &ActiveTarget) {
     if let Ok(mut points) = points.lock() {
-        points.insert(
+        points.remember(
             (
                 active.target.device_id.clone(),
                 active.current_screen_id.clone(),
             ),
-            (active.x, active.y),
+            active.x,
+            active.y,
         );
     }
 }
@@ -282,11 +360,7 @@ fn remembered_remote_screen_point(
     let (x, y) = points
         .lock()
         .ok()
-        .and_then(|points| {
-            points
-                .get(&(target.device_id.clone(), target.screen_id.clone()))
-                .copied()
-        })
+        .and_then(|mut points| points.recall(&(target.device_id.clone(), target.screen_id.clone())))
         .unwrap_or(fallback);
     (
         x.clamp(0.0, (target.remote_screen.width - 1).max(0) as f64),
@@ -930,7 +1004,7 @@ fn request_screen_switch(
         native_layout,
         active,
         None,
-        &Mutex::new(HashMap::new()),
+        &Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP)),
     )
 }
 
@@ -1092,7 +1166,7 @@ fn screen_center_point(screen: &Screen) -> (f64, f64) {
 }
 
 fn remembered_local_screen_point(
-    points: &Mutex<HashMap<String, (f64, f64)>>,
+    points: &Mutex<BoundedPointCache<String>>,
     from_screen_id: &str,
     to_screen_id: &str,
     current_point: Option<(f64, f64)>,
@@ -1101,10 +1175,10 @@ fn remembered_local_screen_point(
     let Ok(mut points) = points.lock() else {
         return fallback;
     };
-    if let Some(point) = current_point {
-        points.insert(from_screen_id.to_string(), point);
+    if let Some((x, y)) = current_point {
+        points.remember(from_screen_id.to_string(), x, y);
     }
-    points.get(to_screen_id).copied().unwrap_or(fallback)
+    points.recall(&to_screen_id.to_string()).unwrap_or(fallback)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1336,7 +1410,7 @@ fn start_platform_capture(
             just_crossed: AtomicBool::new(false),
             decouple_pending: AtomicBool::new(false),
             suppress_next_mouse_delta: AtomicBool::new(false),
-            local_screen_points: Mutex::new(HashMap::new()),
+            local_screen_points: Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP)),
             display_snapshots,
             drag_count_at_left_down: std::sync::atomic::AtomicI64::new(macos_appkit::change_count()),
             pending_edge_drop: Mutex::new(None),
@@ -1616,7 +1690,7 @@ fn start_platform_capture(
             capture_stop: Arc::clone(&stop),
             cursor_hide_calls: Mutex::new(0),
             just_crossed: AtomicBool::new(false),
-            local_screen_points: Mutex::new(HashMap::new()),
+            local_screen_points: Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP)),
             pending_drag_cross: Mutex::new(None),
             drag_arm_since: Mutex::new(None),
         });
@@ -3578,7 +3652,7 @@ struct MacCaptureContext {
     // stays attached until that event draws the hide (hide_and_pin_macos_cursor).
     decouple_pending: AtomicBool,
     suppress_next_mouse_delta: AtomicBool,
-    local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
+    local_screen_points: Mutex<BoundedPointCache<String>>,
     display_snapshots: Vec<MacDisplaySnapshot>,
     // Edge drag-drop (ShareMouse-style): the drag pasteboard's changeCount as
     // of the last LOCAL left-button press. A left-drag that crosses the edge
@@ -3800,7 +3874,7 @@ struct WindowsCaptureContext {
     // Swallow the first post-crossing delta so a fast flick across the edge
     // does not shove the cursor inward on Windows, where we pin by warping.
     just_crossed: AtomicBool,
-    local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
+    local_screen_points: Mutex<BoundedPointCache<String>>,
     // Edge drag-drop: while a left-button file drag sits on the edge catcher
     // (before crossing), the target it would cross into is parked here; the
     // catcher's DragEnter hand-off then activates it so the cursor slides over.
@@ -10473,7 +10547,7 @@ mod tests {
     fn hotkey_round_trip_restores_both_cursors_without_remembering_the_park() {
         let layout = layout_for_target_tests();
         let state = Arc::new(Mutex::new(layout.clone()));
-        let points = Mutex::new(HashMap::new());
+        let points = Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP));
         let active = Mutex::new(None);
         let SwitchOutcome::Enter(mut first) = request_screen_switch_from_point(
             SwitchDirection::Right,
@@ -10520,7 +10594,7 @@ mod tests {
 
     #[test]
     fn remote_cursor_memory_separates_devices_and_screens_and_clamps_a_resized_screen() {
-        let points = Mutex::new(HashMap::new());
+        let points = Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP));
         let target = target_for_coordinate_tests();
         let mut active =
             crossing_target(std::slice::from_ref(&target), 1919.0, 500.0, 40.0, 0.0).unwrap();
@@ -10588,7 +10662,7 @@ mod tests {
             &layout,
             &active,
             Some((960.0, 540.0)),
-            &Mutex::new(HashMap::new()),
+            &Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP)),
         ) {
             SwitchOutcome::LocalMove {
                 from_screen_id,
@@ -10610,7 +10684,7 @@ mod tests {
             &layout,
             &active,
             Some((1268.0, 1571.0)),
-            &Mutex::new(HashMap::new()),
+            &Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP)),
         ) {
             SwitchOutcome::LocalMove {
                 from_screen_id,
@@ -10629,7 +10703,7 @@ mod tests {
 
     #[test]
     fn local_screen_switch_remembers_points_by_screen_id() {
-        let points = Mutex::new(HashMap::new());
+        let points = Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP));
 
         let first_target = remembered_local_screen_point(
             &points,
@@ -10649,9 +10723,15 @@ mod tests {
         );
         assert_eq!(return_target, (333.0, 444.0));
 
-        let points = points.lock().unwrap();
-        assert_eq!(points.get("local-display-1"), Some(&(333.0, 444.0)));
-        assert_eq!(points.get("local-display-2"), Some(&(1200.0, 1500.0)));
+        let mut points = points.lock().unwrap();
+        assert_eq!(
+            points.recall(&"local-display-1".to_string()),
+            Some((333.0, 444.0))
+        );
+        assert_eq!(
+            points.recall(&"local-display-2".to_string()),
+            Some((1200.0, 1500.0))
+        );
     }
 
     #[test]
@@ -11193,6 +11273,58 @@ mod tests {
             admitted_credentialless_input_packets(),
             before + 1,
             "窗口内被放行的无凭据包应被计数"
+        );
+    }
+
+    #[test]
+    fn screen_point_cache_stays_bounded_and_evicts_least_recently_used() {
+        // 分级优化方案 1.2：screen_points 缓存原先只增不删，设备/屏幕数量
+        // 变化会让残留条目无限累积。新缓存有上限并按 LRU 淘汰。
+        let mut cache = BoundedPointCache::new(3);
+        cache.remember(("a".into(), "1".into()), 1.0, 1.0);
+        cache.remember(("b".into(), "1".into()), 2.0, 2.0);
+        cache.remember(("c".into(), "1".into()), 3.0, 3.0);
+        // 命中 a 刷新其新近度，使 b 成为最旧条目。
+        assert_eq!(cache.recall(&("a".into(), "1".into())), Some((1.0, 1.0)));
+        cache.remember(("d".into(), "1".into()), 4.0, 4.0);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.recall(&("b".into(), "1".into())), None);
+        assert_eq!(cache.recall(&("a".into(), "1".into())), Some((1.0, 1.0)));
+        assert_eq!(cache.recall(&("c".into(), "1".into())), Some((3.0, 3.0)));
+        assert_eq!(cache.recall(&("d".into(), "1".into())), Some((4.0, 4.0)));
+        // 写入即视为使用：重复写 b 后再淘汰，出局的应是别人。
+        cache.remember(("b".into(), "1".into()), 2.5, 2.5);
+        cache.remember(("e".into(), "1".into()), 5.0, 5.0);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.recall(&("b".into(), "1".into())), Some((2.5, 2.5)));
+        assert_eq!(cache.recall(&("c".into(), "1".into())), None);
+
+        // 会话结束按设备清理全部相关条目。
+        cache.forget_device("a");
+        assert_eq!(cache.recall(&("a".into(), "1".into())), None);
+        assert_eq!(cache.recall(&("d".into(), "1".into())), Some((4.0, 4.0)));
+    }
+
+    #[test]
+    fn remote_screen_points_cache_is_capped_at_256_entries() {
+        let points = Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP));
+        let target = target_for_coordinate_tests();
+        for index in 0..(REMOTE_SCREEN_POINTS_CACHE_CAP as u32 + 40) {
+            let mut active = crossing_target(
+                std::slice::from_ref(&target),
+                1919.0,
+                index as f64 % 1080.0,
+                40.0,
+                0.0,
+            )
+            .unwrap();
+            active.target.device_id = format!("device-{index}");
+            remember_remote_screen_point(&points, &active);
+        }
+        let count = points.lock().unwrap().len();
+        assert!(
+            count <= REMOTE_SCREEN_POINTS_CACHE_CAP,
+            "缓存应维持在 {REMOTE_SCREEN_POINTS_CACHE_CAP} 条以内，实际 {count}"
         );
     }
 

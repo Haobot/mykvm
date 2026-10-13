@@ -1468,6 +1468,8 @@ impl AppRuntime {
         }
         self.remote_input_active.store(false, Ordering::Relaxed);
         input::clear_clipboard_target(&self.clipboard_target);
+        // 会话结束：清空远端光标落点缓存，已下线设备的条目不跨会话残留。
+        input::clear_remote_screen_points();
         // Drop any modifier flags we were holding for injection so a lost
         // key-up cannot leave Shift/Ctrl/Cmd stuck for the next session.
         input::reset_injected_modifiers();

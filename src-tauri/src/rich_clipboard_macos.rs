@@ -1,3 +1,16 @@
+//! macOS 富文本剪贴板的裸 objc_msgSend 访问层。
+//!
+//! Autorelease 纪律（分级优化方案 1.2 审计结论，改动本模块前必读）：
+//! - 每个公开入口（`read` / `write_rtf` / `read_files`）必须以
+//!   `crate::input::macos_appkit::autorelease_pool()` 的守卫开头；
+//!   所有 `objc_msgSend` 返回的对象按 Cocoa 惯例是 autoreleased 的，
+//!   只在 pool 排空（守卫析构）前有效。
+//! - 裸指针（如 `NSData bytes`、`UTF8String`）指向 autoreleased 对象的内部
+//!   缓冲，必须在守卫存续期内 `to_vec`/`into_owned` 拷贝成 Rust 所有数据，
+//!   不得把指针（或引用它的切片）带出守卫作用域。
+//! - 现状核对：三个入口均已在 pool 内完成拷贝（`read` 的 `rtf`/`html` 在
+//!   返回前 `to_vec`/`into_owned`；`read_files` 逐项 `path` 转字符串），
+//!   无指针逃逸。
 use super::{RichText, MAX_FORMAT_BYTES};
 use std::ffi::{c_char, c_void, CStr, CString};
 

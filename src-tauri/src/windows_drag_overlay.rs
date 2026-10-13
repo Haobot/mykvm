@@ -17,6 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
     DIB_RGB_COLORS,
 };
+use windows_sys::Win32::Graphics::Gdi::{HBITMAP, HDC, HGDIOBJ};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -99,9 +100,14 @@ unsafe fn run(file_name: &str, mode: &AtomicU8, progress: &dyn Fn() -> f32) {
         log::warn!("drag overlay: could not create its window");
         return;
     }
+    let Some(mut renderer) = FrameRenderer::new() else {
+        log::warn!("drag overlay: could not prepare its frame buffers");
+        DestroyWindow(hwnd);
+        return;
+    };
     let icon = file_icon_pixels(file_name);
     let mut shown_progress = progress();
-    render(
+    renderer.draw(
         hwnd,
         icon.as_deref(),
         shown_progress,
@@ -123,7 +129,7 @@ unsafe fn run(file_name: &str, mode: &AtomicU8, progress: &dyn Fn() -> f32) {
             let now = progress();
             if (now - shown_progress).abs() >= 0.005 {
                 shown_progress = now;
-                render(hwnd, icon.as_deref(), now, at);
+                renderer.draw(hwnd, icon.as_deref(), now, at);
             } else {
                 // Move only: no source DC means no repaint.
                 let point = POINT { x: at.0, y: at.1 };
@@ -159,57 +165,95 @@ unsafe fn position(mode: u8) -> (i32, i32) {
     (cursor.x + 14, cursor.y + 18)
 }
 
-unsafe fn render(hwnd: HWND, icon: Option<&[u32]>, progress: f32, at: (i32, i32)) {
-    let screen = GetDC(std::ptr::null_mut());
-    let memory = CreateCompatibleDC(screen);
-    let info = bitmap_info(WIDTH, HEIGHT);
-    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let bitmap = CreateDIBSection(
-        memory,
-        &info,
-        DIB_RGB_COLORS,
-        &mut bits,
-        std::ptr::null_mut(),
-        0,
-    );
-    if bitmap.is_null() || bits.is_null() {
-        DeleteDC(memory);
-        ReleaseDC(std::ptr::null_mut(), screen);
-        return;
+/// 每帧渲染器：screen DC、内存 DC 与 DIB 在整个浮层生命周期内复用
+/// （分级优化方案 1.2：原先每帧 GetDC/CreateDIBSection/DeleteObject，
+/// 长时间传输期间 GDI 句柄与位图内存反复分配回收），每帧只重绘像素
+/// 并调用一次 UpdateLayeredWindow。Drop 时按创建的逆序释放。
+struct FrameRenderer {
+    screen: HDC,
+    memory: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: *mut u32,
+}
+
+impl FrameRenderer {
+    unsafe fn new() -> Option<Self> {
+        let screen = GetDC(std::ptr::null_mut());
+        let memory = CreateCompatibleDC(screen);
+        let info = bitmap_info(WIDTH, HEIGHT);
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            memory,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if screen.is_null() || memory.is_null() || bitmap.is_null() || bits.is_null() {
+            if !bitmap.is_null() {
+                DeleteObject(bitmap);
+            }
+            if !memory.is_null() {
+                DeleteDC(memory);
+            }
+            if !screen.is_null() {
+                ReleaseDC(std::ptr::null_mut(), screen);
+            }
+            return None;
+        }
+        let previous = SelectObject(memory, bitmap);
+        Some(Self {
+            screen,
+            memory,
+            bitmap,
+            previous,
+            bits: bits.cast::<u32>(),
+        })
     }
-    let previous = SelectObject(memory, bitmap);
-    let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (WIDTH * HEIGHT) as usize);
-    pixels.fill(0);
-    paint(pixels, icon, progress);
 
-    let size = SIZE {
-        cx: WIDTH,
-        cy: HEIGHT,
-    };
-    let source = POINT { x: 0, y: 0 };
-    let destination = POINT { x: at.0, y: at.1 };
-    let blend = BLENDFUNCTION {
-        BlendOp: AC_SRC_OVER as u8,
-        BlendFlags: 0,
-        SourceConstantAlpha: 255,
-        AlphaFormat: AC_SRC_ALPHA as u8,
-    };
-    UpdateLayeredWindow(
-        hwnd,
-        screen,
-        &destination,
-        &size,
-        memory,
-        &source,
-        0,
-        &blend,
-        ULW_ALPHA,
-    );
+    /// 重绘一帧并推送到分层窗口。参数语义与原每帧重建版 render() 一致。
+    unsafe fn draw(&mut self, hwnd: HWND, icon: Option<&[u32]>, progress: f32, at: (i32, i32)) {
+        let pixels = std::slice::from_raw_parts_mut(self.bits, (WIDTH * HEIGHT) as usize);
+        pixels.fill(0);
+        paint(pixels, icon, progress);
 
-    SelectObject(memory, previous);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
-    ReleaseDC(std::ptr::null_mut(), screen);
+        let size = SIZE {
+            cx: WIDTH,
+            cy: HEIGHT,
+        };
+        let source = POINT { x: 0, y: 0 };
+        let destination = POINT { x: at.0, y: at.1 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        UpdateLayeredWindow(
+            hwnd,
+            self.screen,
+            &destination,
+            &size,
+            self.memory,
+            &source,
+            0,
+            &blend,
+            ULW_ALPHA,
+        );
+    }
+}
+
+impl Drop for FrameRenderer {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.memory, self.previous);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.memory);
+            ReleaseDC(std::ptr::null_mut(), self.screen);
+        }
+    }
 }
 
 /// Premultiplied BGRA into the top-down `WIDTH` x `HEIGHT` canvas.
