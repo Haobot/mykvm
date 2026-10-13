@@ -264,6 +264,7 @@ export async function readPerformanceSample(): Promise<PerformanceSample> {
       transportPackets: 0,
       inputEvents: 0,
       clipboardPackets: 0,
+      admittedCredentialessInputPackets: 0,
     }
   }
 

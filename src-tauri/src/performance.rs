@@ -18,6 +18,7 @@ pub(crate) struct PerformanceSample {
     transport_packets: u64,
     input_events: u64,
     clipboard_packets: u64,
+    admitted_credentialess_input_packets: u64,
 }
 
 #[cfg(target_os = "windows")]
@@ -34,6 +35,7 @@ pub(crate) fn read_process_sample(
     transport_packets: u64,
     input_events: u64,
     clipboard_packets: u64,
+    admitted_credentialess_input_packets: u64,
 ) -> PerformanceSample {
     let (app_cpu_percent, app_memory_mb) =
         read_platform_process_performance().unwrap_or((0.0, 0.0));
@@ -45,6 +47,7 @@ pub(crate) fn read_process_sample(
         transport_packets,
         input_events,
         clipboard_packets,
+        admitted_credentialess_input_packets,
     }
 }
 

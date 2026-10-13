@@ -2846,6 +2846,7 @@ fn read_performance_sample(state: tauri::State<'_, AppRuntime>) -> PerformanceSa
         state.transport_packets.load(Ordering::Relaxed),
         state.input_events.load(Ordering::Relaxed),
         state.clipboard_packets.load(Ordering::Relaxed),
+        input::admitted_credentialless_input_packets(),
     )
 }
 
@@ -6511,6 +6512,21 @@ fn normalize_cluster_id(cluster_id: &str) -> String {
     }
 }
 
+/// 恒定时间字节串比较：耗时只取决于长度、不取决于内容差异位置，
+/// 用于 pair_secret 等共享机密的等值校验，避免计时侧信道。
+/// 长度不同的输入立即返回 false——长度本身不是机密（约 10 行手写实现，
+/// 等价于 subtle::ConstantTimeEq 对切片的语义，避免新增依赖）。
+pub(crate) fn consttime_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn normalize_pair_secret(pair_secret: &str) -> String {
     let pair_secret = pair_secret.trim();
     if pair_secret.is_empty() {
@@ -7365,7 +7381,7 @@ fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
+        || !consttime_eq(packet.pair_secret.as_bytes(), layout.pair_secret.as_bytes())
     {
         return false;
     }
@@ -8169,7 +8185,7 @@ fn handle_drag_control_packet(payload: &[u8], layout: &LayoutState, local_peer_i
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
+        || !consttime_eq(packet.pair_secret.as_bytes(), layout.pair_secret.as_bytes())
     {
         return false;
     }
@@ -8580,7 +8596,7 @@ fn authorize_peer_request(
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
+        || !consttime_eq(packet.pair_secret.as_bytes(), layout.pair_secret.as_bytes())
     {
         return None;
     }
@@ -9016,7 +9032,7 @@ fn file_transfer_packet_authorized(layout: &LayoutState, packet: &FileTransferPa
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
+        || !consttime_eq(packet.pair_secret.as_bytes(), layout.pair_secret.as_bytes())
     {
         return false;
     }
@@ -10528,6 +10544,24 @@ fn random_pairing_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consttime_eq_matches_plain_equality() {
+        // 分级优化方案 1.1：pair_secret 比较的行为等价性——
+        // 相同返回 true；不同长度/不同前缀/完全不同返回 false；空对空返回 true。
+        assert!(consttime_eq(b"", b""));
+        assert!(consttime_eq(b"mykvm-secret", b"mykvm-secret"));
+        assert!(!consttime_eq(b"mykvm-secret", b"mykvm-secres"));
+        assert!(!consttime_eq(b"mykvm-secret", b"mykvm-secret-2"));
+        assert!(!consttime_eq(b"short", b"mykvm-secret"));
+        assert!(!consttime_eq(b"", b"mykvm-secret"));
+        // 长度不同但前缀相同：不得因提前返回误判为相等。
+        assert!(!consttime_eq(b"aaaaaaaaaaaaaaaa", b"aaaaaaaaaaaaaaaab"));
+        // 非ASCII（多字节 UTF-8）按字节比较不受影响。
+        let zh = "共享密钥-秘密";
+        assert!(consttime_eq(zh.as_bytes(), zh.as_bytes()));
+        assert!(!consttime_eq(zh.as_bytes(), "共享密钥-机密".as_bytes()));
+    }
 
     fn test_screen(device_id: &str) -> Screen {
         Screen {

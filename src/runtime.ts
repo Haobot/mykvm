@@ -117,4 +117,5 @@ export interface PerformanceSample {
   transportPackets: number
   inputEvents: number
   clipboardPackets: number
+  admittedCredentialessInputPackets: number
 }

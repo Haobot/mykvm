@@ -105,15 +105,23 @@ const WINDOWS_DESKTOP_CHECK_INTERVAL_MS: u64 = 250;
 /// How often the full pairing credentials (~0.5KB, mostly the base64 transport
 /// certificate) ride an input packet. Between refreshes, packets omit them and
 /// the receiver authorizes by its per-source cache — cutting steady-state
-/// input datagrams from ~0.8KB to ~0.15KB. Must stay below
-/// `INPUT_ORIGIN_CACHE_TTL` so the receiver's authorization never lapses
-/// mid-session.
-const INPUT_FULL_CRED_REFRESH: Duration = Duration::from_secs(2);
-/// How long the receiver treats a source address as authorized after a
-/// credentialled packet, so it can admit the credential-less packets in
-/// between. A peer that never proved the pairing secret from this address
-/// never gets an entry, so credential-less packets from it are always rejected.
-const INPUT_ORIGIN_CACHE_TTL: Duration = Duration::from_secs(5);
+/// input datagrams from ~0.8KB to ~0.15KB. 必须严格小于
+/// `INPUT_ORIGIN_CACHE_TTL`，否则接收端授权会在两次凭据包之间到期。
+const INPUT_FULL_CRED_REFRESH: Duration = Duration::from_secs(1);
+/// 接收端把一个源地址视为已授权的时长（自上一个带凭据包起算），
+/// 窗口内的无凭据包才被放行。安全不变式（分级优化方案 1.1 确认并文档化）：
+/// 只有通过完整凭据校验的包才会调用 `cache_authorized_input_origin` 写入缓存，
+/// 从未证明过配对密钥的地址永远拿不到条目，其无凭据包一律拒绝。
+const INPUT_ORIGIN_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// 被放行的无凭据输入包 debug 计数器（接入 performance.rs 采样）。
+/// 正常会话中它与输入事件同量级；若在无远端会话时持续增长，
+/// 说明有来源正在借用放行窗口，应优先排查源地址伪造。
+static ADMITTED_CREDENTIALLESS_INPUT_PACKETS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn admitted_credentialless_input_packets() -> u64 {
+    ADMITTED_CREDENTIALLESS_INPUT_PACKETS.load(Ordering::Relaxed)
+}
 pub(crate) const NATIVE_INPUT_SUPPORTED: bool =
     cfg!(any(target_os = "macos", target_os = "windows"));
 
@@ -376,7 +384,7 @@ struct InputPacketRef<'a> {
     cursor: Option<RemoteCursorState>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InputPacket {
     protocol: String,
@@ -2714,7 +2722,9 @@ pub(crate) fn handle_input_datagram_with_sink(
                     return true;
                 }
                 cache_authorized_input_origin(source);
-            } else if !input_origin_recently_authorized(source) {
+            } else if input_origin_recently_authorized(source) {
+                ADMITTED_CREDENTIALLESS_INPUT_PACKETS.fetch_add(1, Ordering::Relaxed);
+            } else {
                 return true;
             }
             let local_peer_id = cached_local_peer_id(&layout);
@@ -2922,7 +2932,11 @@ fn packet_authorized_fields(
     if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
         return false;
     }
-    if cluster_id != layout.cluster_id || pair_secret != layout.pair_secret {
+    // pair_secret 是长期共享机密：等值比较用恒定时间实现，避免逐字节
+    // 短路造成的计时侧信道（分级优化方案 1.1）。cluster_id 非机密，无需处理。
+    if cluster_id != layout.cluster_id
+        || !crate::consttime_eq(pair_secret.as_bytes(), layout.pair_secret.as_bytes())
+    {
         return false;
     }
 
@@ -10774,6 +10788,7 @@ mod tests {
     fn cursor_park_requires_authorization_and_does_not_skip_an_idle_position() {
         let mut layout = layout_for_target_tests();
         layout.machine_role = "client".into();
+        eprintln!("[dbg] role set");
         layout.paired_controllers = vec![crate::PairedController {
             id: "cursor-test-server".into(),
             name: "Server".into(),
@@ -10910,6 +10925,7 @@ mod tests {
 
     #[test]
     fn input_packet_round_trips_as_messagepack() {
+        eprintln!("[dbg] arcs built, locking for packet");
         let packet = InputPacket {
             protocol: INPUT_PROTOCOL.into(),
             target_device_id: "peer-device".into(),
@@ -11085,6 +11101,108 @@ mod tests {
         // The refresh interval must stay under the cache TTL, or authorization
         // would lapse between credentialled packets.
         assert!(INPUT_FULL_CRED_REFRESH < INPUT_ORIGIN_CACHE_TTL);
+    }
+
+    #[test]
+    fn credentialless_packets_pass_only_from_authorized_sources_and_are_counted() {
+        eprintln!("[dbg] test start");
+        let mut layout = layout_for_target_tests();
+        eprintln!("[dbg] fixture built");
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![crate::PairedController {
+            id: "credless-counter-server".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "192.0.2.51".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let secret = layout.pair_secret.clone();
+        let native = Arc::new(Mutex::new(layout.clone()));
+        let layout = Arc::new(Mutex::new(layout));
+        let events = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(Mutex::new(None));
+        let source: SocketAddr = "192.0.2.51:47834".parse().unwrap();
+        let receive = |packet: &InputPacket| {
+            handle_input_datagram_with_sink(
+                &layout,
+                &native,
+                &rmp_serde::to_vec_named(packet).unwrap(),
+                source,
+                &events,
+                &target,
+                &|_| true,
+            )
+        };
+        let packet = InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            target_device_id: "local-device".into(),
+            origin_device_id: "credless-counter-server".into(),
+            origin_port: 47834,
+            origin_transport_public_key: "server-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: {
+                eprintln!("[dbg] lock #1");
+                let guard = layout.lock().unwrap();
+                let value = guard.cluster_id.clone();
+                drop(guard);
+                eprintln!("[dbg] lock #1 ok");
+                value
+            },
+            pair_secret: secret,
+            event: InputEvent::MouseMove {
+                screen_id: {
+                    eprintln!("[dbg] lock #2");
+                    let guard = layout.lock().unwrap();
+                    let value = guard.devices[0].screens[0].id.clone();
+                    drop(guard);
+                    eprintln!("[dbg] lock #2 ok");
+                    value
+                },
+                x: 100,
+                y: 200,
+            },
+            held: None,
+            cursor: None,
+        };
+
+        // 从未授权的源发来的无凭据包：直接拒绝，计数器不动。
+        let mut credless = packet.clone();
+        credless.pair_secret = String::new();
+        let before = admitted_credentialless_input_packets();
+        assert!(receive(&credless));
+        assert_eq!(
+            admitted_credentialless_input_packets(),
+            before,
+            "未经授权的源不应被计数"
+        );
+        assert_eq!(
+            admitted_credentialless_input_packets(),
+            before,
+            "未经授权的源不应被计数"
+        );
+
+        // 带凭据包：完整授权，并把该源记入放行缓存。
+        assert!(receive(&packet));
+
+        // 同源无凭据包：在放行窗口内被接纳，debug 计数器递增。
+        assert!(receive(&credless));
+        assert_eq!(
+            admitted_credentialless_input_packets(),
+            before + 1,
+            "窗口内被放行的无凭据包应被计数"
+        );
+    }
+
+    #[test]
+    fn credentialless_admission_window_is_two_seconds() {
+        // 分级优化方案 1.1：无凭据包的按源放行窗口收紧至 2 秒。
+        // 凭据刷新节拍随之设为 1 秒（必须严格小于 TTL），为弱网抖动留出
+        // 至少一个节拍的余量，避免授权在刷新瞬间到期导致丢按键。
+        assert_eq!(INPUT_ORIGIN_CACHE_TTL, Duration::from_secs(2));
+        assert_eq!(INPUT_FULL_CRED_REFRESH, Duration::from_secs(1));
     }
 
     #[test]

@@ -175,6 +175,7 @@ export const TEXT = {
       packets: "传输包",
       inputRate: "键鼠速度",
       clipboardPackets: "剪贴板包",
+      admittedCredentialessPackets: "放行的无凭据输入包",
       noSamples: "开启后开始采样",
     },
     layout: {
@@ -424,6 +425,7 @@ export const TEXT = {
       packets: "Packets",
       inputRate: "Input rate",
       clipboardPackets: "Clipboard packets",
+      admittedCredentialessPackets: "Admitted uncredentialed input",
       noSamples: "Enable monitoring to sample",
     },
     layout: {
