@@ -1,5 +1,6 @@
 import { DeviceSettingsModal } from "./DeviceSettingsModal";
 import { HelpHeading, InfoTip } from "./InfoTip";
+import { createLayoutPersistQueue } from "./layoutPersist";
 import {
   type CSSProperties,
   type FormEvent,
@@ -1442,6 +1443,17 @@ function App() {
     setBoardZoom((currentZoom) => clampZoom(currentZoom + delta));
   }
 
+  // 布局保存队列：setState 更新函数内只入队，提交后的 effect 里保存一次。
+  // StrictMode 会双重调用更新函数，若在其中直接发起 IPC，同一布局变更会被
+  // 保存两次（分级优化方案 1.3）。
+  const layoutPersistQueue = useMemo(
+    () => createLayoutPersistQueue<LayoutState>(),
+    [],
+  );
+  useEffect(() => {
+    void layoutPersistQueue.flush(persistLayout);
+  });
+
   function updateLayout(mutator: (layoutState: LayoutState) => LayoutState) {
     setSnapshot((current) => {
       if (!current) {
@@ -1449,7 +1461,8 @@ function App() {
       }
 
       const nextLayout = mutator(current.layout);
-      void persistLayout(nextLayout);
+      // 更新函数可能被 StrictMode 双重调用：这里只入队，保存由提交后的 effect 执行。
+      layoutPersistQueue.enqueue(nextLayout);
 
       return {
         ...current,
@@ -3255,6 +3268,13 @@ function App() {
                     <dt>{ui.settings.clipboardPackets}</dt>
                     <dd>
                       {performanceSamples.at(-1)?.clipboardPackets ?? "--"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>{ui.settings.admittedCredentialessPackets}</dt>
+                    <dd>
+                      {performanceSamples.at(-1)
+                        ?.admittedCredentialessInputPackets ?? "--"}
                     </dd>
                   </div>
                 </dl>
