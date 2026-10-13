@@ -1417,7 +1417,7 @@ impl AppRuntime {
     }
 
     fn layout_snapshot(&self) -> LayoutState {
-        sync_layout_peer_presence(&self.layout, &self.peers);
+        sync_layout_peer_presence_throttled(&self.layout, &self.peers);
         self.layout
             .lock()
             .map(|layout| layout.clone())
@@ -9148,6 +9148,19 @@ where
     rmp_serde::from_slice::<T>(payload).ok()
 }
 
+/// 上次 peer 在线状态合并的时间戳（ms）。发现线程每个 tick（socket 读超时
+/// 500ms）都会同步一次；读路径以此为节流依据，避免前端 2s 轮询把
+/// O(peers) 的写锁合并放大到每次快照（分级优化方案 1.4）。
+static LAST_PRESENCE_SYNC_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 读路径防御性合并的节流间隔。
+const PRESENCE_SYNC_THROTTLE_MS: u64 = 1000;
+
+/// 距上次同步达到节流间隔（或从未同步）才允许再次合并。
+fn presence_sync_due(last_sync_ms: u64, now_ms: u64) -> bool {
+    last_sync_ms == 0 || now_ms.saturating_sub(last_sync_ms) >= PRESENCE_SYNC_THROTTLE_MS
+}
+
 fn sync_layout_peer_presence(
     layout_state: &Arc<Mutex<LayoutState>>,
     peers: &Arc<Mutex<Vec<LanPeer>>>,
@@ -9156,6 +9169,19 @@ fn sync_layout_peer_presence(
     if let Ok(mut layout) = layout_state.lock() {
         apply_peer_presence(&mut layout, &peers);
     }
+    LAST_PRESENCE_SYNC_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+/// 快照等读路径使用的节流版合并：发现线程正常运行时（≤500ms 一拍）
+/// 这里常态直通为纯读；发现线程停摆时保留每秒至多一次的兜底合并。
+fn sync_layout_peer_presence_throttled(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    peers: &Arc<Mutex<Vec<LanPeer>>>,
+) {
+    if !presence_sync_due(LAST_PRESENCE_SYNC_MS.load(Ordering::Relaxed), now_ms()) {
+        return;
+    }
+    sync_layout_peer_presence(layout_state, peers);
 }
 
 fn active_peer_snapshot(peers: &Arc<Mutex<Vec<LanPeer>>>) -> Vec<LanPeer> {
@@ -10546,6 +10572,20 @@ fn random_pairing_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_sync_throttle_only_fires_after_the_interval() {
+        // 分级优化方案 1.4：快照读路径的防御性合并按 1s 节流。
+        // 从未同步（0）立即允许；间隔不足不允许；达到阈值允许。
+        assert!(presence_sync_due(0, 5_000));
+        assert!(!presence_sync_due(
+            5_000,
+            5_000 + PRESENCE_SYNC_THROTTLE_MS - 1
+        ));
+        assert!(presence_sync_due(5_000, 5_000 + PRESENCE_SYNC_THROTTLE_MS));
+        // 系统时钟回拨（NTP 校正）：饱和减法得到 0，按未到阈值处理，避免合并风暴。
+        assert!(!presence_sync_due(9_000, 8_000));
+    }
 
     #[test]
     fn consttime_eq_matches_plain_equality() {
