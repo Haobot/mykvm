@@ -56,5 +56,11 @@ jobs:
       - name: Check Tauri backend
         run: cargo check --manifest-path src-tauri/Cargo.toml --workspace --all-targets --locked
 
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Clippy Tauri backend
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
       - name: Test Tauri backend and input helper
         run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --locked
