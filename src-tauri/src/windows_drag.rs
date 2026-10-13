@@ -553,6 +553,8 @@ struct FileReadStream {
 }
 
 impl FileReadStream {
+    // 返回值是 COM 接口对象而非 Self（windows-rs implement 宏的惯例形态）。
+    #[allow(clippy::new_ret_no_self)]
     fn new(buffer: Arc<FileBuffer>) -> IStream {
         FileReadStream {
             buffer,
@@ -705,9 +707,11 @@ impl IStream_Impl for FileReadStream_Impl {
         if pstatstg.is_null() {
             return Err(windows::core::Error::from(E_NOTIMPL));
         }
-        let mut stat = STATSTG::default();
-        stat.r#type = STGTY_STREAM.0 as u32;
-        stat.cbSize = self.buffer.size;
+        let stat = STATSTG {
+            r#type: STGTY_STREAM.0 as u32,
+            cbSize: self.buffer.size,
+            ..Default::default()
+        };
         unsafe { *pstatstg = stat };
         Ok(())
     }
@@ -1003,7 +1007,7 @@ fn inject_left_button(down: bool) {
     } else {
         MOUSEEVENTF_LEFTUP
     };
-    let mut input = INPUT {
+    let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
             mi: MOUSEINPUT {
@@ -1017,6 +1021,6 @@ fn inject_left_button(down: bool) {
         },
     };
     unsafe {
-        SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+        SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
     }
 }

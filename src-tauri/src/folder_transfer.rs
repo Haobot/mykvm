@@ -135,6 +135,7 @@ pub(crate) fn extract(archive: &Path, destination: &Path) -> Result<(), String> 
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
     let entries = walk(source).map_err(std::io::Error::other)?;
     fs::create_dir(destination)?;

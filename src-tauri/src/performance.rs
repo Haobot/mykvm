@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 
 #[cfg(target_os = "windows")]
@@ -64,6 +65,7 @@ fn read_platform_process_performance() -> Result<(f64, f64), String> {
     read_unix_process_performance()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn read_unix_process_performance() -> Result<(f64, f64), String> {
     let pid = std::process::id().to_string();
     let output = command_stdout(Command::new("ps").args(["-p", &pid, "-o", "%cpu=,rss="]))?;
@@ -187,6 +189,8 @@ fn read_windows_process_performance() -> Result<(f64, f64), String> {
     ))
 }
 
+// 纯解析逻辑，全平台保留以供单测；Windows 生产路径不经过它。
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn parse_process_metrics(output: &str) -> Result<(f64, f64), String> {
     let values = output
         .trim()
@@ -215,6 +219,7 @@ fn filetime_to_u64(filetime: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64
 }
 
+#[cfg(not(target_os = "windows"))]
 fn command_stdout(command: &mut Command) -> Result<String, String> {
     let output = command
         .output()

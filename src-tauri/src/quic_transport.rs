@@ -345,6 +345,8 @@ enum ConnectionSlot {
 
 type ConnectionMap = Arc<Mutex<HashMap<PeerKey, ConnectionSlot>>>;
 
+// 参数为端到端握手与生命周期所需全量上下文，收敛留待协议治理（分级优化方案 3.3）。
+#[allow(clippy::too_many_arguments)]
 async fn run_transport(
     preferred_port: u16,
     identity: TransportIdentity,

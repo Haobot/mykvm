@@ -308,8 +308,10 @@ mod tests {
 
     #[test]
     fn automatic_rules_block_entry_without_pulling_an_existing_session_back() {
-        let mut protection = InputProtection::default();
-        protection.blocked_applications = vec!["game.exe".into()];
+        let protection = InputProtection {
+            blocked_applications: vec!["game.exe".into()],
+            ..InputProtection::default()
+        };
         let app = ForegroundApplication {
             names: vec!["GAME.EXE".into()],
             fullscreen: true,
@@ -319,7 +321,10 @@ mod tests {
             Some(PauseReason::Application)
         );
         assert_eq!(pause_reason(&protection, &app, true), None);
-        protection.local_only = true;
+        let protection = InputProtection {
+            local_only: true,
+            ..protection
+        };
         assert_eq!(
             pause_reason(&protection, &app, true),
             Some(PauseReason::LocalOnly)
@@ -328,8 +333,10 @@ mod tests {
 
     #[test]
     fn leaving_a_fullscreen_app_restores_capture_and_disabling_the_rule_allows_entry() {
-        let mut protection = InputProtection::default();
-        protection.protect_fullscreen = true;
+        let mut protection = InputProtection {
+            protect_fullscreen: true,
+            ..InputProtection::default()
+        };
         let mut app = ForegroundApplication {
             names: vec!["player.exe".into()],
             fullscreen: true,

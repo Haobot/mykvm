@@ -151,8 +151,8 @@ pub fn arm(device_id: &str, x: i32, y: i32) {
     let hwnd = HWND(catcher.hwnd as *mut _);
     // Pack the (possibly negative on multi-monitor) coordinates through the
     // message params; the window thread unpacks and positions itself.
-    let wparam = WPARAM((x as i32) as u32 as usize);
-    let lparam = LPARAM((y as i32) as isize);
+    let wparam = WPARAM(x as u32 as usize);
+    let lparam = LPARAM(y as isize);
     unsafe {
         let _ = PostMessageW(Some(hwnd), WM_ARM, wparam, lparam);
     }

@@ -86,7 +86,7 @@ mod windows_helper {
         fs::{self, OpenOptions},
         io::Write as _,
         mem,
-        path::PathBuf,
+        path::{Path, PathBuf},
         ptr,
         sync::{mpsc, OnceLock},
         thread,
@@ -154,20 +154,17 @@ mod windows_helper {
         let mut args = env::args_os().skip(1);
         match args.next().as_deref().and_then(OsStr::to_str) {
             Some("--service") => {
-                let service_args = ServiceArgs::parse(args).map_err(|error| {
-                    log_service_error("parse service arguments", &error);
-                    error
-                })?;
+                let service_args = ServiceArgs::parse(args)
+                    .inspect_err(|error| log_service_error("parse service arguments", error))?;
                 if SERVICE_ARGS.set(service_args).is_err() {
                     return Err("service arguments already initialized".into());
                 }
                 service_dispatcher::start(INPUT_SERVICE_NAME, ffi_service_main)
                     .map_err(|error| format!("start service dispatcher: {error}"))
             }
-            Some("--worker") => run_worker().map_err(|error| {
-                log_service_error("input worker stopped with error", &error);
-                error
-            }),
+            Some("--worker") => {
+                run_worker().inspect_err(|error| log_service_error("input worker stopped with error", error))
+            }
             _ => Err("expected --service or --worker".into()),
         }
     }
@@ -257,7 +254,7 @@ mod windows_helper {
 
         let mut worker = WorkerProcess::default();
         restart_worker(&mut worker);
-        let mut receiver = service_args.config_path.as_ref().and_then(start_receiver);
+        let mut receiver = service_args.config_path.as_ref().and_then(|path| start_receiver(path));
         let mut network_leased = false;
         let mut network_shutdown_failed = false;
         if let Some(owner_sid) = service_args.owner_sid.clone() {
@@ -293,14 +290,14 @@ mod windows_helper {
                         log_service_error("stop headless receiver after GUI lease", &error);
                     }
                     network_leased = false;
-                    receiver = service_args.config_path.as_ref().and_then(start_receiver);
+                    receiver = service_args.config_path.as_ref().and_then(|path| start_receiver(path));
                 }
                 Ok(ServiceEvent::SessionChange) | Err(mpsc::RecvTimeoutError::Timeout) => {
                     if worker.needs_restart() {
                         restart_worker(&mut worker);
                     }
                     if !network_leased && receiver.is_none() {
-                        receiver = service_args.config_path.as_ref().and_then(start_receiver);
+                        receiver = service_args.config_path.as_ref().and_then(|path| start_receiver(path));
                     }
                 }
             }
@@ -345,8 +342,8 @@ mod windows_helper {
         }
     }
 
-    fn start_receiver(config_path: &PathBuf) -> Option<HeadlessClientHandle> {
-        match headless_client::start(config_path.clone()) {
+    fn start_receiver(config_path: &Path) -> Option<HeadlessClientHandle> {
+        match headless_client::start(config_path.to_path_buf()) {
             Ok(receiver) => receiver,
             Err(error) => {
                 log_service_error("start headless receiver", &error);
@@ -579,15 +576,15 @@ mod windows_helper {
 
     unsafe fn spawn_worker_on_desktop(
         primary_token: HANDLE,
-        exe: &PathBuf,
-        current_dir: &PathBuf,
+        exe: &Path,
+        current_dir: &Path,
         desktop: &str,
     ) -> Result<HANDLE, String> {
         let command = format!("\"{}\" --worker", exe.display());
         let mut command_w = wide_null(&command);
         let mut desktop_w = wide_null(desktop);
         let current_dir_w = wide_null(&current_dir.to_string_lossy());
-        let mut startup_info = STARTUPINFOW {
+        let startup_info = STARTUPINFOW {
             cb: mem::size_of::<STARTUPINFOW>() as u32,
             lpDesktop: desktop_w.as_mut_ptr(),
             ..Default::default()
@@ -603,7 +600,7 @@ mod windows_helper {
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
             ptr::null(),
             current_dir_w.as_ptr(),
-            &mut startup_info,
+            &startup_info,
             &mut process_info,
         ) == 0
         {
@@ -856,7 +853,7 @@ mod windows_helper {
         }
 
         fn from_sddl(sddl: &str) -> Result<Self, String> {
-            let sddl_w = wide_null(&sddl);
+            let sddl_w = wide_null(sddl);
             let mut security_descriptor = ptr::null_mut();
             let ok = unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(

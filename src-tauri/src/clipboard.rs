@@ -227,95 +227,6 @@ where
     read_text().or_else(read_image)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn file_clipboard_recopies_resend_without_changing_the_echo_signature() {
-        let files = ClipboardSnapshot::Files(vec!["/folder".into(), "/中文.txt".into()]);
-        assert_ne!(files.send_key(Some(1)), files.send_key(Some(2)));
-        assert_eq!(
-            files.signature(),
-            files_signature(&["/folder".into(), "/中文.txt".into()])
-        );
-        assert_ne!(
-            files_signature(&["ab".into(), "c".into()]),
-            files_signature(&["a".into(), "bc".into()])
-        );
-        let text = ClipboardSnapshot::Content(ClipboardContent::Text("same text".into()));
-        assert_eq!(text.send_key(Some(1)), text.send_key(Some(2)));
-    }
-
-    #[test]
-    fn image_budget_accounts_for_base64_padding() {
-        let encoded_len = CLIPBOARD_MAX_IMAGE_BYTES.div_ceil(3) * 4;
-        let mut image = ClipboardImage {
-            width: 8192,
-            height: 1024,
-            rgba_base64: "A".repeat(encoded_len - 1) + "=",
-        };
-        assert!(!ClipboardContent::Image(image.clone()).is_oversized());
-        image.rgba_base64.replace_range(encoded_len - 1.., "A");
-        assert!(ClipboardContent::Image(image).is_oversized());
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn unknown_clipboard_prefers_text_before_image() {
-        let content = read_content_for_hint(
-            ClipboardContentHint::Unknown,
-            || Some(ClipboardContent::Text("中文测试 abc 123".into())),
-            || {
-                Some(ClipboardContent::Image(ClipboardImage {
-                    width: 1,
-                    height: 1,
-                    rgba_base64: "AAAAAA==".into(),
-                }))
-            },
-        );
-
-        match content {
-            Some(ClipboardContent::Text(text)) => assert_eq!(text, "中文测试 abc 123"),
-            _ => panic!("expected text to win when the platform cannot identify clipboard format"),
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn unknown_clipboard_keeps_windows_image_first_fallback() {
-        let content = read_content_for_hint(
-            ClipboardContentHint::Unknown,
-            || Some(ClipboardContent::Text("中文测试 abc 123".into())),
-            || {
-                Some(ClipboardContent::Image(ClipboardImage {
-                    width: 1,
-                    height: 1,
-                    rgba_base64: "AAAAAA==".into(),
-                }))
-            },
-        );
-
-        match content {
-            Some(ClipboardContent::Image(image)) => assert_eq!(image.width, 1),
-            _ => panic!("expected Windows fallback to keep image priority"),
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn utf8_command_sets_locale_for_clipboard_tools() {
-        let command = utf8_command("pbpaste");
-        let envs: std::collections::HashMap<_, _> = command
-            .get_envs()
-            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
-            .collect();
-
-        assert_eq!(envs.get("LANG"), Some(&"en_US.UTF-8"));
-        assert_eq!(envs.get("LC_CTYPE"), Some(&"en_US.UTF-8"));
-    }
-}
-
 fn read_image() -> Option<ClipboardImage> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
@@ -557,4 +468,93 @@ fn utf8_command(program: &str) -> std::process::Command {
         .env("LANG", "en_US.UTF-8")
         .env("LC_CTYPE", "en_US.UTF-8");
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_clipboard_recopies_resend_without_changing_the_echo_signature() {
+        let files = ClipboardSnapshot::Files(vec!["/folder".into(), "/中文.txt".into()]);
+        assert_ne!(files.send_key(Some(1)), files.send_key(Some(2)));
+        assert_eq!(
+            files.signature(),
+            files_signature(&["/folder".into(), "/中文.txt".into()])
+        );
+        assert_ne!(
+            files_signature(&["ab".into(), "c".into()]),
+            files_signature(&["a".into(), "bc".into()])
+        );
+        let text = ClipboardSnapshot::Content(ClipboardContent::Text("same text".into()));
+        assert_eq!(text.send_key(Some(1)), text.send_key(Some(2)));
+    }
+
+    #[test]
+    fn image_budget_accounts_for_base64_padding() {
+        let encoded_len = CLIPBOARD_MAX_IMAGE_BYTES.div_ceil(3) * 4;
+        let mut image = ClipboardImage {
+            width: 8192,
+            height: 1024,
+            rgba_base64: "A".repeat(encoded_len - 1) + "=",
+        };
+        assert!(!ClipboardContent::Image(image.clone()).is_oversized());
+        image.rgba_base64.replace_range(encoded_len - 1.., "A");
+        assert!(ClipboardContent::Image(image).is_oversized());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unknown_clipboard_prefers_text_before_image() {
+        let content = read_content_for_hint(
+            ClipboardContentHint::Unknown,
+            || Some(ClipboardContent::Text("中文测试 abc 123".into())),
+            || {
+                Some(ClipboardContent::Image(ClipboardImage {
+                    width: 1,
+                    height: 1,
+                    rgba_base64: "AAAAAA==".into(),
+                }))
+            },
+        );
+
+        match content {
+            Some(ClipboardContent::Text(text)) => assert_eq!(text, "中文测试 abc 123"),
+            _ => panic!("expected text to win when the platform cannot identify clipboard format"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unknown_clipboard_keeps_windows_image_first_fallback() {
+        let content = read_content_for_hint(
+            ClipboardContentHint::Unknown,
+            || Some(ClipboardContent::Text("中文测试 abc 123".into())),
+            || {
+                Some(ClipboardContent::Image(ClipboardImage {
+                    width: 1,
+                    height: 1,
+                    rgba_base64: "AAAAAA==".into(),
+                }))
+            },
+        );
+
+        match content {
+            Some(ClipboardContent::Image(image)) => assert_eq!(image.width, 1),
+            _ => panic!("expected Windows fallback to keep image priority"),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn utf8_command_sets_locale_for_clipboard_tools() {
+        let command = utf8_command("pbpaste");
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+            .collect();
+
+        assert_eq!(envs.get("LANG"), Some(&"en_US.UTF-8"));
+        assert_eq!(envs.get("LC_CTYPE"), Some(&"en_US.UTF-8"));
+    }
 }

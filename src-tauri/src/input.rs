@@ -704,6 +704,9 @@ impl SwitchDirection {
 /// Outcome of a hotkey-driven switch request. The capture loop acts on it: an
 /// `Enter` builds an `ActiveTarget` and runs the enter sequence; a `Return`
 /// hands control back to the local machine.
+// Enter 携带完整 ActiveTarget（多屏布局数据），与控制流变体体积差异大；
+// 装箱改写留待中期 input.rs 结构重构（分级优化方案 2.2）。
+#[allow(clippy::large_enum_variant)]
 enum SwitchOutcome {
     Enter(ActiveTarget),
     LocalMove {
@@ -774,6 +777,7 @@ fn captured_shortcut(
     None
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn screen_switch_hotkey_matches_vk(
     layout_state: &Arc<Mutex<LayoutState>>,
     key_code: u16,
@@ -791,6 +795,7 @@ fn screen_switch_hotkey_matches_vk(
     screen_switch_hotkeys_match_vk(&layout.screen_switch_hotkeys, key_code, modifiers)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn screen_switch_hotkeys_match_vk(
     hotkeys: &crate::ScreenSwitchHotkeys,
     key_code: u16,
@@ -806,6 +811,7 @@ fn screen_switch_hotkeys_match_vk(
     .any(|hotkey| hotkey_matches_vk(hotkey, key_code, modifiers))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn clipboard_paste_matches(
     layout: &Arc<Mutex<LayoutState>>,
     key: u16,
@@ -1093,6 +1099,7 @@ fn remembered_local_screen_point(
     points.get(to_screen_id).copied().unwrap_or(fallback)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_input_runtime(
     layout: LayoutState,
     layout_state: Arc<Mutex<LayoutState>>,
@@ -1101,7 +1108,6 @@ pub fn start_input_runtime(
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
-    main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
@@ -1124,7 +1130,6 @@ pub fn start_input_runtime(
         stop,
         remote_active,
         main_window_visible,
-        main_window_focused,
         clipboard_target,
         input_events,
         switch_request,
@@ -1235,6 +1240,7 @@ fn macos_secure_input_enabled() -> bool {
     unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_input_capture(
     targets: Vec<InputTarget>,
     layout_state: Arc<Mutex<LayoutState>>,
@@ -1243,7 +1249,6 @@ fn start_input_capture(
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
-    main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
@@ -1264,7 +1269,6 @@ fn start_input_capture(
         stop,
         remote_active,
         main_window_visible,
-        main_window_focused,
         clipboard_target,
         input_events,
         switch_request,
@@ -1281,7 +1285,6 @@ fn start_platform_capture(
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
-    _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
@@ -1534,6 +1537,7 @@ fn start_platform_capture(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn start_platform_capture(
     targets: Vec<InputTarget>,
     layout_state: Arc<Mutex<LayoutState>>,
@@ -1542,7 +1546,6 @@ fn start_platform_capture(
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     _main_window_visible: Arc<AtomicBool>,
-    main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
@@ -1576,7 +1579,6 @@ fn start_platform_capture(
             native_layout,
             active: Mutex::new(None),
             remote_active,
-            main_window_focused,
             clipboard_target,
             input_events,
             targets: Mutex::new(Arc::new(targets)),
@@ -3176,7 +3178,7 @@ fn dispatch_input_command(command: InputCommand) -> bool {
                 note_windows_helper_unavailable(&error);
             }
         }
-        return true;
+        true
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -3301,6 +3303,7 @@ fn input_event_to_command(
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn inject_input_command(command: InputCommand) {
     #[cfg(target_os = "macos")]
     if matches!(command, InputCommand::MouseMove { .. }) {
@@ -3755,7 +3758,6 @@ struct WindowsCaptureContext {
     native_layout: LayoutState,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
-    main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     targets: Mutex<Arc<Vec<InputTarget>>>,
@@ -4042,6 +4044,7 @@ pub fn current_clipboard_target(
     target.clone()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_clipboard_target(
     target: &Arc<Mutex<Option<ClipboardTarget>>>,
     device_id: String,
@@ -4202,8 +4205,8 @@ pub(crate) fn prepare_system_shortcut(value: &str, direction: bool) -> bool {
 pub(crate) fn owns_native_shortcuts() -> bool {
     #[cfg(target_os = "windows")]
     {
-        return windows_capture_context()
-            .is_some_and(|context| context.keyboard_thread_id.load(Ordering::Relaxed) != 0);
+        windows_capture_context()
+            .is_some_and(|context| context.keyboard_thread_id.load(Ordering::Relaxed) != 0)
     }
     #[cfg(not(target_os = "windows"))]
     false
@@ -4795,42 +4798,40 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     // Edge drag-drop hand-off: the edge catcher read a file drag and asked us
     // to cross so the cursor slides onto the controlled machine. Activate the
     // target we parked when we armed the catcher.
-    if active.is_none() {
-        if let Some(device_id) = crate::windows_drop_catcher::take_handoff() {
-            let pending = context
-                .pending_drag_cross
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take());
-            if let Some(active_target) = pending {
-                let anchor = windows_remote_anchor_point(&active_target);
-                hide_windows_cursor_if_needed(context);
-                set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
-                let _ = send_remote_mouse_move(
-                    &context.quic_transport,
-                    &active_target,
-                    &context.layout_state,
-                    &context.input_events,
-                );
-                mark_mouse_move_sent(&context.last_mouse_move_sent);
-                reset_remote_button_mask(&context.remote_button_mask);
-                context.remote_active.store(true, Ordering::Relaxed);
-                set_control_clipboard_target(
-                    &context.clipboard_target,
-                    &active_target,
-                    &context.layout_state,
-                );
-                log::info!(
-                    "edge drag-drop: crossing to {} after edge read",
-                    active_target.target.device_id
-                );
-                *active = Some(active_target);
-                if let Ok(mut anchor_state) = context.anchor.lock() {
-                    *anchor_state = Some(anchor);
-                }
-                context.just_crossed.store(true, Ordering::Relaxed);
-                return true;
+    if active.is_none() && crate::windows_drop_catcher::take_handoff().is_some() {
+        let pending = context
+            .pending_drag_cross
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(active_target) = pending {
+            let anchor = windows_remote_anchor_point(&active_target);
+            hide_windows_cursor_if_needed(context);
+            set_windows_cursor(anchor.0.round() as i32, anchor.1.round() as i32);
+            let _ = send_remote_mouse_move(
+                &context.quic_transport,
+                &active_target,
+                &context.layout_state,
+                &context.input_events,
+            );
+            mark_mouse_move_sent(&context.last_mouse_move_sent);
+            reset_remote_button_mask(&context.remote_button_mask);
+            context.remote_active.store(true, Ordering::Relaxed);
+            set_control_clipboard_target(
+                &context.clipboard_target,
+                &active_target,
+                &context.layout_state,
+            );
+            log::info!(
+                "edge drag-drop: crossing to {} after edge read",
+                active_target.target.device_id
+            );
+            *active = Some(active_target);
+            if let Ok(mut anchor_state) = context.anchor.lock() {
+                *anchor_state = Some(anchor);
             }
+            context.just_crossed.store(true, Ordering::Relaxed);
+            return true;
         }
     }
 
@@ -5131,7 +5132,7 @@ fn handle_windows_mouse_button(
         return false;
     };
     // WM_XBUTTON* packs which side button in the high word of mouseData.
-    let x_button = if (mouse_data >> 16) as u16 == XBUTTON1 as u16 {
+    let x_button = if (mouse_data >> 16) as u16 == XBUTTON1 {
         MouseButton::Back
     } else {
         MouseButton::Forward
@@ -6733,6 +6734,7 @@ fn update_windows_remote_screen(
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn should_ignore_initial_anchor_warp_delta(edge: Edge, dx: f64, dy: f64) -> bool {
     match edge {
         Edge::Right => dx <= -MIN_CROSSING_DELTA && dx.abs() >= dy.abs() * CROSSING_AXIS_DOMINANCE,
@@ -8167,7 +8169,6 @@ fn mac_key_to_windows_vk(code: u16) -> Option<u16> {
     })
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// A Mac media key (IOKit NX_KEYTYPE_*) as the Windows VK the wire carries.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn mac_media_key_to_windows_vk(key: u32) -> Option<u16> {
@@ -8197,6 +8198,7 @@ fn windows_vk_to_mac_media_key(vk: u16) -> Option<u32> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn windows_vk_to_mac_key(code: u16) -> Option<u16> {
     mac_key_to_windows_vk_pairs()
         .iter()
@@ -8921,6 +8923,7 @@ static MAC_INJECT_FLAGS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether remote Caps Lock is currently held down, so auto-repeat key-downs
 /// (which arrive with no key-up between them) don't each trigger a switch.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 static MACOS_CAPS_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Debounce window for remote Caps Lock → input-source switches. A single
@@ -8933,6 +8936,7 @@ static MACOS_CAPS_DOWN: AtomicBool = AtomicBool::new(false);
 const MACOS_CAPS_DEBOUNCE_MS: u64 = 300;
 /// While Caps is held, only switch again once this long has passed with no
 /// key-up — recovers from a dropped key-up without acting on auto-repeat.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const MACOS_CAPS_STALE_MS: u64 = 1500;
 
 #[cfg(target_os = "macos")]
@@ -9269,22 +9273,28 @@ mod macos_input_source {
     }
 }
 
+// Windows 注入已由 pipe 调度器直连（见 dispatch_input_command），以下包装仅
+// 保留平台分派对称性，在 Windows 目标上为死代码。
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     crate::windows_input::inject_mouse_move(x, y, drag_button);
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
     let _ = crate::windows_input::inject_mouse_button(button, down, x, y);
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn inject_scroll(delta_x: i32, delta_y: i32) {
     let _ = crate::windows_input::inject_scroll(delta_x, delta_y);
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn inject_key(key_code: u16, down: bool) {
     let _ = crate::windows_input::inject_key(key_code, down);
 }
@@ -10498,7 +10508,8 @@ mod tests {
     fn remote_cursor_memory_separates_devices_and_screens_and_clamps_a_resized_screen() {
         let points = Mutex::new(HashMap::new());
         let target = target_for_coordinate_tests();
-        let mut active = crossing_target(&[target.clone()], 1919.0, 500.0, 40.0, 0.0).unwrap();
+        let mut active =
+            crossing_target(std::slice::from_ref(&target), 1919.0, 500.0, 40.0, 0.0).unwrap();
         active.x = 2000.0;
         active.y = 1200.0;
         remember_remote_screen_point(&points, &active);
@@ -11564,7 +11575,6 @@ mod tests {
     #[test]
     fn fast_crossing_carries_entry_delta_into_remote() {
         let target = target_for_coordinate_tests();
-        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
         let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0)
             .expect("fast edge movement should cross");
 

@@ -13,7 +13,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 thread_local! {
-    static PROCESS_NAME: RefCell<(u32, Vec<String>)> = RefCell::new((0, Vec::new()));
+    static PROCESS_NAME: RefCell<(u32, Vec<String>)> = const { RefCell::new((0, Vec::new())) };
 }
 
 pub(super) fn snipaste_is_running() -> bool {

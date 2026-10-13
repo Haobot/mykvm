@@ -1321,7 +1321,6 @@ impl AppRuntime {
             Arc::clone(&stop),
             Arc::clone(&self.remote_input_active),
             Arc::clone(&self.main_window_visible),
-            Arc::clone(&self.main_window_focused),
             Arc::clone(&self.clipboard_target),
             Arc::clone(&self.input_events),
             Arc::clone(&self.screen_switch_request),
@@ -3267,14 +3266,14 @@ fn release_single_instance() {}
 pub fn activate_existing_instance() -> bool {
     #[cfg(target_os = "windows")]
     {
-        return signal_named_instance_event(ACTIVATE_INSTANCE_EVENT_NAME);
+        signal_named_instance_event(ACTIVATE_INSTANCE_EVENT_NAME)
     }
 
     #[cfg(target_os = "macos")]
     {
         // Launch Services delivers this to the running instance as a Reopen
         // event, which the app already answers by showing the main window.
-        return std::process::Command::new("open")
+        std::process::Command::new("open")
             .args(["-b", MACOS_BUNDLE_ID])
             .status()
             .map(|status| status.success())
@@ -3290,7 +3289,7 @@ pub fn activate_existing_instance() -> bool {
 pub fn request_existing_instance_quit() -> bool {
     #[cfg(target_os = "windows")]
     {
-        return signal_named_instance_event(QUIT_INSTANCE_EVENT_NAME);
+        signal_named_instance_event(QUIT_INSTANCE_EVENT_NAME)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -4361,14 +4360,14 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
             "Lock-screen input service is installed but not running."
         };
 
-        return Ok(InputServiceStatus {
+        Ok(InputServiceStatus {
             installed: true,
             running,
             worker_session_id,
             pipe_available,
             sas_available,
             detail: detail.into(),
-        });
+        })
     }
 }
 
@@ -4569,8 +4568,8 @@ fn windows_input_service_owns_network_ports() -> Result<bool, String> {
 
 #[cfg(target_os = "windows")]
 fn install_windows_input_service(
-    helper_path: &PathBuf,
-    config_path: &PathBuf,
+    helper_path: &Path,
+    config_path: &Path,
     owner_sid: &str,
 ) -> Result<(), String> {
     use windows_sys::Win32::{
@@ -4738,7 +4737,7 @@ fn protected_input_helper_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn install_protected_input_helper(source: &PathBuf) -> Result<PathBuf, String> {
+fn install_protected_input_helper(source: &Path) -> Result<PathBuf, String> {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
@@ -4983,7 +4982,7 @@ fn current_windows_user_sid() -> Result<String, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn ensure_windows_input_service_firewall_rule(helper_path: &PathBuf) -> Result<(), String> {
+fn ensure_windows_input_service_firewall_rule(helper_path: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -5787,10 +5786,7 @@ fn merge_detected_local_device(saved_layout: &LayoutState, mut detected_device: 
 }
 
 fn is_old_demo_layout(layout: &LayoutState) -> bool {
-    layout
-        .devices
-        .iter()
-        .any(|device| is_old_demo_device(device))
+    layout.devices.iter().any(is_old_demo_device)
 }
 
 fn is_old_demo_device(device: &Device) -> bool {
@@ -6580,10 +6576,11 @@ fn choose_available_transport_port(preferred: u16) -> u16 {
 fn bind_available_udp_port(preferred: u16) -> Result<(UdpSocket, u16), String> {
     let start = normalize_transport_port(preferred);
     for offset in 0..64_u16 {
-        let candidate = start.saturating_add(offset);
-        if candidate > TRANSPORT_PORT_MAX {
+        // TRANSPORT_PORT_MAX 即 u16::MAX，上界比较恒假（clippy absurd_extreme_comparisons），
+        // 溢出保护由 checked_add 承担；若未来常量低于 u16::MAX 需恢复区间检查。
+        let Some(candidate) = start.checked_add(offset) else {
             break;
-        }
+        };
 
         if let Ok(socket) = bind_reusable_udp_port(candidate) {
             return Ok((socket, candidate));
@@ -6770,6 +6767,8 @@ fn clipboard_retry_delay(failures: u32) -> Duration {
     Duration::from_millis((CLIPBOARD_RETRY_INTERVAL_MS << doublings).min(CLIPBOARD_RETRY_MAX_MS))
 }
 
+// 参数为各线程句柄的管线透传，收敛签名属于中期结构重构（分级优化方案 2.x）。
+#[allow(clippy::too_many_arguments)]
 fn run_clipboard_sync(
     quic_transport: quic_transport::TransportHandle,
     local_peer_id: String,
@@ -8111,6 +8110,7 @@ fn send_ole_drag_signal(state: &AppRuntime, device_id: &str, kind: &str) -> Resu
 /// controller mid-drag. Fire-and-forget on a thread so the input hot path never
 /// blocks on the round-trip.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_drag_pull(
     quic_transport: &quic_transport::TransportHandle,
     origin_id: String,
@@ -10370,12 +10370,10 @@ fn discovery_target_ports(base: u16) -> Vec<u16> {
     let base = normalize_transport_port(base);
     let mut ports = Vec::new();
     for offset in 0..DISCOVERY_PORT_SPAN {
+        // 同 bind_available_udp_port：TRANSPORT_PORT_MAX 为 u16::MAX，区间比较恒假。
         let Some(port) = base.checked_add(offset) else {
             break;
         };
-        if port > TRANSPORT_PORT_MAX {
-            break;
-        }
         ports.push(port);
     }
     ports
@@ -10969,7 +10967,7 @@ mod tests {
         layout.devices[1].source = "manual".into();
         layout.devices[1].host = "169.254.10.2".into();
         let peer = test_peer();
-        apply_peer_presence(&mut layout, &[peer.clone()]);
+        apply_peer_presence(&mut layout, std::slice::from_ref(&peer));
         assert_eq!(layout.devices[1].host, "169.254.10.2");
         assert!(layout.devices[1].online);
         assert_eq!(layout.devices[1].quic_port, peer.quic_port);

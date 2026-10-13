@@ -162,11 +162,11 @@ unsafe fn position(mode: u8) -> (i32, i32) {
 unsafe fn render(hwnd: HWND, icon: Option<&[u32]>, progress: f32, at: (i32, i32)) {
     let screen = GetDC(std::ptr::null_mut());
     let memory = CreateCompatibleDC(screen);
-    let mut info = bitmap_info(WIDTH, HEIGHT);
+    let info = bitmap_info(WIDTH, HEIGHT);
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
     let bitmap = CreateDIBSection(
         memory,
-        &mut info,
+        &info,
         DIB_RGB_COLORS,
         &mut bits,
         std::ptr::null_mut(),

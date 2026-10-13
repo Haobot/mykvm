@@ -43,9 +43,11 @@ pub(crate) fn consume_paste(token: &str, key: &str) -> bool {
     true
 }
 
-fn receipts() -> &'static Mutex<HashMap<(String, String), (PathBuf, Instant)>> {
-    static RECEIPTS: OnceLock<Mutex<HashMap<(String, String), (PathBuf, Instant)>>> =
-        OnceLock::new();
+/// 粘贴回执表：token ->（对端 id，落盘路径，时间）。
+type PasteReceipts = HashMap<(String, String), (PathBuf, Instant)>;
+
+fn receipts() -> &'static Mutex<PasteReceipts> {
+    static RECEIPTS: OnceLock<Mutex<PasteReceipts>> = OnceLock::new();
     RECEIPTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

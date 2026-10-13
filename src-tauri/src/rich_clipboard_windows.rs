@@ -134,6 +134,7 @@ pub(super) fn read() -> Option<RichText> {
     })
 }
 
+#[allow(dead_code)]
 pub(super) fn write_rtf(bytes: &[u8]) -> Result<(), String> {
     let _open = open()?;
     unsafe { put(format("Rich Text Format"), bytes) }

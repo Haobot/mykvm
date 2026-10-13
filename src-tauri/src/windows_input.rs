@@ -136,12 +136,18 @@ pub struct DesktopAttachment {
     name: String,
 }
 
-impl DesktopAttachment {
-    pub fn new() -> Self {
+impl Default for DesktopAttachment {
+    fn default() -> Self {
         Self {
             desktop: ptr::null_mut(),
             name: String::new(),
         }
+    }
+}
+
+impl DesktopAttachment {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn attach_current_input_desktop(&mut self) -> Result<String, String> {
@@ -192,7 +198,7 @@ impl DesktopAttachment {
             }
             self.desktop = desktop;
             self.name = name.clone();
-            return Ok(name);
+            Ok(name)
         }
     }
 }

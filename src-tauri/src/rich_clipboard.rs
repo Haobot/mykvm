@@ -67,6 +67,7 @@ pub(crate) fn read() -> Option<RichText> {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) fn write_rtf(bytes: &[u8]) -> Result<(), String> {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
