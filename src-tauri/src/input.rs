@@ -8990,7 +8990,7 @@ fn macos_scroll_event(
     // Apple recommends private event state for remote-control applications.
     let source = CGEventSource::new(CGEventSourceStateID::Private)?;
     let event = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)?;
-    event.set_flags(CGEventFlags::from_bits_truncate(flags));
+    event.set_flags(CGEventFlags::from_bits_retain(flags));
     event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
     event.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 0);
     // Public CGEventField values in CGEventTypes.h (not exposed by this crate).
@@ -9052,17 +9052,40 @@ pub fn reset_injected_modifiers() {}
 
 /// Maps a Windows virtual-key modifier (the wire format) to its macOS event
 /// flag bits, or `None` for non-modifier keys.
+///
+/// The result carries BOTH the device-independent `CGEventFlag*` bit and the
+/// device-dependent `NX_DEVICE*KEYMASK` bit. Physical keyboards set both; the
+/// device bit is what modifier-hold detectors test (WeType's push-to-talk, sticky
+/// keys, some games). Without it a synthetic Command key-down is delivered as a
+/// flagsChanged event whose device bit is clear, which such apps read as the
+/// modifier being released — chords (⌘C) keep working because they only look at
+/// the device-independent flag on the following key event.
 #[cfg(target_os = "macos")]
-fn windows_vk_to_mac_flag(vk: u16) -> Option<u64> {
+fn windows_vk_to_mac_flags(vk: u16) -> Option<u64> {
     use core_graphics::event::CGEventFlags;
-    let flag = match vk {
-        0x10 | 0xA0 | 0xA1 => CGEventFlags::CGEventFlagShift,
-        0x11 | 0xA2 | 0xA3 => CGEventFlags::CGEventFlagControl,
-        0x12 | 0xA4 | 0xA5 => CGEventFlags::CGEventFlagAlternate,
-        0x5B | 0x5C => CGEventFlags::CGEventFlagCommand,
+
+    // Device-dependent modifier bits from IOKit/hidsystem/IOLLEvent.h.
+    const NX_DEVICELCTLKEYMASK: u64 = 0x0000_0001;
+    const NX_DEVICELSHIFTKEYMASK: u64 = 0x0000_0002;
+    const NX_DEVICERSHIFTKEYMASK: u64 = 0x0000_0004;
+    const NX_DEVICELCMDKEYMASK: u64 = 0x0000_0008;
+    const NX_DEVICERCMDKEYMASK: u64 = 0x0000_0010;
+    const NX_DEVICELALTKEYMASK: u64 = 0x0000_0020;
+    const NX_DEVICERALTKEYMASK: u64 = 0x0000_0040;
+    const NX_DEVICERCTLKEYMASK: u64 = 0x0000_2000;
+
+    let (generic, device) = match vk {
+        0x10 | 0xA0 => (CGEventFlags::CGEventFlagShift, NX_DEVICELSHIFTKEYMASK),
+        0xA1 => (CGEventFlags::CGEventFlagShift, NX_DEVICERSHIFTKEYMASK),
+        0x11 | 0xA2 => (CGEventFlags::CGEventFlagControl, NX_DEVICELCTLKEYMASK),
+        0xA3 => (CGEventFlags::CGEventFlagControl, NX_DEVICERCTLKEYMASK),
+        0x12 | 0xA4 => (CGEventFlags::CGEventFlagAlternate, NX_DEVICELALTKEYMASK),
+        0xA5 => (CGEventFlags::CGEventFlagAlternate, NX_DEVICERALTKEYMASK),
+        0x5B => (CGEventFlags::CGEventFlagCommand, NX_DEVICELCMDKEYMASK),
+        0x5C => (CGEventFlags::CGEventFlagCommand, NX_DEVICERCMDKEYMASK),
         _ => return None,
     };
-    Some(flag.bits())
+    Some(generic.bits() | device)
 }
 
 #[cfg(target_os = "macos")]
@@ -9117,7 +9140,7 @@ fn inject_key(key_code: u16, down: bool) {
 
     // Keep the running modifier state in sync, so the modifier event itself and
     // every later key carry the right flags.
-    if let Some(flag) = windows_vk_to_mac_flag(key_code) {
+    if let Some(flag) = windows_vk_to_mac_flags(key_code) {
         let mut flags = MAC_INJECT_FLAGS.load(Ordering::Relaxed);
         if down {
             flags |= flag;
@@ -9141,8 +9164,11 @@ fn inject_key(key_code: u16, down: bool) {
     };
     match CGEvent::new_keyboard_event(source, mac_code, down) {
         Ok(event) => {
+            // from_bits_retain (not truncate): CGEventFlags only defines the
+            // device-independent bits, so truncate would silently drop the
+            // NX_DEVICE*KEYMASK bits we now stamp.
             let mut flags =
-                CGEventFlags::from_bits_truncate(MAC_INJECT_FLAGS.load(Ordering::Relaxed));
+                CGEventFlags::from_bits_retain(MAC_INJECT_FLAGS.load(Ordering::Relaxed));
             // A physical Mac keyboard stamps the function-section flags on
             // arrow/nav keys (arrows additionally carry the numeric-pad bit).
             // Shortcut matching — system ones like ⌃← "move left a space" and
@@ -9794,17 +9820,38 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn windows_vk_to_mac_flag_covers_modifiers() {
-        // Modifiers (incl. sided variants and LWin/RWin -> Command) map to a flag.
-        assert!(windows_vk_to_mac_flag(0x10).is_some()); // Shift
-        assert!(windows_vk_to_mac_flag(0xA1).is_some()); // Right Shift
-        assert!(windows_vk_to_mac_flag(0x11).is_some()); // Control
-        assert!(windows_vk_to_mac_flag(0x12).is_some()); // Alt -> Option
-        assert!(windows_vk_to_mac_flag(0x5B).is_some()); // LWin -> Command
+    fn windows_vk_to_mac_flags_covers_modifiers_and_device_bits() {
+        // Every modifier carries its device-independent flag plus the
+        // device-dependent bit a physical keyboard sets. Modifier-hold detectors
+        // (e.g. WeType push-to-talk) test the device bit, so it must not be
+        // dropped.
+        assert_eq!(windows_vk_to_mac_flags(0x10), Some(0x0002_0000 | 0x2)); // Shift
+        assert_eq!(windows_vk_to_mac_flags(0xA0), Some(0x0002_0000 | 0x2)); // Left Shift
+        assert_eq!(windows_vk_to_mac_flags(0xA1), Some(0x0002_0000 | 0x4)); // Right Shift
+        assert_eq!(windows_vk_to_mac_flags(0x11), Some(0x0004_0000 | 0x1)); // Control
+        assert_eq!(windows_vk_to_mac_flags(0xA3), Some(0x0004_0000 | 0x2000)); // Right Ctrl
+        assert_eq!(windows_vk_to_mac_flags(0x12), Some(0x0008_0000 | 0x20)); // Alt -> Option
+        assert_eq!(windows_vk_to_mac_flags(0xA5), Some(0x0008_0000 | 0x40)); // Right Alt
+        assert_eq!(windows_vk_to_mac_flags(0x5B), Some(0x0010_0000 | 0x8)); // LWin -> Command
+        assert_eq!(windows_vk_to_mac_flags(0x5C), Some(0x0010_0000 | 0x10)); // RWin -> Command
 
         // Ordinary keys carry no modifier flag.
-        assert!(windows_vk_to_mac_flag(0x41).is_none()); // 'A'
-        assert!(windows_vk_to_mac_flag(0x20).is_none()); // Space
+        assert_eq!(windows_vk_to_mac_flags(0x41), None); // 'A'
+        assert_eq!(windows_vk_to_mac_flags(0x20), None); // Space
+
+        // Regression guard for the injection path: core_graphics' CGEventFlags
+        // only declares device-independent bits, so from_bits_truncate would
+        // silently drop NX_DEVICE*KEYMASK. inject_key must keep using
+        // from_bits_retain.
+        use core_graphics::event::CGEventFlags;
+        assert_eq!(
+            CGEventFlags::from_bits_retain(0x0010_0000 | 0x8).bits(),
+            0x0010_0000 | 0x8
+        );
+        assert_eq!(
+            CGEventFlags::from_bits_truncate(0x0010_0000 | 0x8).bits(),
+            0x0010_0000
+        );
     }
 
     #[cfg(target_os = "macos")]

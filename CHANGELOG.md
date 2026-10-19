@@ -80,6 +80,7 @@ release will reuse them).
 
 - macOS: opening MyKVM while it is already running (a second .app copy, `open -n`, or launching from a mounted DMG) now brings the running window to the front instead of starting a second process that fights the first over the network ports.
 - Windows: keyboard and mouse from the controller now keep working while a Remote Desktop session owns the machine and after it disconnects, so you can unlock the physical screen remotely instead of walking over to it (#21). The lock-screen input service now follows the physical console session when Remote Desktop swaps it, and the app reaches the service across that swap.
+- macOS: keys injected from the controlling machine now carry the device-dependent modifier bits a physical keyboard sets alongside the normal modifier flags. Apps that detect a held modifier — such as WeChat/WeType voice input's hold-Command push-to-talk — now start correctly, while ordinary shortcuts and copy/paste keep working.
 
 ### Known limitations
 
