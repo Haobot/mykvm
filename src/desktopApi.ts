@@ -220,15 +220,21 @@ export async function probeLanPeer(host: string) {
   return invoke<DiscoveryStatus['localPeer']>('probe_lan_peer', { host })
 }
 
-export async function requestLanPairing(host: string) {
+// deviceId 可选：重新配对已保存设备时传入布局设备 id。后端会据此在实时
+// peer 快照里重新解析该机器的当前地址（设备保存的 host 可能已过期），并回退
+// 到调用方传入的 host。未传时 Tauri 侧按 null 处理。
+export async function requestLanPairing(host: string, deviceId?: string) {
   if (!isTauri()) {
     throw new Error('LAN pairing is available only in the Tauri desktop runtime.')
   }
 
-  return invoke<DiscoveryStatus['localPeer']>('request_lan_pairing', { host })
+  return invoke<DiscoveryStatus['localPeer']>('request_lan_pairing', {
+    host,
+    deviceId: deviceId?.trim() || null,
+  })
 }
 
-export async function confirmLanPairing(host: string, code: string) {
+export async function confirmLanPairing(host: string, code: string, deviceId?: string) {
   if (!isTauri()) {
     throw new Error('LAN pairing is available only in the Tauri desktop runtime.')
   }
@@ -236,6 +242,7 @@ export async function confirmLanPairing(host: string, code: string) {
   return invoke<DiscoveryStatus['localPeer']>('confirm_lan_pairing', {
     host,
     code,
+    deviceId: deviceId?.trim() || null,
   })
 }
 

@@ -2,6 +2,15 @@ import { DeviceSettingsModal } from "./DeviceSettingsModal";
 import { HelpHeading, InfoTip } from "./InfoTip";
 import { createLayoutPersistQueue } from "./layoutPersist";
 import {
+  deviceMatchesPeer,
+  fallbackScreen,
+  findPeerDevice,
+  findRepairDeviceForPeer,
+  normalizePlatform,
+  repairHostCandidates,
+  upsertPeerDevice,
+} from "./pairingRepair";
+import {
   type CSSProperties,
   type FormEvent,
   useEffect,
@@ -77,7 +86,6 @@ import type {
   AppStateSnapshot,
   DiagnosticInfo,
   LanPeer,
-  LanPeerScreen,
   PerformanceSample,
   RuntimeStatus,
 } from "./runtime";
@@ -88,7 +96,6 @@ import type {
   MachineRole,
   ModifierMap,
   ModifierTarget,
-  Platform,
   Screen,
   ThemeMode,
   TransportPortMode,
@@ -101,14 +108,6 @@ const BOARD_ZOOM_MIN = 0.35;
 const BOARD_ZOOM_MAX = 2.4;
 const BOARD_ZOOM_STEP = 0.15;
 const SNAP_SIZE = 20;
-const DEVICE_COLORS = [
-  "#2f7af8",
-  "#0f766e",
-  "#b45309",
-  "#7c3aed",
-  "#be123c",
-  "#0891b2",
-];
 const PLATFORM_LABELS = {
   windows: "Windows",
   macos: "macOS",
@@ -139,6 +138,8 @@ interface ServerPairingState {
   host: string;
   manual: boolean;
   alias: string;
+  /** 重新配对的目标设备：后端据此在实时 peer 快照里重新解析地址。 */
+  deviceId?: string;
 }
 
 interface DragState {
@@ -1866,23 +1867,36 @@ function App() {
     });
   }
 
-  async function beginPairing(hostInput: string, manual = false, alias = "") {
+  async function beginPairing(
+    hostInput: string,
+    manual = false,
+    alias = "",
+    deviceId = "",
+  ): Promise<boolean> {
     const host = hostInput.trim();
     if (!host) {
       setErrorMessage(ui.errors.manualHostRequired);
-      return;
+      return false;
     }
 
     setIsPairingDevice(true);
     setErrorMessage(null);
 
     try {
-      const challengePeer = await requestLanPairing(host);
-      setServerPairing({ peer: challengePeer, host, manual, alias });
+      const challengePeer = await requestLanPairing(host, deviceId);
+      setServerPairing({
+        peer: challengePeer,
+        host,
+        manual,
+        alias,
+        deviceId: deviceId.trim() || undefined,
+      });
       setServerPairingCode("");
       setServerPairingError(null);
+      return true;
     } catch (error: unknown) {
       setErrorMessage(formatUnknownError(error, ui.errors.pairingFailed));
+      return false;
     } finally {
       setIsPairingDevice(false);
     }
@@ -1891,13 +1905,37 @@ function App() {
   // Re-pair an already-added device (server side). The client shows the code
   // on its own screen, so this works even when the client has no keyboard or
   // mouse and the cursor can no longer cross to it.
+  //
+  // The saved device.host can be stale (the client got a new DHCP lease while
+  // this controller still had it offline), so prefer the live discovery
+  // address and pass the device id: the backend re-resolves the live peer
+  // address from its own snapshot and falls back to the saved address.
   async function handleRepairDevice(device: Device) {
-    const host = (device.host || "").split("/").pop()?.trim() || "";
-    if (!host) {
+    const candidates = layout
+      ? repairHostCandidates(device, lanPeers, layout)
+      : repairHostCandidates(device, lanPeers);
+    if (candidates.length === 0) {
       setErrorMessage(ui.errors.manualHostRequired);
       return;
     }
-    await beginPairing(host, device.source === "manual");
+    await beginPairing(
+      candidates[0],
+      device.source === "manual",
+      "",
+      device.id,
+    );
+  }
+
+  // Devices page: a live peer matches no saved device, but an offline device is
+  // clearly the same machine (same name or hostname). Re-pair it in place
+  // instead of adding a duplicate that leaves the old device offline forever.
+  async function handleRepairPeerDevice(peer: LanPeer, device: Device) {
+    await beginPairing(
+      peer.ip || peer.host,
+      device.source === "manual",
+      "",
+      device.id,
+    );
   }
 
   async function confirmPairing(event: FormEvent<HTMLFormElement>) {
@@ -1916,14 +1954,28 @@ function App() {
     setServerPairingError(null);
 
     try {
-      const pairedPeer = await confirmLanPairing(serverPairing.host, code);
+      const pairedPeer = await confirmLanPairing(
+        serverPairing.host,
+        code,
+        serverPairing.deviceId,
+      );
       if (pairedPeer.screens.length === 0) {
         setServerPairingError(
           `${pairedPeer.name}: ${ui.errors.connectedWithoutScreens}`,
         );
         return;
       }
-      updateLayout((layoutState) => upsertPeerDevice(layoutState, pairedPeer, serverPairing.alias, serverPairing.manual));
+      // deviceId 命中旧设备时原位更新（换 IP / 证书轮换后也能恢复同一台设备），
+      // 否则沿用按公钥/id 匹配或新增设备的原有逻辑。
+      updateLayout((layoutState) =>
+        upsertPeerDevice(
+          layoutState,
+          pairedPeer,
+          serverPairing.alias,
+          serverPairing.manual,
+          serverPairing.deviceId,
+        ),
+      );
       setServerPairing(null);
       setServerPairingCode("");
       setServerPairingError(null);
@@ -2598,6 +2650,11 @@ function App() {
               <div className="connection-list">
                 {lanPeers.map((peer) => {
                   const addedDevice = findPeerDevice(layout, peer);
+                  // 已添加但离线、且明显是同一台机器（换 IP / 证书轮换）的
+                  // 设备：给出"重新配对"而不是新增一台重复设备。
+                  const staleDevice = addedDevice
+                    ? undefined
+                    : findRepairDeviceForPeer(layout, lanPeers, peer);
                   const screenCount =
                     peer.screens.length || addedDevice?.screens.length || 0;
                   // A client older than this controller can be updated from here.
@@ -2667,14 +2724,20 @@ function App() {
                           <button
                             type="button"
                             className="secondary-button compact-button"
-                            onClick={() => handleAddPeer(peer)}
+                            onClick={() =>
+                              staleDevice
+                                ? void handleRepairPeerDevice(peer, staleDevice)
+                                : handleAddPeer(peer)
+                            }
                             disabled={peer.screens.length === 0 || isPairingDevice}
                           >
                             {peer.screens.length === 0
                               ? ui.devices.noScreens
-                              : peer.pairingRequired
-                                ? ui.devices.pair
-                                : ui.common.add}
+                              : staleDevice
+                                ? ui.devices.repair
+                                : peer.pairingRequired
+                                  ? ui.devices.pair
+                                  : ui.common.add}
                           </button>
                         )}
                       </div>
@@ -3519,20 +3582,6 @@ function App() {
   );
 }
 
-function fallbackScreen(): Screen {
-  return {
-    id: "fallback",
-    deviceId: "fallback",
-    name: "Fallback",
-    x: 0,
-    y: 0,
-    width: 1,
-    height: 1,
-    scale: 1,
-    isPrimary: true,
-  };
-}
-
 function getSystemTheme(): Exclude<ThemeMode, "system"> {
   if (window.matchMedia("(prefers-color-scheme: dark)").matches) {
     return "dark";
@@ -3888,107 +3937,6 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
   return nextLayout;
 }
 
-function upsertPeerDevice(
-  layout: LayoutState,
-  peer: LanPeer,
-  alias = "",
-  manual = false,
-): LayoutState {
-  const existingIndex = layout.devices.findIndex(
-    (device) =>
-      device.id === peerDeviceId(peer) ||
-      (device.transportPublicKey.trim().length > 0 &&
-        device.transportPublicKey === peer.transportPublicKey),
-  );
-  const existingDevice =
-    existingIndex >= 0 ? layout.devices[existingIndex] : undefined;
-  const nextDevice = createDeviceFromPeer(layout, peer, alias, existingDevice, manual);
-  const devices =
-    existingIndex >= 0
-      ? layout.devices.map((device, index) =>
-          index === existingIndex ? nextDevice : device,
-        )
-      : [...layout.devices, nextDevice];
-
-  return {
-    ...layout,
-    devices,
-    inputMode: "control",
-    activeDeviceId: nextDevice.id,
-    selectedScreenId: nextDevice.screens[0]?.id ?? layout.selectedScreenId,
-  };
-}
-
-function createDeviceFromPeer(
-  layout: LayoutState,
-  peer: LanPeer,
-  alias = "",
-  existingDevice?: Device,
-  manual = false,
-): Device {
-  const id = existingDevice?.id ?? peerDeviceId(peer);
-
-  return {
-    id,
-    name: alias || existingDevice?.name || peer.name,
-    platform: normalizePlatform(peer.platform),
-    host: !manual && existingDevice?.source === "manual" ? existingDevice.host : peer.ip || peer.host,
-    transportPort: peer.transportPort,
-    quicPort: peer.quicPort,
-    transportPublicKey: peer.transportPublicKey,
-    protocolVersion: peer.protocolVersion,
-    color: existingDevice?.color ?? nextDeviceColor(layout),
-    online: true,
-    inputReady: peer.inputReady,
-    role: "client",
-    source: manual || existingDevice?.source === "manual" ? "manual" : "detected",
-    screens: createScreensFromPeer(layout, id, peer.screens, existingDevice),
-  };
-}
-
-function createScreensFromPeer(
-  layout: LayoutState,
-  deviceId: string,
-  peerScreens: LanPeerScreen[],
-  existingDevice?: Device,
-): Screen[] {
-  if (peerScreens.length === 0) {
-    return [];
-  }
-
-  const localScreens =
-    layout.devices.find((device) => device.role === "local")?.screens ?? [];
-  const localBounds = getLayoutBounds(
-    localScreens.length > 0 ? localScreens : [fallbackScreen()],
-  );
-  const layoutScreens = flattenScreens(layout);
-  const layoutBounds = getLayoutBounds(
-    layoutScreens.length > 0 ? layoutScreens : [fallbackScreen()],
-  );
-  const peerMinX = Math.min(...peerScreens.map((screen) => screen.x));
-  const peerMinY = Math.min(...peerScreens.map((screen) => screen.y));
-  const startX = layoutBounds.maxX;
-
-  return peerScreens.map((screen, index) => {
-    const id = uniqueScreenId(deviceId, screen, index);
-    const existingScreen = existingDevice?.screens.find(
-      (candidate) => candidate.id === id,
-    );
-
-    return {
-      id,
-      deviceId,
-      name: screen.name || `Display ${index + 1}`,
-      x: existingScreen?.x ?? startX + (screen.x - peerMinX),
-      y: existingScreen?.y ?? localBounds.minY + (screen.y - peerMinY),
-      width: screen.width,
-      height: screen.height,
-      scale: screen.scale,
-      isPrimary: screen.isPrimary,
-    };
-  });
-}
-
 function formatScreenCount(count: number, language: AppLanguage) {
   return language === "en"
     ? `${count} ${count === 1 ? "screen" : "screens"}`
@@ -4105,56 +4053,6 @@ function formatUpdaterError(
     : message;
 }
 
-function uniqueScreenId(
-  deviceId: string,
-  screen: LanPeerScreen,
-  index: number,
-) {
-  return `${deviceId}-${sanitizeId(screen.id || screen.name || `display-${index + 1}`)}`;
-}
-
-function nextDeviceColor(layout: LayoutState) {
-  return DEVICE_COLORS[layout.devices.length % DEVICE_COLORS.length];
-}
-
-function peerDeviceId(peer: LanPeer) {
-  return sanitizeId(peer.id || peer.name || peer.ip) || "peer-device";
-}
-
-function findPeerDevice(layout: LayoutState, peer: LanPeer) {
-  return layout.devices.find((device) => deviceMatchesPeer(layout, device, peer));
-}
-
-function deviceMatchesPeer(layout: LayoutState, device: Device, peer: LanPeer) {
-  if (device.transportPublicKey.trim().length > 0) {
-    return device.transportPublicKey === peer.transportPublicKey;
-  }
-  return (
-    device.id === peerDeviceId(peer) ||
-    sameClusterHost(layout, device, peer)
-  );
-}
-
-function sameClusterHost(layout: LayoutState, device: Device, peer: LanPeer) {
-  return (
-    layout.clusterId.trim().length > 0 &&
-    !peer.pairingRequired &&
-    peer.clusterId === layout.clusterId &&
-    (sameHost(device.host, peer.host) || sameHost(device.host, peer.ip))
-  );
-}
-
-function sameHost(value: string, host: string) {
-  const normalizedHost = host.trim().toLowerCase();
-  return (
-    normalizedHost.length > 0 &&
-    value
-      .split("/")
-      .map((part) => part.trim().toLowerCase())
-      .some((part) => part === normalizedHost)
-  );
-}
-
 function deviceBadgeStatusClass(device: Device) {
   if (device.role === "local") {
     return "device-badge-local";
@@ -4185,22 +4083,6 @@ function deviceSourceTagClass(device: Device) {
   }
 
   return "tag-pill-manual";
-}
-
-function sanitizeId(value: string) {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function normalizePlatform(platform: string): Platform {
-  if (platform === "windows" || platform === "macos") {
-    return platform;
-  }
-
-  return "unknown";
 }
 
 function getBoardMetrics(

@@ -12,7 +12,8 @@ use crate::{
     advertised_input_ready, apply_transport_to_peer, bind_available_udp_port, broadcast_addrs,
     decode_discovery_packet, discovery_base_port, input, known_peer_discovery_targets,
     load_layout_from_disk, local_peer_from_layout, peer_from_discovery_packet, preferred_quic_port,
-    quic_transport, send_discovery_packet, should_reply_to_discovery, LayoutState,
+    quic_transport, send_discovery_packet, send_discovery_packet_with_pairing,
+    should_reply_to_discovery, DiscoveryPairingFields, LayoutState,
 };
 
 /// The receive-only network runtime used by the Windows service before the
@@ -158,6 +159,29 @@ pub fn start(config_path: PathBuf) -> Result<Option<HeadlessClientHandle>, Strin
                     && should_reply_to_discovery(&current, &incoming.peer)
                 {
                     let _ = send_discovery_packet(&socket, "reply", &local_peer, source);
+                    continue;
+                }
+
+                if incoming.kind == "pair-request" {
+                    // Trusting a new controller (and showing the pairing code)
+                    // belongs to the interactive app; this headless receive-only
+                    // runtime deliberately does not pair. Answer with a reason
+                    // instead of silence so the controller side reports "start
+                    // the client app" rather than "the client is unreachable"
+                    // while the app is closed, restarting or updating.
+                    let _ = send_discovery_packet_with_pairing(
+                        &socket,
+                        "pair-reject",
+                        &local_peer,
+                        source,
+                        DiscoveryPairingFields {
+                            error: Some(
+                                "客户端主程序未运行或正在重启（当前仅无人值守接收服务在线），请启动客户端后重试。"
+                                    .into(),
+                            ),
+                            ..DiscoveryPairingFields::default()
+                        },
+                    );
                 }
             }
         });

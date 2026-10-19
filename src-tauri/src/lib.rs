@@ -1060,10 +1060,16 @@ impl AppRuntime {
         thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
             let mut last_announce = Instant::now() - Duration::from_secs(10);
+            let mut last_local_identity_refresh = Instant::now() - LOCAL_IDENTITY_REFRESH_INTERVAL;
             let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
             let mut last_upgrading = upgrading.load(Ordering::Relaxed);
 
             while !thread_stop.load(Ordering::Relaxed) {
+                if last_local_identity_refresh.elapsed() >= LOCAL_IDENTITY_REFRESH_INTERVAL {
+                    refresh_local_device_identity(&layout_state);
+                    last_local_identity_refresh = Instant::now();
+                }
+
                 let current_input_ready = input_receive_enabled.load(Ordering::Relaxed);
                 let current_upgrading = upgrading.load(Ordering::Relaxed);
                 if last_announce.elapsed() >= Duration::from_secs(3)
@@ -1134,12 +1140,18 @@ impl AppRuntime {
                             &current_peer.id,
                         ) {
                             if incoming.kind == "pair-request" {
-                                if begin_pairing_challenge(
+                                let accepted = begin_pairing_challenge(
                                     &pairing_challenge,
                                     &current_layout,
                                     &incoming.peer,
                                     source.ip().to_string(),
-                                ) {
+                                );
+                                if accepted {
+                                    log::info!(
+                                        "pairing request from {} ({}) accepted; showing pairing code",
+                                        incoming.peer.name,
+                                        source
+                                    );
                                     let handle = app_handle.clone();
                                     let _ = app_handle.run_on_main_thread(move || {
                                         let _ = show_main_window_handle(&handle);
@@ -1149,6 +1161,29 @@ impl AppRuntime {
                                         "pair-challenge",
                                         &current_peer,
                                         source,
+                                    );
+                                } else if let Some(reason) = pair_request_rejection_reason(
+                                    &current_layout,
+                                    &incoming.peer,
+                                    &pairing_challenge,
+                                ) {
+                                    // The requester is reachable; staying silent only
+                                    // gives it a misleading "client not reachable"
+                                    // timeout. Tell it why pairing cannot proceed.
+                                    log::info!(
+                                        "pairing request from {} ({}) rejected: {reason}",
+                                        incoming.peer.name,
+                                        source
+                                    );
+                                    let _ = send_discovery_packet_with_pairing(
+                                        &socket,
+                                        "pair-reject",
+                                        &current_peer,
+                                        source,
+                                        DiscoveryPairingFields {
+                                            error: Some(reason),
+                                            ..DiscoveryPairingFields::default()
+                                        },
                                     );
                                 }
                                 continue;
@@ -2925,8 +2960,17 @@ async fn probe_lan_peer(app: tauri::AppHandle, host: String) -> Result<LanPeer, 
 
 /// 配对握手（UDP 挑战往返）在线程池执行（分级优化方案 1.6），
 /// 命令线程不被弱网下的重试等待拖住。
+///
+/// `device_id` 来自设备设置里的"重新配对"：该设备在布局里离线时保存的
+/// host 可能已经过期（对端 DHCP 变更 / 证书轮换后 discovery 无法再刷新它），
+/// 而后端在 `state.peers` 里仍然持有这台机器的实时地址。带上 device_id
+/// 时先试实时地址、再回退到设备保存的地址，避免重新配对打到旧 IP。
 #[tauri::command]
-async fn request_lan_pairing(app: tauri::AppHandle, host: String) -> Result<LanPeer, String> {
+async fn request_lan_pairing(
+    app: tauri::AppHandle,
+    host: String,
+    device_id: Option<String>,
+) -> Result<LanPeer, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppRuntime>();
         let state = state.inner();
@@ -2940,15 +2984,25 @@ async fn request_lan_pairing(app: tauri::AppHandle, host: String) -> Result<LanP
             return Err("只有服务端可以发起配对。".into());
         }
 
+        let candidates = pairing_candidate_hosts(
+            &layout,
+            &active_peer_snapshot(&state.peers),
+            device_id.as_deref(),
+            &host,
+        );
         let mut local_peer = local_peer_from_layout(&layout);
         if let Some(transport) = state.quic_transport_handle() {
             apply_transport_to_peer(&mut local_peer, &transport);
         }
-        let peer = match request_pairing_for_peer(&local_peer, &host, discovery_base_port(&layout))
-        {
+        let peer = match request_pairing_for_hosts(
+            &local_peer,
+            &candidates,
+            discovery_base_port(&layout),
+            PAIRING_CHALLENGE_WAIT,
+        ) {
             Ok(peer) => peer,
             Err(error) => {
-                log::warn!("LAN pairing request failed host={host}: {error}");
+                log::warn!("LAN pairing request failed candidates={candidates:?}: {error}");
                 return Err(error);
             }
         };
@@ -2966,6 +3020,7 @@ async fn confirm_lan_pairing(
     app: tauri::AppHandle,
     host: String,
     code: String,
+    device_id: Option<String>,
 ) -> Result<LanPeer, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppRuntime>();
@@ -2980,6 +3035,12 @@ async fn confirm_lan_pairing(
             return Err("只有服务端可以确认配对。".into());
         }
 
+        let candidates = pairing_candidate_hosts(
+            &layout,
+            &active_peer_snapshot(&state.peers),
+            device_id.as_deref(),
+            &host,
+        );
         let mut local_peer = local_peer_from_layout(&layout);
         let transport = state
             .quic_transport_handle()
@@ -2989,13 +3050,13 @@ async fn confirm_lan_pairing(
             &local_peer,
             &transport,
             &layout.pair_secret,
-            &host,
+            &candidates,
             &code,
             discovery_base_port(&layout),
         ) {
             Ok(peer) => peer,
             Err(error) => {
-                log::warn!("LAN pairing confirm failed host={host}: {error}");
+                log::warn!("LAN pairing confirm failed candidates={candidates:?}: {error}");
                 return Err(error);
             }
         };
@@ -4942,6 +5003,47 @@ fn local_host_label() -> String {
         (None, Some(ips)) => ips,
         (None, None) => "localhost".into(),
     }
+}
+
+/// How often the long-running discovery loop refreshes the local device's
+/// displayed host label. DHCP leases, Wi-Fi/Ethernet switches and Thunderbolt
+/// bridges change the address set rarely; 10 s keeps it current without doing
+/// `getifaddrs` on the 500 ms discovery tick.
+const LOCAL_IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Refresh the local device's displayed host label in the live layout.
+fn refresh_local_device_identity(layout_state: &Arc<Mutex<LayoutState>>) -> bool {
+    let host_label = local_host_label();
+    layout_state
+        .lock()
+        .map(|mut layout| refresh_local_device_host(&mut layout, &host_label))
+        .unwrap_or(false)
+}
+
+/// Update the local device's host label when the machine's hostname or LAN
+/// address set changed.
+///
+/// The detected layout (and its host label "hostname / ip, ip") is built once
+/// at startup. Without this refresh the device list keeps showing addresses the
+/// machine no longer owns after a DHCP renewal — a peer user then copies a stale
+/// IP out of the UI and can never reach this machine with it.
+fn refresh_local_device_host(layout: &mut LayoutState, host_label: &str) -> bool {
+    let host_label = host_label.trim();
+    if host_label.is_empty() {
+        return false;
+    }
+    let Some(local) = layout
+        .devices
+        .iter_mut()
+        .find(|device| device.role == "local")
+    else {
+        return false;
+    };
+    if local.host == host_label {
+        return false;
+    }
+    local.host = host_label.to_string();
+    true
 }
 
 /// The default-route address first, then every other usable IPv4, so a
@@ -8513,7 +8615,7 @@ struct DiscoveryPacket {
 }
 
 #[derive(Default)]
-struct DiscoveryPairingFields {
+pub(crate) struct DiscoveryPairingFields {
     code: Option<String>,
     cluster_id: Option<String>,
     secret: Option<String>,
@@ -8526,6 +8628,7 @@ struct IncomingDiscovery {
     pairing_code: Option<String>,
     pair_cluster_id: Option<String>,
     pair_secret: Option<String>,
+    pairing_error: Option<String>,
 }
 
 fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
@@ -8784,16 +8887,38 @@ fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<La
     ))
 }
 
-fn request_pairing_for_peer(
+/// How long one candidate address gets to answer a `pair-request` with a
+/// `pair-challenge`. A named constant (rather than a literal) so tests can
+/// shorten the wait while exercising the candidate fallback.
+const PAIRING_CHALLENGE_WAIT: Duration = Duration::from_millis(1800);
+const PAIRING_PROBE_READ_TIMEOUT: Duration = Duration::from_millis(250);
+
+enum PairingRequestOutcome {
+    // Boxed: `LanPeer` is much larger than the other variants.
+    Challenge(Box<LanPeer>),
+    Rejected(String),
+    TimedOut,
+}
+
+/// One `pair-request` round trip against one concrete address.
+///
+/// The client may answer with `pair-challenge` (continue pairing) or with
+/// `pair-reject` + a reason when it is reachable but cannot pair right now
+/// (it is not in client mode, it is paired with another controller, a pairing
+/// is already in flight, or only its headless receive service is running).
+/// The explicit rejection is returned as-is so the user sees the real cause
+/// instead of a misleading "the client is not reachable" timeout.
+fn request_pairing_from_host(
     local_peer: &LanPeer,
     host: &str,
     base_port: u16,
-) -> Result<LanPeer, String> {
+    wait: Duration,
+) -> Result<PairingRequestOutcome, String> {
     let (host, ports) = pairing_probe_targets(host, base_port);
     let socket = UdpSocket::bind("0.0.0.0:0")
         .map_err(|error| format!("failed to open UDP pairing socket: {error}"))?;
     socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
+        .set_read_timeout(Some(PAIRING_PROBE_READ_TIMEOUT))
         .map_err(|error| format!("failed to set UDP pairing timeout: {error}"))?;
 
     for port in &ports {
@@ -8803,7 +8928,7 @@ fn request_pairing_for_peer(
 
     let started = Instant::now();
     let mut buffer = [0_u8; 4096];
-    while started.elapsed() < Duration::from_millis(1800) {
+    while started.elapsed() < wait {
         if let Ok((length, source)) = socket.recv_from(&mut buffer) {
             if let Some(packet) = decode_discovery_packet(&buffer[..length]) {
                 if let Some(incoming) =
@@ -8812,27 +8937,159 @@ fn request_pairing_for_peer(
                     if incoming.kind == "pair-challenge"
                         && pair_challenge_usable_for_local_peer(local_peer, &incoming.peer)
                     {
-                        return Ok(incoming.peer);
+                        return Ok(PairingRequestOutcome::Challenge(Box::new(incoming.peer)));
+                    }
+                    if incoming.kind == "pair-reject" {
+                        let reason = incoming
+                            .pairing_error
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|reason| !reason.is_empty())
+                            .unwrap_or("对端拒绝了配对请求。");
+                        let describe = if incoming.peer.name.trim().is_empty() {
+                            incoming.peer.ip.clone()
+                        } else {
+                            incoming.peer.name.clone()
+                        };
+                        return Ok(PairingRequestOutcome::Rejected(format!(
+                            "{reason}（{describe}）"
+                        )));
                     }
                 }
             }
         }
     }
 
+    Ok(PairingRequestOutcome::TimedOut)
+}
+
+/// Try the candidate addresses in order and return the first challenge.
+///
+/// A stale stored address must not hide a reachable machine: when the peer's
+/// DHCP lease moved while it was offline, discovery keeps listing it in the
+/// device list under its new address, and this fallback lets "Re-pair" reach
+/// that live address instead of only the address saved on the device.
+fn request_pairing_for_hosts(
+    local_peer: &LanPeer,
+    hosts: &[String],
+    base_port: u16,
+    wait: Duration,
+) -> Result<LanPeer, String> {
+    if hosts.is_empty() {
+        return Err("没有可用的配对目标地址。".into());
+    }
+
+    let mut timed_out: Vec<String> = Vec::new();
+    let mut rejections: Vec<String> = Vec::new();
+    for host in hosts {
+        match request_pairing_from_host(local_peer, host, base_port, wait)? {
+            PairingRequestOutcome::Challenge(peer) => {
+                log::info!("pairing challenge received from {host}");
+                return Ok(*peer);
+            }
+            // A stale address may now belong to an unrelated MyKVM client that
+            // answers "reject"; keep trying the remaining candidates and only
+            // report the rejection if none of them yields a challenge.
+            PairingRequestOutcome::Rejected(reason) => rejections.push(reason),
+            PairingRequestOutcome::TimedOut => {
+                timed_out.push(host.clone());
+            }
+        }
+    }
+
+    if let Some(reason) = rejections.into_iter().next() {
+        return Err(reason);
+    }
+    log::warn!("no pairing challenge from {timed_out:?}");
     Err(format!(
-        "no pairing challenge received from {host}; make sure the client is running and reachable"
+        "no pairing challenge received from {}; make sure the client is running and reachable",
+        timed_out.join(", ")
     ))
+}
+
+/// Addresses to try for a (re-)pairing request, best first: live discovery
+/// peers for the same machine, then the addresses stored on the layout device,
+/// then whatever the caller asked for.
+fn pairing_candidate_hosts(
+    layout: &LayoutState,
+    peers: &[LanPeer],
+    device_id: Option<&str>,
+    requested_host: &str,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let device = device_id
+        .map(str::trim)
+        .filter(|device_id| !device_id.is_empty())
+        .and_then(|device_id| layout.devices.iter().find(|device| device.id == device_id));
+
+    if let Some(device) = device {
+        for peer in peers
+            .iter()
+            .filter(|peer| device_may_be_same_machine(device, peer, &layout.cluster_id))
+        {
+            push_pairing_host_candidates(&mut candidates, &peer.ip);
+            push_pairing_host_candidates(&mut candidates, &peer.host);
+        }
+        push_pairing_host_candidates(&mut candidates, &device.host);
+    }
+    push_pairing_host_candidates(&mut candidates, requested_host);
+    candidates
+}
+
+fn push_pairing_host_candidates(candidates: &mut Vec<String>, value: &str) {
+    for part in split_pairing_host_candidates(value) {
+        if !candidates.contains(&part) {
+            candidates.push(part);
+        }
+    }
+}
+
+/// A device host label can hold a hostname plus every local IPv4 address
+/// (`name / 10.0.0.2, 10.0.0.3`); split those apart so each address is tried.
+fn split_pairing_host_candidates(value: &str) -> Vec<String> {
+    value
+        .split(['/', ','])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a live discovery peer is plausibly the machine behind `device`.
+///
+/// Discovery can only keep a paired device online while its transport
+/// certificate matches. An identity rotation (reinstall, cleared config, key
+/// reset) leaves the stored device offline; matching the live peer by host,
+/// name or (legacy key-less devices) cluster lets "Re-pair" reach it anyway.
+fn device_may_be_same_machine(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
+    if device.role == "local" {
+        return false;
+    }
+    if device_matches_peer(device, peer, layout_cluster_id) {
+        return true;
+    }
+    if !peer.id.trim().is_empty() && (device.id == peer.id || device.id == peer_device_id(peer)) {
+        return true;
+    }
+
+    same_host(&device.host, &peer.host)
+        || same_host(&device.host, &peer.ip)
+        || (!device.name.trim().is_empty() && text_matches(&device.name, &peer.name))
+        || (device.transport_public_key.trim().is_empty()
+            && !layout_cluster_id.trim().is_empty()
+            && peer.cluster_id == layout_cluster_id)
 }
 
 fn confirm_pairing_for_peer(
     local_peer: &LanPeer,
     quic_transport: &quic_transport::TransportHandle,
     pair_secret: &str,
-    host: &str,
+    hosts: &[String],
     code: &str,
     base_port: u16,
 ) -> Result<LanPeer, String> {
-    let challenge_peer = request_pairing_for_peer(local_peer, host, base_port)?;
+    let challenge_peer =
+        request_pairing_for_hosts(local_peer, hosts, base_port, PAIRING_CHALLENGE_WAIT)?;
     if challenge_peer.transport_public_key.trim().is_empty()
         || challenge_peer.protocol_version != quic_transport::PROTOCOL_VERSION
         || challenge_peer.quic_port == 0
@@ -8857,7 +9114,11 @@ fn confirm_pairing_for_peer(
         .send_stream_expect_ack(endpoint, payload)
         .map_err(|error| format!("failed to send encrypted pairing confirmation: {error}"))?;
 
-    let paired_peer = probe_for_peer(local_peer, host, base_port)?;
+    // Confirm against exactly the address the challenge came from — the input
+    // `hosts` may include a stale stored address that intentionally failed
+    // over to the live one.
+    let confirm_host = format!("{}:{}", challenge_peer.ip, challenge_peer.transport_port);
+    let paired_peer = probe_for_peer(local_peer, &confirm_host, base_port)?;
     if paired_peer.pairing_required {
         return Err("配对未被客户端接受，请检查验证码后重试。".into());
     }
@@ -8905,7 +9166,7 @@ fn send_discovery_packet(
     )
 }
 
-fn send_discovery_packet_with_pairing(
+pub(crate) fn send_discovery_packet_with_pairing(
     socket: &UdpSocket,
     kind: &str,
     local_peer: &LanPeer,
@@ -8973,6 +9234,7 @@ fn peer_from_discovery_packet(
         pairing_code: packet.pairing_code,
         pair_cluster_id: packet.pair_cluster_id,
         pair_secret: packet.pair_secret,
+        pairing_error: packet.pairing_error,
     })
 }
 
@@ -9285,6 +9547,56 @@ fn begin_pairing_challenge(
     }
 
     false
+}
+
+/// Why a reachable `pair-request` cannot become a challenge right now.
+///
+/// `begin_pairing_challenge` deliberately declines some requests: a paired
+/// client only re-pairs with a controller it recognizes, so a random LAN
+/// device cannot pop a code prompt onto its screen. Staying silent made that
+/// indistinguishable from an unreachable client on the requester side, which
+/// then reported a misleading "no pairing challenge received / make sure the
+/// client is running and reachable". Answer with the concrete reason instead.
+fn pair_request_rejection_reason(
+    layout: &LayoutState,
+    requester: &LanPeer,
+    pairing_challenge: &Mutex<Option<PairingChallenge>>,
+) -> Option<String> {
+    if requester.machine_role != "server" {
+        return None;
+    }
+    if layout.machine_role != "client" {
+        return Some(if layout.machine_role == "server" {
+            "对端当前设置为服务端，无法接受配对；请在它的设置里切换为客户端后重试。".into()
+        } else {
+            "对端尚未选择角色，无法接受配对；请在它的设置里选择客户端后重试。".into()
+        });
+    }
+    if pairing_required(layout) {
+        // An unpaired client accepts any server. Nothing to reject here.
+        return None;
+    }
+
+    if let Ok(challenge) = pairing_challenge.lock() {
+        let now = Instant::now();
+        if let Some(existing) = challenge.as_ref() {
+            if existing.expires_at > now && existing.requester_id != requester.id {
+                return Some("对端正在与另一台服务端配对，请稍后重试。".into());
+            }
+        }
+    }
+
+    let requester_already_known = layout
+        .paired_controllers
+        .iter()
+        .any(|controller| paired_controller_can_repair_with_peer(controller, requester));
+    if requester_already_known {
+        // begin_pairing_challenge should have accepted it; do not send a
+        // misleading rejection if some other condition raced us.
+        return None;
+    }
+
+    Some("对端已与其他服务端配对，请先在对端「设置 → 解除配对」后重试。".into())
 }
 
 fn complete_pairing_from_confirm(
@@ -10373,6 +10685,357 @@ mod tests {
 
         client.machine_role = "server".into();
         assert!(!pair_challenge_usable_for_local_peer(&local_peer, &client));
+    }
+
+    #[test]
+    fn pairing_candidates_prefer_live_peer_address_over_stale_stored_host() {
+        // 对端离线时布局里保存的是旧地址；discovery 里其实有它的实时地址。
+        // 重新配对必须先试实时地址，否则会一直打到已失效的 IP 上。
+        let mut layout = test_layout();
+        layout.devices[1].transport_public_key = "rotated-away-key".into();
+        layout.devices[1].host = "10.0.0.44".into();
+        layout.devices[1].source = "manual".into();
+        let mut peer = test_peer();
+        peer.id = "peer-client-moved".into();
+        peer.transport_public_key = "rotated-new-key".into();
+        peer.ip = "10.0.0.55".into();
+        peer.host = "Client".into();
+
+        let candidates = pairing_candidate_hosts(
+            &layout,
+            std::slice::from_ref(&peer),
+            Some("peer-client-10-0-0-2"),
+            "",
+        );
+
+        assert_eq!(candidates.first().map(String::as_str), Some("10.0.0.55"));
+        assert!(candidates.iter().any(|host| host == "10.0.0.44"));
+    }
+
+    #[test]
+    fn pairing_candidates_split_host_labels_and_keep_requested_host() {
+        let mut layout = test_layout();
+        layout.devices[1].host = "client.local / 10.0.0.44, 10.0.0.45".into();
+        layout.devices[1].transport_public_key = "stale-key".into();
+
+        let candidates = pairing_candidate_hosts(
+            &layout,
+            &[],
+            Some("peer-client-10-0-0-2"),
+            "10.0.0.99:47833",
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                "client.local".to_string(),
+                "10.0.0.44".to_string(),
+                "10.0.0.45".to_string(),
+                "10.0.0.99:47833".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pairing_candidates_without_device_use_requested_host() {
+        let layout = test_layout();
+        let candidates = pairing_candidate_hosts(&layout, &[], None, "192.168.3.44");
+        assert_eq!(candidates, vec!["192.168.3.44".to_string()]);
+
+        let unknown_device =
+            pairing_candidate_hosts(&layout, &[], Some("no-such-device"), "192.168.3.55");
+        assert_eq!(unknown_device, vec!["192.168.3.55".to_string()]);
+    }
+
+    #[test]
+    fn pair_request_rejection_explains_why_pairing_cannot_proceed() {
+        let requester = {
+            let mut peer = test_peer();
+            peer.machine_role = "server".into();
+            peer.id = "server-stranger".into();
+            peer.name = "Stranger".into();
+            peer.host = "stranger".into();
+            peer.ip = "10.0.0.9".into();
+            peer.transport_public_key = "stranger-key".into();
+            peer
+        };
+        let challenge = Mutex::new(None);
+
+        // 对端是服务端：明确提示切换角色，而不是静默超时。
+        let mut server_layout = test_layout();
+        let reason = pair_request_rejection_reason(&server_layout, &requester, &challenge)
+            .expect("role mismatch should be answered");
+        assert!(reason.contains("服务端"), "{reason}");
+
+        // 对端未选择角色。
+        server_layout.machine_role = "unset".into();
+        let reason = pair_request_rejection_reason(&server_layout, &requester, &challenge)
+            .expect("unset role should be answered");
+        assert!(reason.contains("尚未选择角色"), "{reason}");
+
+        // 未配对的客户端本应接受任何服务端：不要误回绝。
+        let mut client_layout = test_layout();
+        client_layout.machine_role = "client".into();
+        client_layout.paired_controllers.clear();
+        assert!(pair_request_rejection_reason(&client_layout, &requester, &challenge).is_none());
+
+        // 已和别的服务端配对：提示在客户端解除配对。
+        client_layout.paired_controllers = vec![PairedController {
+            id: "server-other".into(),
+            name: "Other Server".into(),
+            host: "other-server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "other-server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: client_layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let reason = pair_request_rejection_reason(&client_layout, &requester, &challenge)
+            .expect("unknown requester on a paired client should be answered");
+        assert!(reason.contains("解除配对"), "{reason}");
+
+        // 相同 id 的已知控制端在重新配对：begin_pairing_challenge 会接受，不应回绝。
+        let known = PairedController {
+            id: requester.id.clone(),
+            name: requester.name.clone(),
+            host: requester.host.clone(),
+            ip: requester.ip.clone(),
+            transport_public_key: requester.transport_public_key.clone(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: client_layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        };
+        client_layout.paired_controllers = vec![known];
+        assert!(pair_request_rejection_reason(&client_layout, &requester, &challenge).is_none());
+
+        // 非服务端发来的 pair-request 不回包（避免对普通发现流量乱回）。
+        let mut client_requester = requester.clone();
+        client_requester.machine_role = "client".into();
+        assert!(
+            pair_request_rejection_reason(&client_layout, &client_requester, &challenge).is_none()
+        );
+    }
+
+    #[test]
+    fn pair_request_rejection_reports_busy_challenge() {
+        let requester = {
+            let mut peer = test_peer();
+            peer.machine_role = "server".into();
+            peer.id = "server-two".into();
+            peer.name = "Server Two".into();
+            peer.transport_public_key = "server-two-key".into();
+            peer
+        };
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "server-one".into(),
+            name: "Server One".into(),
+            host: "server-one".into(),
+            ip: "10.0.0.2".into(),
+            transport_public_key: "server-one-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let challenge = Mutex::new(Some(PairingChallenge {
+            code: "123456".into(),
+            requester_id: "server-one".into(),
+            requester_name: "Server One".into(),
+            requester_ip: "10.0.0.2".into(),
+            requester_host: "server-one".into(),
+            requester_public_key: "server-one-key".into(),
+            requester_protocol_version: quic_transport::PROTOCOL_VERSION,
+            expires_at: Instant::now() + Duration::from_secs(60),
+            expires_at_ms: now_ms() + 60_000,
+            attempts: 0,
+        }));
+
+        let reason = pair_request_rejection_reason(&layout, &requester, &challenge)
+            .expect("busy challenge should be answered");
+        assert!(reason.contains("正在与另一台服务端配对"), "{reason}");
+    }
+
+    #[test]
+    fn local_device_host_label_refreshes_when_addresses_change() {
+        let mut layout = test_layout();
+        assert!(refresh_local_device_host(
+            &mut layout,
+            "MacBook-Pro.local / 10.9.9.9"
+        ));
+        assert_eq!(layout.devices[0].host, "MacBook-Pro.local / 10.9.9.9");
+        assert!(!refresh_local_device_host(
+            &mut layout,
+            "MacBook-Pro.local / 10.9.9.9"
+        ));
+        assert!(!refresh_local_device_host(&mut layout, "   "));
+        assert_eq!(layout.devices[1].host, "client / 10.0.0.2");
+    }
+
+    #[test]
+    fn pairing_request_returns_explicit_rejection_without_full_timeout() {
+        let client_socket = UdpSocket::bind("127.0.0.1:0").expect("fake client socket");
+        client_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client timeout");
+        let client_port = client_socket.local_addr().expect("client addr").port();
+        let fake_client = thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            let (length, source) = client_socket.recv_from(&mut buffer).expect("pair request");
+            let packet = decode_discovery_packet(&buffer[..length]).expect("discovery packet");
+            assert_eq!(packet.kind, "pair-request");
+            let mut reply_peer = test_peer();
+            reply_peer.machine_role = "client".into();
+            let reply = encode_discovery_payload(
+                "pair-reject",
+                &reply_peer,
+                DiscoveryPairingFields {
+                    error: Some("客户端已与其他服务端配对".into()),
+                    ..DiscoveryPairingFields::default()
+                },
+            )
+            .expect("reject payload");
+            client_socket.send_to(&reply, source).expect("send reject");
+        });
+
+        let local_peer = local_peer_from_layout(&test_layout());
+        let started = Instant::now();
+        let error = request_pairing_for_hosts(
+            &local_peer,
+            &[format!("127.0.0.1:{client_port}")],
+            DISCOVERY_PORT,
+            Duration::from_millis(5_000),
+        )
+        .expect_err("explicit rejection must not be reported as success");
+
+        assert!(error.contains("客户端已与其他服务端配对"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an explicit rejection must return before the challenge wait elapses"
+        );
+        fake_client.join().expect("fake client");
+    }
+
+    #[test]
+    fn pairing_request_keeps_trying_after_an_unrelated_candidate_rejects() {
+        // 旧地址可能被同一网段的另一台 MyKVM 客户端占用：它会回 reject，
+        // 但这不能阻止继续尝试真正目标设备的下一个候选地址。
+        let client_socket = UdpSocket::bind("127.0.0.1:0").expect("fake client socket");
+        client_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client timeout");
+        let client_port = client_socket.local_addr().expect("client addr").port();
+        let fake_client = thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            let (length, source) = client_socket.recv_from(&mut buffer).expect("pair request");
+            let packet = decode_discovery_packet(&buffer[..length]).expect("discovery packet");
+            assert_eq!(packet.kind, "pair-request");
+            let mut reply_peer = test_peer();
+            reply_peer.machine_role = "client".into();
+            reply_peer.pairing_required = false;
+            let reply = encode_discovery_payload(
+                "pair-challenge",
+                &reply_peer,
+                DiscoveryPairingFields::default(),
+            )
+            .expect("challenge payload");
+            client_socket
+                .send_to(&reply, source)
+                .expect("send challenge");
+        });
+
+        let reject_socket = UdpSocket::bind("127.0.0.1:0").expect("rejecting client socket");
+        reject_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("reject timeout");
+        let reject_port = reject_socket.local_addr().expect("reject addr").port();
+        let rejecter = thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            let (length, source) = reject_socket.recv_from(&mut buffer).expect("pair request");
+            let packet = decode_discovery_packet(&buffer[..length]).expect("discovery packet");
+            assert_eq!(packet.kind, "pair-request");
+            let mut reply_peer = test_peer();
+            reply_peer.id = "peer-unrelated".into();
+            reply_peer.machine_role = "client".into();
+            let reply = encode_discovery_payload(
+                "pair-reject",
+                &reply_peer,
+                DiscoveryPairingFields {
+                    error: Some("对端已与其他服务端配对".into()),
+                    ..DiscoveryPairingFields::default()
+                },
+            )
+            .expect("reject payload");
+            reject_socket.send_to(&reply, source).expect("send reject");
+        });
+
+        let local_peer = local_peer_from_layout(&test_layout());
+        let peer = request_pairing_for_hosts(
+            &local_peer,
+            &[
+                format!("127.0.0.1:{reject_port}"),
+                format!("127.0.0.1:{client_port}"),
+            ],
+            DISCOVERY_PORT,
+            Duration::from_millis(2_000),
+        )
+        .expect("a later candidate must still be tried after a rejection");
+
+        assert_eq!(peer.id, "peer-client-10-0-0-2");
+        rejecter.join().expect("rejecting client");
+        fake_client.join().expect("fake client");
+    }
+
+    #[test]
+    fn pairing_request_falls_back_to_the_next_candidate_host() {
+        let client_socket = UdpSocket::bind("127.0.0.1:0").expect("fake client socket");
+        client_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client timeout");
+        let client_port = client_socket.local_addr().expect("client addr").port();
+        let fake_client = thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            let (length, source) = client_socket.recv_from(&mut buffer).expect("pair request");
+            let packet = decode_discovery_packet(&buffer[..length]).expect("discovery packet");
+            assert_eq!(packet.kind, "pair-request");
+            let mut reply_peer = test_peer();
+            reply_peer.machine_role = "client".into();
+            reply_peer.pairing_required = false;
+            let reply = encode_discovery_payload(
+                "pair-challenge",
+                &reply_peer,
+                DiscoveryPairingFields::default(),
+            )
+            .expect("challenge payload");
+            client_socket
+                .send_to(&reply, source)
+                .expect("send challenge");
+        });
+
+        // A closed port stands in for the stale stored address.
+        let dead_socket = UdpSocket::bind("127.0.0.1:0").expect("dead socket");
+        let dead_port = dead_socket.local_addr().expect("dead addr").port();
+        drop(dead_socket);
+
+        let local_peer = local_peer_from_layout(&test_layout());
+        let started = Instant::now();
+        let peer = request_pairing_for_hosts(
+            &local_peer,
+            &[
+                format!("127.0.0.1:{dead_port}"),
+                format!("127.0.0.1:{client_port}"),
+            ],
+            DISCOVERY_PORT,
+            Duration::from_millis(400),
+        )
+        .expect("the live candidate should answer");
+
+        assert_eq!(peer.id, "peer-client-10-0-0-2");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "fallback must not wait the full timeout on the second candidate"
+        );
+        fake_client.join().expect("fake client");
     }
 
     #[test]
