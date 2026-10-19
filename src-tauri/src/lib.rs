@@ -1042,6 +1042,15 @@ impl AppRuntime {
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
             .map_err(|error| format!("failed to set discovery read timeout: {error}"))?;
+        // A blocking sendto can park forever when macOS restarts its local-network
+        // privacy session (it does that right after the app bundle is replaced, e.g.
+        // an update or reinstall): the announce thread then never returns to
+        // recv_from, discovery silently dies and the other machine cannot scan this
+        // one until the app is relaunched. A send timeout makes such a call return
+        // instead of wedging the whole loop.
+        if let Err(error) = socket.set_write_timeout(Some(Duration::from_millis(500))) {
+            log::warn!("failed to set discovery send timeout: {error}");
+        }
         // Aim announces at the configured base port and the span above it, not
         // our own (possibly drifted) `actual_port`, so a peer that landed on a
         // neighbouring port still receives them.
@@ -1059,7 +1068,11 @@ impl AppRuntime {
 
         thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
-            let mut last_announce = Instant::now() - Duration::from_secs(10);
+            // Delay the first announce instead of firing it during startup:
+            // replacing the app bundle makes macOS restart the local-network
+            // privacy session in the same second, and a send racing that restart
+            // could block indefinitely (see the send timeout above).
+            let mut last_announce = Instant::now();
             let mut last_local_identity_refresh = Instant::now() - LOCAL_IDENTITY_REFRESH_INTERVAL;
             let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
             let mut last_upgrading = upgrading.load(Ordering::Relaxed);
@@ -1093,12 +1106,14 @@ impl AppRuntime {
                         .unwrap_or_else(|_| Some((local_peer.clone(), Vec::new())));
                     if let Some((local_peer, direct_targets)) = announcement {
                         for target in &broadcast_targets {
-                            let _ = send_discovery_packet(
+                            if let Err(error) = send_discovery_packet(
                                 &socket,
                                 "announce",
                                 &local_peer,
                                 target.as_str(),
-                            );
+                            ) {
+                                log::debug!("discovery announce to {target} failed: {error}");
+                            }
                         }
                         let probed_peers = probe_known_peer_targets(&local_peer, &direct_targets);
                         if !probed_peers.is_empty() {
