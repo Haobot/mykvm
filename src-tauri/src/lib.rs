@@ -3305,7 +3305,7 @@ pub fn activate_existing_instance() -> bool {
             .args(["-b", MACOS_BUNDLE_ID])
             .status()
             .map(|status| status.success())
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

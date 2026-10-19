@@ -4,17 +4,29 @@
 //! - 所有条目保持原有 `#[cfg(target_os = "windows")]` 属性；
 //! - 可见性统一提升为 pub(crate)，由 lib.rs 的
 //!   `pub(crate) use windows_service::*;` 再导出，调用点符号不变。
+// Platform imports: this module also compiles on macOS/Linux, where only the
+// type and the stub `current_input_service_status` are used. Keeping the
+// imports unconditional broke non-Windows builds after the module split.
+#[cfg(target_os = "windows")]
 use std::env;
+#[cfg(target_os = "windows")]
 use std::fs;
+#[cfg(target_os = "windows")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
 use std::process::Command;
+#[cfg(target_os = "windows")]
 use std::thread;
+#[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "windows")]
 use crate::input;
+#[cfg(target_os = "windows")]
 use crate::shared_input;
+#[cfg(target_os = "windows")]
 use crate::wide_null;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
