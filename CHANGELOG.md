@@ -26,6 +26,7 @@ release will reuse them).
 
 ### Fixed
 
+- Windows: the controlled cursor no longer moves too fast when the controller uses display scaling above 100% — native pixel deltas from the mouse hook were accumulated as the controlled screen's logical units (at 250% scaling the controlled cursor moved 2.5x too fast). If you had compensated with the device pointer speed, reset it to 1x after upgrading.
 - Screen-switch shortcuts restore the cursor position used before leaving each device and screen. Only a first visit without a remembered position lands at the center; hidden client parking does not overwrite the remembered position.
 - MyKVM shortcuts release logical keys on both devices while tracking physically held modifiers separately. Holding Alt for repeated screen switches remains possible; releasing Alt stops plain arrow keys from switching screens.
 - macOS: leaving a controlled Mac requests cursor hiding until the next movement. Re-entry, local mouse movement, and stopping sharing restore it; ordered cursor messages prevent delayed parking from overriding re-entry.

@@ -3232,6 +3232,28 @@ fn scale_size(value: i32, scale: f64) -> i32 {
         .clamp(1.0, i32::MAX as f64) as i32
 }
 
+/// Convert a movement measured in the controller's native screen units into the
+/// layout/logical unit carried by ActiveTarget::x/y and by the wire MouseMove
+/// position.
+///
+/// On Windows the low-level mouse hook and SetCursorPos work in native (physical)
+/// pixels because the process is per-monitor DPI aware, while the remote cursor
+/// and the controlled screen's advertised size are logical units. This ratio is
+/// 1/scale on Windows and exactly 1.0 on macOS, where the hook already reports
+/// points and platform_native_screen is the identity.
+///
+/// The edge-entry delta in crossing_target already uses the same ratio, so the
+/// first nudge after crossing and every later frame stay in one unit system.
+#[cfg(any(target_os = "windows", test))]
+fn native_delta_to_layout(target: &InputTarget, dx: f64, dy: f64) -> (f64, f64) {
+    let native = &target.local_screen;
+    let layout = &target.layout_local_screen;
+    (
+        dx * layout.width.max(1) as f64 / native.width.max(1) as f64,
+        dy * layout.height.max(1) as f64 / native.height.max(1) as f64,
+    )
+}
+
 fn pack_remote_position(x: i32, y: i32) -> i64 {
     ((x as i64) << 32) | (y as u32 as i64)
 }
@@ -4973,8 +4995,14 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             return true;
         }
 
-        active_target.x += dx * active_target.target.pointer_speed;
-        active_target.y += dy * active_target.target.pointer_speed;
+        // The hook reports native screen units (physical pixels on Windows),
+        // while the remote cursor and the wire position use the controlled
+        // screen's logical units. Convert before accumulating; the edge-entry
+        // nudge in crossing_target already applies the same ratio. The geometry
+        // checks below keep the native delta so edge/return feel is unchanged.
+        let (step_dx, step_dy) = native_delta_to_layout(&active_target.target, dx, dy);
+        active_target.x += step_dx * active_target.target.pointer_speed;
+        active_target.y += step_dy * active_target.target.pointer_speed;
 
         let confirmed_return = context
             .return_edge_gate
@@ -10154,6 +10182,116 @@ mod tests {
             edge: Edge::Right,
             modifier_map: None,
         }
+    }
+
+    fn mixed_dpi_target(native: Screen, layout: Screen) -> InputTarget {
+        let mut target = target_for_coordinate_tests();
+        target.local_screen = native;
+        target.layout_local_screen = layout;
+        target.pointer_speed = 1.0;
+        target
+    }
+
+    #[test]
+    fn native_delta_to_layout_is_identity_at_100_percent() {
+        let target = mixed_dpi_target(
+            screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+        );
+        assert_eq!(native_delta_to_layout(&target, 12.5, -7.0), (12.5, -7.0));
+    }
+
+    #[test]
+    fn native_delta_to_layout_matches_windows_scales() {
+        // (native_w, native_h, layout_w, layout_h) at 125% / 150% / 200% / 250%.
+        for (nw, nh, lw, lh) in [
+            (2400, 1350, 1920, 1080),
+            (2880, 1620, 1920, 1080),
+            (3840, 2160, 1920, 1080),
+            (3840, 2400, 1536, 960),
+        ] {
+            let target = mixed_dpi_target(
+                screen("local-device", "local-display-1", 0, 0, nw, nh),
+                screen("local-device", "local-display-1", 0, 0, lw, lh),
+            );
+            let (dx, dy) = native_delta_to_layout(&target, 40.0, -20.0);
+            assert!((dx - 40.0 * lw as f64 / nw as f64).abs() < 1e-9);
+            assert!((dy + 20.0 * lh as f64 / nh as f64).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn native_delta_to_layout_handles_round_trip_sizes() {
+        // 1.5x on a 2560-wide panel: detect 1707 logical, then
+        // platform_native_screen re-expands it to 2561, so the ratio must follow
+        // the stored rects (0.66654...), not an exact 2/3.
+        let target = mixed_dpi_target(
+            screen("local-device", "local-display-1", 0, 0, 2561, 1601),
+            screen("local-device", "local-display-1", 0, 0, 1707, 1067),
+        );
+        let (dx, _) = native_delta_to_layout(&target, 100.0, 0.0);
+        assert!((dx - 100.0 * 1707.0 / 2561.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn native_delta_to_layout_uses_each_axis_ratio() {
+        let target = mixed_dpi_target(
+            screen("local-device", "local-display-1", 0, 0, 3840, 1080),
+            screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+        );
+        assert_eq!(native_delta_to_layout(&target, 100.0, 100.0), (50.0, 100.0));
+    }
+
+    #[test]
+    fn native_delta_to_layout_keeps_macos_identity() {
+        let target = mixed_dpi_target(
+            screen("local-device", "local-display-1", 0, 0, 1512, 982),
+            screen("local-device", "local-display-1", 0, 0, 1512, 982),
+        );
+        assert_eq!(native_delta_to_layout(&target, 3.0, 5.0), (3.0, 5.0));
+    }
+
+    #[test]
+    fn mixed_dpi_monitors_convert_with_their_own_screen_ratio() {
+        let scaled = mixed_dpi_target(
+            screen("local-device", "local-display-1", 0, 0, 3840, 2160),
+            screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+        );
+        let unscaled = mixed_dpi_target(
+            screen("local-device", "local-display-2", 3840, 0, 1920, 1080),
+            screen("local-device", "local-display-2", 1920, 0, 1920, 1080),
+        );
+        assert_eq!(native_delta_to_layout(&scaled, 100.0, 0.0).0, 50.0);
+        assert_eq!(native_delta_to_layout(&unscaled, 100.0, 0.0).0, 100.0);
+    }
+
+    #[test]
+    fn pointer_delta_accumulates_in_layout_units_across_frames() {
+        let target = mixed_dpi_target(
+            screen("local-device", "local-display-1", 0, 0, 3840, 2160),
+            screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+        );
+        let mut x = 0.0;
+        // 4 frames x 40 native pixels at 200% == 4 * 20 logical units, not 160.
+        for _ in 0..4 {
+            let (dx, _) = native_delta_to_layout(&target, 40.0, 0.0);
+            x += dx * target.pointer_speed;
+        }
+        assert!((x - 80.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pointer_speed_multiplies_the_normalised_delta() {
+        let mut target = mixed_dpi_target(
+            screen("local-device", "local-display-1", 0, 0, 3840, 2160),
+            screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+        );
+        target.pointer_speed = 2.0;
+        let (dx, _) = native_delta_to_layout(&target, 40.0, 0.0);
+        assert!((dx * target.pointer_speed - 40.0).abs() < 1e-9);
+        target.pointer_speed = 0.5;
+        let (dx, _) = native_delta_to_layout(&target, 40.0, 0.0);
+        assert!((dx * target.pointer_speed - 10.0).abs() < 1e-9);
     }
 
     fn layout_for_target_tests() -> LayoutState {
