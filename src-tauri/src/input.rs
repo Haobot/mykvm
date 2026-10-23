@@ -1245,6 +1245,19 @@ pub fn input_runtime_status(
     (capture, input_receive_status(layout, false))
 }
 
+/// Current readiness of the inject stage, probed on demand.
+///
+/// The stage status captured when the runtime starts goes stale: on macOS the
+/// Accessibility grant and Secure Keyboard Entry come and go while the app
+/// keeps running (the app even starts sharing eagerly at login, when the lock
+/// screen may hold secure input). Status reads must re-run this probe instead
+/// of reusing the stored stage, otherwise a block that is already gone stays
+/// on screen forever — which is exactly the "Secure Keyboard Entry is on"
+/// dialog users could never get rid of.
+pub fn input_inject_status(layout: &LayoutState) -> NativeStageStatus {
+    input_receive_status(layout, false)
+}
+
 fn input_receive_status(layout: &LayoutState, request_permission: bool) -> NativeStageStatus {
     let _ = request_permission;
     if !NATIVE_INPUT_SUPPORTED {
@@ -1270,7 +1283,7 @@ fn input_receive_status(layout: &LayoutState, request_permission: bool) -> Nativ
     if macos_secure_input_enabled() {
         return NativeStageStatus {
             state: "error".into(),
-            detail: "检测到 macOS 安全键盘输入(Secure Keyboard Entry)已开启，系统会拦截所有注入的键盘事件（鼠标点击不受影响）。请退出正在占用安全输入的应用——常见来源：终端里勾选的“安全键盘输入”、聚焦中的密码输入框、部分密码管理器；必要时注销重新登录，然后重试。".into(),
+            detail: "检测到 macOS 安全键盘输入(Secure Keyboard Entry)已开启，系统会丢弃所有注入的键盘事件（鼠标点击不受影响）。常见来源：终端/编辑器里勾选的“安全键盘输入”、聚焦中的密码输入框、密码管理器、锁屏/登录窗口。关闭来源后此提示会自动消失，无需重启 MyKVM。".into(),
         };
     }
 
@@ -1319,7 +1332,22 @@ fn macos_secure_input_enabled() -> bool {
         fn IsSecureEventInputEnabled() -> u8;
     }
 
-    unsafe { IsSecureEventInputEnabled() != 0 }
+    let enabled = unsafe { IsSecureEventInputEnabled() != 0 };
+    // This probe is now polled by the UI while the runtime runs, so log only
+    // transitions: one line when the block starts (the user needs to know why
+    // injected keys stopped working) and one when it clears.
+    static LAST_REPORTED: AtomicBool = AtomicBool::new(false);
+    let previous = LAST_REPORTED.swap(enabled, Ordering::Relaxed);
+    if enabled != previous {
+        if enabled {
+            log::warn!(
+                "macOS Secure Keyboard Entry turned on; injected key events are dropped until it is turned off"
+            );
+        } else {
+            log::info!("macOS Secure Keyboard Entry turned off; keyboard injection resumed");
+        }
+    }
+    enabled
 }
 
 #[allow(clippy::too_many_arguments)]

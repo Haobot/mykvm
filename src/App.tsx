@@ -12,7 +12,9 @@ import {
 } from "./pairingRepair";
 import {
   type CSSProperties,
+  type Dispatch,
   type FormEvent,
+  type SetStateAction,
   useEffect,
   useEffectEvent,
   useMemo,
@@ -100,6 +102,31 @@ import type {
   ThemeMode,
   TransportPortMode,
 } from "./types";
+import {
+  blockingRuntimeDetail,
+  createRuntimeBlockerTracker,
+  dismissRuntimeBlocker,
+  trackRuntimeBlocker,
+  type RuntimeBlockerTracker,
+} from "./runtimeBlocker";
+
+/// Applies one runtime status read to the blocker dialog. Extracted from the
+/// component so the polling effect can reuse it without re-subscribing.
+function applyRuntimeBlockerDetail(
+  trackerRef: { current: RuntimeBlockerTracker },
+  detail: string | null,
+  setErrorMessage: Dispatch<SetStateAction<string | null>>,
+): void {
+  const update = trackRuntimeBlocker(trackerRef.current, detail);
+  trackerRef.current = update.tracker;
+  if (update.show !== null) {
+    setErrorMessage(update.show);
+  }
+  if (update.clear !== null) {
+    const cleared = update.clear;
+    setErrorMessage((current) => (current === cleared ? null : current));
+  }
+}
 
 const DEFAULT_BOARD_WIDTH = 1040;
 const DEFAULT_BOARD_HEIGHT = 640;
@@ -265,6 +292,9 @@ function App() {
     () => getSystemTheme(),
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
+  const runtimeBlockerRef = useRef<RuntimeBlockerTracker>(
+    createRuntimeBlockerTracker(),
+  );
   const edgeSwitchHotkeyButtonRef = useRef<HTMLButtonElement | null>(null);
   const screenSwitchButtonRefs = useRef<
     Record<"left" | "right" | "up" | "down", HTMLButtonElement | null>
@@ -655,16 +685,19 @@ function App() {
               .catch(() => {});
           }
 
-          // Keep a persistent blocking condition visible. The inject stage holds
-          // the receiver-side reason keys/clicks get dropped (macOS Accessibility
-          // missing, or Secure Keyboard Entry on); it is otherwise never shown.
-          if (nextRuntime.started) {
-            if (nextRuntime.capture.state === "error") {
-              setErrorMessage(nextRuntime.capture.detail);
-            } else if (nextRuntime.inject.state === "error") {
-              setErrorMessage(nextRuntime.inject.detail);
-            }
-          }
+          // Keep a blocking runtime condition visible, but surface each
+          // occurrence once and drop it when the backend reports recovery. The
+          // backend re-probes the macOS inject conditions on every read, so a
+          // "Secure Keyboard Entry is on" dialog no longer reappears every
+          // two seconds after the user closes it, and it disappears by itself
+          // once the block is gone.
+          applyRuntimeBlockerDetail(
+            runtimeBlockerRef,
+            nextRuntime.started
+              ? blockingRuntimeDetail(nextRuntime.capture, nextRuntime.inject)
+              : null,
+            setErrorMessage,
+          );
         })
         .catch(() => {
           // Keep the current UI state if a transient refresh fails.
@@ -1281,18 +1314,23 @@ function App() {
   async function setRuntimeState(nextStarted: boolean) {
     setIsRuntimePending(true);
     setErrorMessage(null);
+    // A manual start/stop is a new occurrence: show a blocking reason again
+    // even if the user already dismissed the same dialog for the last one.
+    runtimeBlockerRef.current = createRuntimeBlockerTracker();
 
     try {
       const nextRuntime = nextStarted
         ? await startRuntime()
         : await stopRuntime();
-      if (nextStarted && nextRuntime.capture.state === "error") {
-        setErrorMessage(nextRuntime.capture.detail);
-      } else if (nextStarted && nextRuntime.inject.state === "error") {
+      if (nextStarted) {
         // On a client the capture stage is idle; the blocking reason (macOS
         // Accessibility not granted, or Secure Keyboard Entry intercepting every
         // key) lives in the inject stage, so surface that too.
-        setErrorMessage(nextRuntime.inject.detail);
+        applyRuntimeBlockerDetail(
+          runtimeBlockerRef,
+          blockingRuntimeDetail(nextRuntime.capture, nextRuntime.inject),
+          setErrorMessage,
+        );
       }
       setSnapshot((current) =>
         current
@@ -2125,6 +2163,16 @@ function App() {
     void openUpdateReleasePage();
   }
 
+  function dismissErrorDialog() {
+    const blocker = runtimeBlockerRef.current;
+    // Only remember the dismissal when the dialog actually shows the runtime
+    // blocker; unrelated errors (pairing, updates) must not suppress it.
+    if (errorMessage !== null && errorMessage === blocker.shown) {
+      runtimeBlockerRef.current = dismissRuntimeBlocker(blocker);
+    }
+    setErrorMessage(null);
+  }
+
   function renderErrorDialog(message: string) {
     const canRelaunch = shouldOfferPermissionRelaunch(message);
 
@@ -2134,7 +2182,7 @@ function App() {
           <button
             type="button"
             className="error-dialog-close"
-            onClick={() => setErrorMessage(null)}
+            onClick={dismissErrorDialog}
             aria-label={ui.errors.close}
             title={ui.errors.close}
           >

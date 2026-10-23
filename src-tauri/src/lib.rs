@@ -788,6 +788,15 @@ impl AppRuntime {
                 };
             }
         }
+        // The inject stage is a pure probe of current system state, so refresh
+        // it on every status read while we are a running receiver. Without
+        // this, a block captured once at start-up (e.g. Secure Keyboard Entry
+        // while the Mac was locked, or a not-yet-ready QUIC transport) stayed
+        // in the UI after the cause was long gone.
+        runtime.inject =
+            refreshed_inject_status(runtime.started, &layout.input_mode, runtime.inject, || {
+                self.live_inject_status(layout)
+            });
         runtime.input_protection = input_guard::snapshot(&self.input_guard);
 
         runtime
@@ -831,6 +840,18 @@ impl AppRuntime {
             .lock()
             .ok()
             .and_then(|transport| transport.clone())
+    }
+
+    /// Live inject-stage probe for the receive path: the same checks
+    /// `start_input` runs, minus the one-shot Accessibility prompt.
+    fn live_inject_status(&self, layout: &LayoutState) -> NativeStageStatus {
+        if self.quic_transport_handle().is_none() {
+            return NativeStageStatus {
+                state: "error".into(),
+                detail: "QUIC transport is not ready.".into(),
+            };
+        }
+        input::input_inject_status(layout)
     }
 
     fn start_quic_transport(
@@ -1685,6 +1706,25 @@ fn merge_local_runtime_device_fields(incoming: &mut LayoutState, current: &Layou
     {
         incoming_local.transport_public_key = current_local.transport_public_key.clone();
         incoming_local.protocol_version = current_local.protocol_version;
+    }
+}
+
+/// Decides the inject stage to report on a status read.
+///
+/// While the runtime runs in receive mode the inject stage only depends on
+/// current system state (Accessibility trust, Secure Keyboard Entry, QUIC
+/// transport), so a stored snapshot must never win over a fresh probe: a block
+/// that was captured at start-up has to clear by itself once the cause is gone.
+fn refreshed_inject_status(
+    started: bool,
+    input_mode: &str,
+    stored: NativeStageStatus,
+    probe: impl FnOnce() -> NativeStageStatus,
+) -> NativeStageStatus {
+    if started && input_mode == "receive" {
+        probe()
+    } else {
+        stored
     }
 }
 
@@ -9972,6 +10012,56 @@ fn random_pairing_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_receive_mode_reprobes_inject_status_instead_of_reusing_the_snapshot() {
+        // 复盘：客户端注入状态过去只在 start_input 时算一次，启动瞬间抓到的
+        // “安全键盘输入已开启”会永久留在界面上；运行中必须每次读取都重新探测。
+        let stored = NativeStageStatus {
+            state: "error".into(),
+            detail: "启动时安全键盘输入已开启".into(),
+        };
+        let live = refreshed_inject_status(true, "receive", stored, || NativeStageStatus {
+            state: "ready".into(),
+            detail: "ok".into(),
+        });
+        assert_eq!(live.state, "ready");
+        assert_eq!(live.detail, "ok");
+
+        // 条件再次出现同样要立刻反映，而不是缓存旧的 ready。
+        let live = refreshed_inject_status(
+            true,
+            "receive",
+            NativeStageStatus {
+                state: "ready".into(),
+                detail: "ok".into(),
+            },
+            || NativeStageStatus {
+                state: "error".into(),
+                detail: "安全键盘输入已开启".into(),
+            },
+        );
+        assert_eq!(live.state, "error");
+        assert_eq!(live.detail, "安全键盘输入已开启");
+    }
+
+    #[test]
+    fn stopped_runtime_or_control_mode_keeps_captured_inject_status() {
+        let stored = NativeStageStatus {
+            state: "error".into(),
+            detail: "启动失败".into(),
+        };
+        for (started, input_mode) in [(false, "receive"), (true, "control"), (false, "control")] {
+            let status = refreshed_inject_status(started, input_mode, stored.clone(), || {
+                NativeStageStatus {
+                    state: "ready".into(),
+                    detail: "probe".into(),
+                }
+            });
+            assert_eq!(status.state, "error");
+            assert_eq!(status.detail, "启动失败");
+        }
+    }
 
     #[test]
     fn presence_sync_throttle_only_fires_after_the_interval() {
