@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -459,6 +459,9 @@ struct DiagnosticInfo {
     discovery_port: u16,
     quic_port: u16,
     peer_count: usize,
+    /// Remote devices that no live discovery peer strongly or weakly matches
+    /// right now (0 when no peers are visible — no evidence, not a failure).
+    unmatched_devices: usize,
     known_devices: Vec<DiagnosticDevice>,
     log_dir: String,
     config_dir: String,
@@ -1097,6 +1100,7 @@ impl AppRuntime {
             let mut last_local_identity_refresh = Instant::now() - LOCAL_IDENTITY_REFRESH_INTERVAL;
             let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
             let mut last_upgrading = upgrading.load(Ordering::Relaxed);
+            let mut last_probe_by_peer: HashMap<String, u64> = HashMap::new();
 
             while !thread_stop.load(Ordering::Relaxed) {
                 if last_local_identity_refresh.elapsed() >= LOCAL_IDENTITY_REFRESH_INTERVAL {
@@ -1148,6 +1152,45 @@ impl AppRuntime {
                     last_announce = Instant::now();
                     last_input_ready = current_input_ready;
                     last_upgrading = current_upgrading;
+                }
+
+                // TTL keep-alive: unicast-probe peers whose heartbeat is
+                // halfway to the TTL so brief announce gaps (sleep, AP roam,
+                // packet loss) cannot age them out. Short receive window and
+                // per-peer rate limit keep this from stalling the recv loop.
+                {
+                    let now = now_ms();
+                    let probe_targets = peers
+                        .lock()
+                        .map(|peers| {
+                            peers_nearing_ttl_probe_targets(&peers, now, &last_probe_by_peer)
+                        })
+                        .unwrap_or_default();
+                    if !probe_targets.is_empty() {
+                        let probe_peer = layout_state
+                            .lock()
+                            .map(|layout| {
+                                let mut peer = local_peer_from_layout(&layout);
+                                apply_transport_to_peer(&mut peer, &quic_transport);
+                                peer
+                            })
+                            .unwrap_or_else(|_| local_peer.clone());
+                        let targets = probe_targets
+                            .iter()
+                            .map(|(_, target)| target.clone())
+                            .collect::<Vec<_>>();
+                        let probed = probe_known_peer_targets_within(
+                            &probe_peer,
+                            &targets,
+                            Duration::from_millis(250),
+                        );
+                        for (peer_id, _) in &probe_targets {
+                            last_probe_by_peer.insert(peer_id.clone(), now);
+                        }
+                        for peer in probed {
+                            merge_peer(&peers, peer);
+                        }
+                    }
                 }
 
                 if let Ok((length, source)) = socket.recv_from(&mut buffer) {
@@ -1650,28 +1693,57 @@ fn merge_runtime_owned_layout_fields(
     }
 
     merge_local_runtime_device_fields(&mut incoming, current);
-    merge_remote_upgrading_fields(&mut incoming, current);
+    merge_runtime_owned_device_fields(&mut incoming, current);
     incoming
 }
 
-/// A remote device's "upgrading" state is determined entirely by the backend
-/// (discovery announces + the grace timer), and the frontend never carries the
-/// internal `upgrading_until_ms`. So a whole-layout save from the frontend must
-/// not clobber it — otherwise saving while a client is mid-upgrade resets
-/// `upgrading_until_ms` to 0 and the very next presence pass clears the badge
-/// early. Treat both fields as backend-owned for matching remote devices.
-fn merge_remote_upgrading_fields(incoming: &mut LayoutState, current: &LayoutState) {
+/// Fields of a *remote* device that only the backend can observe, and which a
+/// stale snapshot (a whole-layout save from the frontend, or the on-disk
+/// layout lagging behind runtime state) must never roll back:
+///
+/// - `transport_public_key`: the pinned identity discovered via announce.
+///   Rolling it back to an older value is exactly the "certificate rotation
+///   permanently pins the device offline" failure mode.
+/// - `protocol_version`/`transport_port`/`quic_port`: refreshed by announce.
+/// - `upgrading`/`upgrading_until_ms`: backend-owned grace-timer state; the
+///   frontend never carries `upgrading_until_ms`, so a save mid-upgrade used
+///   to reset the timer and clear the badge early.
+/// - `host`: refreshed from discovery, *except* for `source == "manual"`
+///   devices where the user explicitly chose the address.
+///
+/// Everything else (name/screens/color/speeds/platform) stays incoming-first
+/// because the user can edit it.
+fn merge_runtime_owned_device_fields(incoming: &mut LayoutState, current: &LayoutState) {
     for incoming_device in incoming.devices.iter_mut() {
         if incoming_device.role == "local" {
             continue;
         }
-        if let Some(current_device) = current
+        let Some(current_device) = current
             .devices
             .iter()
             .find(|device| device.id == incoming_device.id)
-        {
-            incoming_device.upgrading = current_device.upgrading;
-            incoming_device.upgrading_until_ms = current_device.upgrading_until_ms;
+        else {
+            continue;
+        };
+
+        if !current_device.transport_public_key.trim().is_empty() {
+            incoming_device.transport_public_key = current_device.transport_public_key.clone();
+        }
+        if current_device.protocol_version != 0 {
+            incoming_device.protocol_version = current_device.protocol_version;
+        }
+        if current_device.transport_port != 0 {
+            incoming_device.transport_port = current_device.transport_port;
+        }
+        if current_device.quic_port != 0 {
+            incoming_device.quic_port = current_device.quic_port;
+        }
+
+        incoming_device.upgrading = current_device.upgrading;
+        incoming_device.upgrading_until_ms = current_device.upgrading_until_ms;
+
+        if incoming_device.source != "manual" && !current_device.host.trim().is_empty() {
+            incoming_device.host = current_device.host.clone();
         }
     }
 }
@@ -1688,6 +1760,7 @@ fn merge_disk_layout_into_runtime(mut disk: LayoutState, current: &LayoutState) 
     }
 
     merge_local_runtime_device_fields(&mut disk, current);
+    merge_runtime_owned_device_fields(&mut disk, current);
     disk
 }
 
@@ -1861,6 +1934,7 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
         .collect::<Vec<_>>();
     let network_hint = diagnostic_network_hint(&known_devices);
     let firewall_hint = diagnostic_firewall_hint();
+    let unmatched_devices = count_unmatched_devices(&layout, &runtime.discovery.peers);
 
     let mut lines = vec![
         "MyKVM diagnostics".to_string(),
@@ -1886,6 +1960,7 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
             runtime.discovery.port, local_peer.quic_port
         ),
         format!("discovery peers: {}", runtime.discovery.peers.len()),
+        format!("unmatched devices: {unmatched_devices}"),
         format!("paired controllers: {}", layout.paired_controllers.len()),
         format!("privilege: {}", runtime.privilege.detail),
         format!("input service: {}", runtime.input_service.detail),
@@ -1932,6 +2007,7 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
         discovery_port: runtime.discovery.port,
         quic_port: local_peer.quic_port,
         peer_count: runtime.discovery.peers.len(),
+        unmatched_devices,
         known_devices,
         log_dir: log_dir.to_string_lossy().into_owned(),
         config_dir: config_dir.to_string_lossy().into_owned(),
@@ -4340,8 +4416,24 @@ fn load_layout_from_disk(path: &PathBuf) -> Option<LayoutState> {
     serde_json::from_str::<LayoutState>(&contents).ok()
 }
 
+/// Presence/transient fields describe *right now*, not a saved preference.
+/// They are recomputed on every discovery presence pass, so persisting them
+/// only lets a stale snapshot briefly resurrect "online"/"upgrading" devices
+/// after a restart. Normalize them on a clone so the caller's in-memory value
+/// is untouched.
+fn normalized_transient_clone(layout: &LayoutState) -> LayoutState {
+    let mut layout = layout.clone();
+    for device in &mut layout.devices {
+        device.online = false;
+        device.input_ready = false;
+        device.upgrading = false;
+        device.upgrading_until_ms = 0;
+    }
+    layout
+}
+
 fn write_layout_to_disk(path: &PathBuf, layout: &LayoutState) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(layout)
+    let json = serde_json::to_string_pretty(&normalized_transient_clone(layout))
         .map_err(|error| format!("failed to serialize layout: {error}"))?;
 
     fs::write(path, json)
@@ -4932,6 +5024,18 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
     };
 
     let transport_port = normalize_transport_port(saved_layout.transport_port);
+
+    // Older layout.json files were written with presence fields baked in
+    // (`online: true` etc). Recompute them from discovery instead of trusting
+    // the snapshot, so a device never reads as online before any peer was
+    // actually seen this run.
+    let mut devices = devices;
+    for device in &mut devices {
+        device.online = false;
+        device.input_ready = false;
+        device.upgrading = false;
+        device.upgrading_until_ms = 0;
+    }
 
     LayoutState {
         devices,
@@ -8425,11 +8529,63 @@ fn active_peer_snapshot(peers: &Arc<Mutex<Vec<LanPeer>>>) -> Vec<LanPeer> {
         .unwrap_or_default()
 }
 
+/// Applies discovery presence to the device list in two passes:
+///
+/// 1. strong match (`device_matches_peer`, unchanged semantics — this is the
+///    anti-impersonation gate). A strong hit on a non-manual device whose id
+///    drifted (the peer id embeds the LAN address, so a DHCP change produces a
+///    new id) first retargets the device id so the pairing survives.
+/// 2. weak match: remaining offline devices against unclaimed peers, requiring
+///    bidirectional uniqueness. A weak hit only restores `online`/`input_ready`
+///    for display — it never rewrites key/host/ports/id.
 fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
     let local_transport_port = layout.transport_port;
     let local_quic_port = layout.quic_port;
     let cluster_id = layout.cluster_id.clone();
-    for device in &mut layout.devices {
+
+    // Pass 1a: resolve strong matches by index (ids may be retargeted below).
+    let mut strong_matches: Vec<Option<usize>> = Vec::with_capacity(layout.devices.len());
+    for device in &layout.devices {
+        if device.role == "local" {
+            strong_matches.push(None);
+            continue;
+        }
+        strong_matches.push(
+            peers
+                .iter()
+                .position(|peer| device_matches_peer(device, peer, &cluster_id)),
+        );
+    }
+
+    // Pass 1b: id follow for non-manual devices. Manual devices keep their
+    // user-chosen identity; this is the only path allowed to rewrite
+    // device.id, and it never touches transport_public_key.
+    for (index, peer_index) in strong_matches.iter().enumerate() {
+        let Some(peer_index) = peer_index else {
+            continue;
+        };
+        let peer = &peers[*peer_index];
+        let device = &layout.devices[index];
+        if device.source == "manual" {
+            continue;
+        }
+        let new_id = peer_device_id(peer);
+        if new_id.is_empty() || new_id == device.id {
+            continue;
+        }
+        let old_id = device.id.clone();
+        let device_name = device.name.clone();
+        if retarget_device_id(layout, &old_id, &new_id) {
+            log::info!(
+                "device id followed discovery drift old_id={old_id} new_id={new_id} name={device_name}"
+            );
+        }
+    }
+
+    // Pass 1c: apply strong matches / offline state.
+    let mut claimed_peers = vec![false; peers.len()];
+    let mut strong_matched = vec![false; layout.devices.len()];
+    for (index, device) in layout.devices.iter_mut().enumerate() {
         if device.role == "local" {
             device.online = true;
             device.input_ready = false;
@@ -8439,11 +8595,10 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
             continue;
         }
 
-        let peer = peers
-            .iter()
-            .find(|peer| device_matches_peer(device, peer, &cluster_id));
-        if let Some(peer) = peer {
-            update_device_from_peer(device, peer);
+        if let Some(peer_index) = strong_matches[index] {
+            claimed_peers[peer_index] = true;
+            strong_matched[index] = true;
+            update_device_from_peer(device, &peers[peer_index]);
         } else {
             device.online = false;
             device.input_ready = false;
@@ -8453,7 +8608,241 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
         }
     }
 
+    // Pass 2: weak match for the remaining offline devices. Unclaimed peers
+    // only, bidirectional uniqueness, display state only.
+    if !peers.is_empty() {
+        apply_weak_peer_presence(layout, peers, &cluster_id, &claimed_peers, &strong_matched);
+    }
+
+    log_unmatched_devices(layout, peers);
+
     refresh_paired_controller_addresses(layout, peers);
+}
+
+/// Second presence pass: restore `online`/`input_ready` for an offline device
+/// that is very likely the peer we just saw, even though the strong identity
+/// check failed (e.g. the peer rotated its certificate). A weak hit requires:
+///
+/// - same cluster, non-empty, and the peer does not demand pairing;
+/// - a name match or a host-segment match (case-insensitive, trimmed);
+/// - bidirectional uniqueness: neither side was claimed by the strong pass
+///   and neither has a second weak candidate.
+///
+/// Weak matches never rewrite identity fields and never rebind device ids.
+fn apply_weak_peer_presence(
+    layout: &mut LayoutState,
+    peers: &[LanPeer],
+    cluster_id: &str,
+    claimed_peers: &[bool],
+    strong_matched: &[bool],
+) {
+    let mut candidates: Vec<Vec<usize>> = Vec::with_capacity(layout.devices.len());
+    for (index, device) in layout.devices.iter().enumerate() {
+        if device.role == "local" || strong_matched[index] {
+            candidates.push(Vec::new());
+            continue;
+        }
+        let hits = peers
+            .iter()
+            .enumerate()
+            .filter(|(peer_index, _)| !claimed_peers[*peer_index])
+            .filter(|(_, peer)| weak_device_match(device, peer, cluster_id).is_some())
+            .map(|(peer_index, _)| peer_index)
+            .collect::<Vec<_>>();
+        candidates.push(hits);
+    }
+
+    let mut peer_candidate_count = vec![0usize; peers.len()];
+    for hits in &candidates {
+        for peer_index in hits {
+            peer_candidate_count[*peer_index] += 1;
+        }
+    }
+
+    for (index, hits) in candidates.iter().enumerate() {
+        let [peer_index] = hits.as_slice() else {
+            continue;
+        };
+        if peer_candidate_count[*peer_index] != 1 {
+            continue;
+        }
+        let peer = &peers[*peer_index];
+        let device = &mut layout.devices[index];
+        device.online = true;
+        device.input_ready = peer.input_ready;
+        log::info!(
+            "discovery weak match restored presence device_id={} name={} peer={} peer_id={} (identity fields untouched)",
+            device.id,
+            device.name,
+            peer.name,
+            peer.id
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeakMatchReason {
+    Name,
+    Host,
+}
+
+/// Weak (display-only) match between a saved device and a live peer. Never
+/// used to grant trust: it only gates `online`/`input_ready` display, and
+/// callers must additionally enforce bidirectional uniqueness.
+fn weak_device_match(
+    device: &Device,
+    peer: &LanPeer,
+    layout_cluster_id: &str,
+) -> Option<WeakMatchReason> {
+    let cluster_id = layout_cluster_id.trim();
+    if cluster_id.is_empty() || peer.pairing_required || peer.cluster_id != cluster_id {
+        return None;
+    }
+
+    let device_name = device.name.trim().to_ascii_lowercase();
+    let peer_name = peer.name.trim().to_ascii_lowercase();
+    if !device_name.is_empty() && device_name == peer_name {
+        return Some(WeakMatchReason::Name);
+    }
+
+    if same_host(&device.host, &peer.host) {
+        return Some(WeakMatchReason::Host);
+    }
+
+    None
+}
+
+/// Rate limit for the "peer visible but device unmatched" warning: one line
+/// per device id every 30s so the 2s layout polling cannot flood the log.
+const UNMATCHED_WARN_INTERVAL_MS: u64 = 30_000;
+
+static UNMATCHED_WARN_MS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn unmatched_warn_due(device_id: &str, now: u64, last_warn: &mut HashMap<String, u64>) -> bool {
+    let Some(last) = last_warn.get(device_id).copied() else {
+        last_warn.insert(device_id.to_string(), now);
+        return true;
+    };
+    if now.saturating_sub(last) < UNMATCHED_WARN_INTERVAL_MS {
+        return false;
+    }
+    last_warn.insert(device_id.to_string(), now);
+    true
+}
+
+/// Pure counter for diagnostics: remote devices that no live peer strongly or
+/// weakly matches. Empty peer list means "no evidence", so nothing counts.
+fn count_unmatched_devices(layout: &LayoutState, peers: &[LanPeer]) -> usize {
+    if peers.is_empty() {
+        return 0;
+    }
+    let cluster_id = layout.cluster_id.as_str();
+    layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+        .filter(|device| {
+            !peers.iter().any(|peer| {
+                device_matches_peer(device, peer, cluster_id)
+                    || weak_device_match(device, peer, cluster_id).is_some()
+            })
+        })
+        .count()
+}
+
+fn log_unmatched_devices(layout: &LayoutState, peers: &[LanPeer]) {
+    if peers.is_empty() {
+        return;
+    }
+    let cluster_id = layout.cluster_id.as_str();
+    let now = now_ms();
+    let Ok(mut last_warn) = UNMATCHED_WARN_MS.get_or_init(Default::default).lock() else {
+        return;
+    };
+    for device in layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+    {
+        let unmatched = !peers.iter().any(|peer| {
+            device_matches_peer(device, peer, cluster_id)
+                || weak_device_match(device, peer, cluster_id).is_some()
+        });
+        if unmatched && unmatched_warn_due(&device.id, now, &mut last_warn) {
+            log::warn!(
+                "discovery peer visible but device unmatched id={} name={} host={} peers={}",
+                device.id,
+                device.name,
+                device.host,
+                peers.len()
+            );
+        }
+    }
+}
+
+/// Rewrites a device id and cascades every reference to it: the device entry,
+/// its screens (ids and `device_id`), the active device and the selected
+/// screen. Screen placement (x/y) is preserved via prefix replacement of the
+/// screen id, which keeps the existing id-derivation unique.
+///
+/// Refuses (returns false, warn-logged) when another device already owns
+/// `new_id` — two devices must never merge.
+fn retarget_device_id(layout: &mut LayoutState, old_id: &str, new_id: &str) -> bool {
+    if old_id == new_id {
+        return false;
+    }
+    if layout.devices.iter().any(|device| device.id == new_id) {
+        log::warn!(
+            "device id retarget refused: target id already taken old_id={old_id} new_id={new_id}"
+        );
+        return false;
+    }
+
+    let taken: HashSet<String> = layout
+        .devices
+        .iter()
+        .filter(|device| device.id != old_id)
+        .flat_map(|device| device.screens.iter().map(|screen| screen.id.clone()))
+        .collect();
+    let mut taken = taken;
+
+    let mut screen_remap: Vec<(String, String)> = Vec::new();
+    let old_prefix = format!("{old_id}-");
+    for device in layout.devices.iter_mut() {
+        if device.id != old_id {
+            continue;
+        }
+        device.id = new_id.to_string();
+        for (index, screen) in device.screens.iter_mut().enumerate() {
+            let old_screen_id = screen.id.clone();
+            screen.device_id = new_id.to_string();
+            let base = old_screen_id
+                .strip_prefix(&old_prefix)
+                .map(|rest| format!("{new_id}-{rest}"))
+                .unwrap_or_else(|| format!("{new_id}-display-{}", index + 1));
+            let mut candidate = base.clone();
+            let mut counter = 2;
+            while taken.contains(&candidate) {
+                candidate = format!("{base}-{counter}");
+                counter += 1;
+            }
+            taken.insert(candidate.clone());
+            screen.id = candidate;
+            screen_remap.push((old_screen_id, screen.id.clone()));
+        }
+    }
+
+    if layout.active_device_id == old_id {
+        layout.active_device_id = new_id.to_string();
+    }
+    if let Some((_, new_screen_id)) = screen_remap
+        .iter()
+        .find(|(old_screen_id, _)| *old_screen_id == layout.selected_screen_id)
+    {
+        layout.selected_screen_id = new_screen_id.clone();
+    }
+
+    true
 }
 
 /// Discovery may refresh an address, but cannot replace a paired certificate.
@@ -8596,12 +8985,20 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
         .map(|screen| screen.y)
         .min()
         .unwrap_or_default();
+    let same_count = existing_screens.len() == peer.screens.len();
     peer.screens
         .iter()
         .enumerate()
         .map(|(index, peer_screen)| {
             let id = unique_peer_screen_id(device_id, peer_screen, index);
-            let existing_screen = existing_screens.iter().find(|screen| screen.id == id);
+            // Match by id first; when the device id was retargeted (or the
+            // peer renamed a display) and both sides have the same number of
+            // screens, fall back to same-position matching so the user's
+            // placement (x/y) survives instead of snapping back to default.
+            let existing_screen = existing_screens
+                .iter()
+                .find(|screen| screen.id == id)
+                .or_else(|| existing_screens.get(index).filter(|_| same_count));
 
             Screen {
                 id,
@@ -8866,6 +9263,16 @@ fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, 
 }
 
 fn probe_known_peer_targets(local_peer: &LanPeer, targets: &[String]) -> Vec<LanPeer> {
+    probe_known_peer_targets_within(local_peer, targets, Duration::from_millis(700))
+}
+
+/// Same probe, but with a caller-chosen receive window. The TTL keep-alive
+/// path uses a short window so it can never stall the discovery recv loop.
+fn probe_known_peer_targets_within(
+    local_peer: &LanPeer,
+    targets: &[String],
+    window: Duration,
+) -> Vec<LanPeer> {
     if targets.is_empty() {
         return Vec::new();
     }
@@ -8881,7 +9288,7 @@ fn probe_known_peer_targets(local_peer: &LanPeer, targets: &[String]) -> Vec<Lan
     let started = Instant::now();
     let mut buffer = [0_u8; 4096];
     let mut peers = Vec::new();
-    while started.elapsed() < Duration::from_millis(700) {
+    while started.elapsed() < window {
         let Ok((length, source)) = socket.recv_from(&mut buffer) else {
             continue;
         };
@@ -9735,7 +10142,42 @@ fn prune_stale_peers(peers: &Arc<Mutex<Vec<LanPeer>>>) {
     }
 }
 
+/// A forward clock jump larger than this between two prune calls (sleep/wake,
+/// NTP correction) makes every peer look stale at once. Skipping one prune
+/// round after such a jump costs at most one extra TTL window of stale rows
+/// and prevents a full-fleet offline flash; the next announce (≤3s) refreshes
+/// every entry anyway.
+const CLOCK_JUMP_GUARD_MS: u64 = 300_000;
+
+static LAST_PRUNE_BASELINE_MS: AtomicU64 = AtomicU64::new(0);
+
 fn prune_stale_peer_entries(peers: &mut Vec<LanPeer>, now: u64) {
+    let mut baseline = LAST_PRUNE_BASELINE_MS.load(Ordering::Relaxed);
+    prune_stale_peer_entries_with_baseline(peers, now, &mut baseline);
+    LAST_PRUNE_BASELINE_MS.store(baseline, Ordering::Relaxed);
+}
+
+fn prune_stale_peer_entries_with_baseline(peers: &mut Vec<LanPeer>, now: u64, baseline: &mut u64) {
+    if clock_jump_guard_skips_prune(*baseline, now) {
+        log::warn!(
+            "discovery prune skipped after apparent clock jump now={} baseline_ms={}",
+            now,
+            baseline
+        );
+        *baseline = now;
+        return;
+    }
+    *baseline = now;
+    prune_stale_peer_entries_at(peers, now);
+}
+
+/// True when the clock appears to have jumped forward past the guard between
+/// two prune rounds, in which case this round must not delete peers.
+fn clock_jump_guard_skips_prune(baseline: u64, now: u64) -> bool {
+    baseline != 0 && now.saturating_sub(baseline) > CLOCK_JUMP_GUARD_MS
+}
+
+fn prune_stale_peer_entries_at(peers: &mut Vec<LanPeer>, now: u64) {
     for peer in peers
         .iter()
         .filter(|peer| now.saturating_sub(peer.last_seen_ms) > PEER_TTL_MS)
@@ -9750,6 +10192,43 @@ fn prune_stale_peer_entries(peers: &mut Vec<LanPeer>, now: u64) {
         );
     }
     peers.retain(|peer| now.saturating_sub(peer.last_seen_ms) <= PEER_TTL_MS);
+}
+
+/// TTL keep-alive: a peer whose last heartbeat is halfway to the TTL but has
+/// not expired yet gets a direct unicast probe, so a flaky broadcast window
+/// (sleep, AP roam, dropped announces) cannot age it out. Rate-limited per
+/// peer and per round so this can never turn into a probe storm or stall the
+/// discovery recv loop.
+const PEER_TTL_PROBE_AFTER_MS: u64 = PEER_TTL_MS / 2;
+const PEER_TTL_PROBE_INTERVAL_MS: u64 = 10_000;
+const PEER_TTL_PROBE_MAX_PER_ROUND: usize = 4;
+
+fn peers_nearing_ttl_probe_targets(
+    peers: &[LanPeer],
+    now: u64,
+    last_probe_by_peer: &HashMap<String, u64>,
+) -> Vec<(String, String)> {
+    let mut targets = Vec::new();
+    for peer in peers {
+        let age = now.saturating_sub(peer.last_seen_ms);
+        if age <= PEER_TTL_PROBE_AFTER_MS || age >= PEER_TTL_MS {
+            continue;
+        }
+        let last = last_probe_by_peer.get(&peer.id).copied().unwrap_or(0);
+        if now.saturating_sub(last) < PEER_TTL_PROBE_INTERVAL_MS {
+            continue;
+        }
+        let ip = peer.ip.trim();
+        if ip.is_empty() {
+            continue;
+        }
+        let port = normalize_transport_port(peer.transport_port);
+        targets.push((peer.id.clone(), format!("{ip}:{port}")));
+        if targets.len() >= PEER_TTL_PROBE_MAX_PER_ROUND {
+            break;
+        }
+    }
+    targets
 }
 
 fn discovery_detail(peer_count: usize, listening: bool, port: u16) -> String {
@@ -10173,7 +10652,15 @@ mod tests {
             native.devices[0].screens = detected;
             let restarted = normalize_saved_layout(disk, native);
             assert_eq!(restarted.devices[0].screens, saved.devices[0].screens);
-            assert_eq!(restarted.devices[1], saved.devices[1]);
+            // P0-1.3:读盘侧清零瞬态字段(online/input_ready/upgrading),旧
+            // layout.json 的脏 presence 不得复活;比对基线随之归零,其余字段
+            // 仍逐一全等比对,不弱化。
+            let mut expected_peer = saved.devices[1].clone();
+            expected_peer.online = false;
+            expected_peer.input_ready = false;
+            expected_peer.upgrading = false;
+            expected_peer.upgrading_until_ms = 0;
+            assert_eq!(restarted.devices[1], expected_peer);
 
             let mut awake = arranged.clone();
             awake.x = 0;
@@ -10582,7 +11069,11 @@ mod tests {
         let mut impostor = peer.clone();
         impostor.transport_public_key = "untrusted-replacement".into();
         apply_peer_presence(&mut layout, &[impostor]);
-        assert!(!layout.devices[1].online);
+        // 弱匹配(P0-2a)会把同名同 cluster 的漂移 peer 显示为在线——这是
+        // 「恢复状态显示 + 弹窗修复」的有意行为;安全边界在于身份绝不被替换:
+        // 下面两行断言(discovery 不能改写 key、不能改写 paired_controllers)
+        // 是本测试的核心,保持不变。
+        assert!(layout.devices[1].online);
         assert_eq!(layout.devices[1].transport_public_key, "peer-public-key");
         assert_eq!(layout.paired_controllers[0], trusted);
 
@@ -11219,6 +11710,397 @@ mod tests {
             merged.devices[0].protocol_version,
             quic_transport::PROTOCOL_VERSION
         );
+    }
+
+    /// P0-1:远端设备的 key/protocol/ports/host(非 manual)是后端观测值,
+    /// 陈旧快照(前端整份保存、磁盘落后)不得回退它们。
+    #[test]
+    fn merge_keeps_runtime_remote_identity_over_stale_snapshot() {
+        let mut current = test_layout();
+        current.devices[1].transport_public_key = "runtime-key".into();
+        current.devices[1].protocol_version = quic_transport::PROTOCOL_VERSION;
+        current.devices[1].transport_port = 52000;
+        current.devices[1].quic_port = 52001;
+        current.devices[1].host = "10.0.0.99".into();
+        current.devices[1].upgrading = true;
+        current.devices[1].upgrading_until_ms = now_ms() + 60_000;
+
+        let mut stale = current.clone();
+        stale.devices[1].transport_public_key = "old-key".into();
+        stale.devices[1].protocol_version = 0;
+        stale.devices[1].transport_port = 47833;
+        stale.devices[1].quic_port = 0;
+        stale.devices[1].host = "10.0.0.2".into();
+        stale.devices[1].upgrading = false;
+        stale.devices[1].upgrading_until_ms = 0;
+        stale.devices[1].name = "User renamed".into();
+
+        let merged_save = merge_runtime_owned_layout_fields(stale.clone(), &current);
+        let merged_disk = merge_disk_layout_into_runtime(stale.clone(), &current);
+
+        for merged in [merged_save, merged_disk] {
+            assert_eq!(merged.devices[1].transport_public_key, "runtime-key");
+            assert_eq!(
+                merged.devices[1].protocol_version,
+                quic_transport::PROTOCOL_VERSION
+            );
+            assert_eq!(merged.devices[1].transport_port, 52000);
+            assert_eq!(merged.devices[1].quic_port, 52001);
+            assert_eq!(merged.devices[1].host, "10.0.0.99");
+            assert!(merged.devices[1].upgrading);
+            assert_eq!(merged.devices[1].upgrading_until_ms, now_ms() + 60_000);
+            // 用户可编辑字段保持 incoming 优先。
+            assert_eq!(merged.devices[1].name, "User renamed");
+        }
+    }
+
+    /// P0-1:current key 非空时,任何 incoming 空值都不能把 key 清空;
+    /// 但 current 为空时保留 incoming(允许首次回填)。
+    #[test]
+    fn merge_never_clears_nonempty_runtime_key() {
+        let mut current = test_layout();
+        current.devices[1].transport_public_key = "runtime-key".into();
+
+        let mut cleared = current.clone();
+        cleared.devices[1].transport_public_key.clear();
+        let merged = merge_runtime_owned_layout_fields(cleared, &current);
+        assert_eq!(merged.devices[1].transport_public_key, "runtime-key");
+
+        // current 为空 → 保留 incoming 的非空 key(不反向清空)。
+        let mut empty_current = current.clone();
+        empty_current.devices[1].transport_public_key.clear();
+        let mut with_key = current.clone();
+        with_key.devices[1].transport_public_key = "disk-key".into();
+        let merged = merge_runtime_owned_layout_fields(with_key, &empty_current);
+        assert_eq!(merged.devices[1].transport_public_key, "disk-key");
+    }
+
+    /// P0-1:落盘归一化瞬态 presence 字段;内存中的值不受影响;读回不带脏状态。
+    #[test]
+    fn write_layout_normalizes_transient_presence_fields() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let path: PathBuf = sandbox.path().join("layout.json");
+
+        let mut layout = test_layout();
+        layout.devices[1].online = true;
+        layout.devices[1].input_ready = true;
+        layout.devices[1].upgrading = true;
+        layout.devices[1].upgrading_until_ms = now_ms() + 60_000;
+
+        write_layout_to_disk(&path, &layout).expect("write layout");
+        // 调用方内存值不受影响。
+        assert!(layout.devices[1].online);
+        assert!(layout.devices[1].input_ready);
+        assert!(layout.devices[1].upgrading);
+
+        let on_disk: LayoutState =
+            serde_json::from_slice(&fs::read(&path).expect("read layout")).expect("parse layout");
+        for device in &on_disk.devices {
+            assert!(!device.online, "online must not be persisted");
+            assert!(!device.input_ready, "input_ready must not be persisted");
+            assert!(!device.upgrading, "upgrading must not be persisted");
+            assert_eq!(
+                device.upgrading_until_ms, 0,
+                "grace timer must not be persisted"
+            );
+        }
+        // 读盘侧再兜底:旧 layout.json 手写脏值也要清零。
+        let mut dirty = test_layout();
+        dirty.devices[1].online = true;
+        dirty.devices[1].input_ready = true;
+        let normalized = normalize_saved_layout(dirty, test_layout());
+        for device in &normalized.devices {
+            assert!(!device.online);
+            assert!(!device.input_ready);
+        }
+    }
+
+    /// P0-2b:强匹配命中且 id 漂移时,id 级联跟随;screens 的 x/y 摆放保留,
+    /// active_device_id / selected_screen_id 正确重映射。
+    #[test]
+    fn strong_match_retargets_device_id_and_keeps_screen_placement() {
+        let mut layout = test_layout();
+        // 用户已把远端屏摆到 (7500, -3960)。
+        layout.devices[1].screens = vec![Screen {
+            id: "peer-client-10-0-0-2-display-1".into(),
+            device_id: "peer-client-10-0-0-2".into(),
+            name: "Display".into(),
+            x: 7500,
+            y: -3960,
+            width: 2560,
+            height: 1440,
+            scale: 1.0,
+            is_primary: true,
+        }];
+        layout.active_device_id = "peer-client-10-0-0-2".into();
+        layout.selected_screen_id = "peer-client-10-0-0-2-display-1".into();
+
+        // 同 key、不同 id(IP 漂移 → id 漂移)。
+        let mut peer = test_peer();
+        peer.id = "peer-client-10-0-1.5".into();
+
+        apply_peer_presence(&mut layout, &[peer]);
+
+        let device = &layout.devices[1];
+        assert_eq!(device.id, "peer-client-10-0-1-5");
+        assert!(device.online);
+        assert_eq!(device.screens.len(), 1);
+        assert_eq!(device.screens[0].device_id, "peer-client-10-0-1-5");
+        assert_eq!(
+            device.screens[0].x, 7500,
+            "placement x must survive id change"
+        );
+        assert_eq!(
+            device.screens[0].y, -3960,
+            "placement y must survive id change"
+        );
+        assert_eq!(layout.active_device_id, "peer-client-10-0-1-5");
+        assert_eq!(
+            layout.selected_screen_id, "peer-client-10-0-1-5-display-1",
+            "selected screen must follow the remapped screen id"
+        );
+        // id 跟随绝不触碰信任。
+        assert_eq!(device.transport_public_key, "peer-public-key");
+    }
+
+    /// P0-2b:manual 设备的 id 是用户稳定引用,永不自动跟随。
+    #[test]
+    fn manual_device_id_never_retargeted() {
+        let mut layout = test_layout();
+        layout.devices[1].source = "manual".into();
+
+        let mut peer = test_peer();
+        peer.id = "peer-client-10-0-1.5".into();
+
+        apply_peer_presence(&mut layout, &[peer]);
+
+        assert_eq!(layout.devices[1].id, "peer-client-10-0-0-2");
+        // manual 设备 host 也不被 discovery 覆盖(既有语义)。
+        assert_eq!(layout.devices[1].host, "client / 10.0.0.2");
+    }
+
+    /// P0-2b:目标 id 已被另一设备占用 → 拒绝改写,绝不合并两台设备。
+    #[test]
+    fn retarget_refuses_when_target_id_taken() {
+        let mut layout = test_layout();
+        layout.devices[1].id = "peer-client-10-0-0-2".into();
+        // 第二台远端设备已占用目标 id。
+        let mut other = layout.devices[1].clone();
+        other.id = "peer-client-10-0-1-5".into();
+        other.name = "Other".into();
+        layout.devices.push(other);
+
+        let refused =
+            retarget_device_id(&mut layout, "peer-client-10-0-0-2", "peer-client-10-0-1-5");
+        assert!(!refused);
+        assert_eq!(layout.devices[1].id, "peer-client-10-0-0-2");
+        assert_eq!(layout.devices[2].id, "peer-client-10-0-1-5");
+        assert_eq!(layout.devices.len(), 3, "devices must never merge");
+    }
+
+    /// P0-2a:弱匹配仅在同 cluster、非 pairing_required、信号命中且双向唯一
+    /// 时生效;大小写不敏感;存在第二个候选时拒绝。
+    #[test]
+    fn weak_match_requires_unique_bidirectional_signal() {
+        let device = Device {
+            id: "stale-id".into(),
+            // 与 test_peer().name("Client")大小写/空白不同 → 名称信号应命中。
+            name: "  client ".into(),
+            // host 的 '/' 首段与 test_peer().host("client")相等 → Host 信号。
+            host: "client / 10.0.0.7".into(),
+            transport_public_key: "old-rotated-key".into(),
+            ..test_layout().devices[1].clone()
+        };
+        let peer = LanPeer {
+            transport_public_key: "new-rotated-key".into(),
+            ..test_peer()
+        };
+
+        // 名称信号(大小写/trim 不敏感)命中。
+        assert_eq!(
+            weak_device_match(&device, &peer, "cluster-test"),
+            Some(WeakMatchReason::Name)
+        );
+        // host 段信号:peer.host 与 device.host 的 '/' 段相等。
+        let mut host_peer = peer.clone();
+        host_peer.name = "Renamed box".into();
+        assert_eq!(
+            weak_device_match(&device, &host_peer, "cluster-test"),
+            Some(WeakMatchReason::Host)
+        );
+        // cluster 不同 / 空 → 不生效。
+        assert_eq!(weak_device_match(&device, &peer, ""), None);
+        assert_eq!(weak_device_match(&device, &peer, "other-cluster"), None);
+        // pairing_required → 不生效。
+        let mut gated = peer.clone();
+        gated.pairing_required = true;
+        assert_eq!(weak_device_match(&device, &gated, "cluster-test"), None);
+        // 双向唯一:两个同名候选 → 都不弱匹配(两台设备 key 均为漂移旧值,
+        // 强匹配不命中,进弱匹配)。
+        let mut layout = test_layout();
+        layout.devices[1] = device.clone();
+        let duplicate = Device {
+            id: "stale-id-2".into(),
+            name: "CLIENT".into(),
+            ..device.clone()
+        };
+        layout.devices.push(duplicate);
+        apply_peer_presence(&mut layout, &[peer.clone()]);
+        assert!(
+            !layout.devices[1].online && !layout.devices[2].online,
+            "ambiguous weak candidates must stay offline"
+        );
+
+        // 单一候选 → 恢复在线,且身份字段不被改写。
+        let mut layout = test_layout();
+        layout.devices[1] = Device {
+            id: "stale-id".into(),
+            name: "Client".into(),
+            host: "old-host".into(),
+            transport_public_key: "old-rotated-key".into(),
+            ..layout.devices[1].clone()
+        };
+        apply_peer_presence(&mut layout, &[peer]);
+        assert!(
+            layout.devices[1].online,
+            "unique weak match must restore online"
+        );
+        assert!(layout.devices[1].input_ready);
+        assert_eq!(
+            layout.devices[1].transport_public_key, "old-rotated-key",
+            "weak match must never rewrite the pinned key"
+        );
+        assert_eq!(
+            layout.devices[1].host, "old-host",
+            "weak match must never rewrite host"
+        );
+        assert_eq!(
+            layout.devices[1].id, "stale-id",
+            "weak match must never rebind id"
+        );
+    }
+
+    /// P1-1:unmatched 计数为纯函数;空 peer 列表 = 无证据,不计数。
+    #[test]
+    fn unmatched_device_counting_is_pure() {
+        let layout = test_layout();
+        assert_eq!(count_unmatched_devices(&layout, &[]), 0);
+
+        // 强匹配命中的 peer 在场 → 0。
+        assert_eq!(count_unmatched_devices(&layout, &[test_peer()]), 0);
+
+        // 名称被改、id 漂移、key 轮换的 peer:弱匹配命中 → 仍 0。
+        let mut drifted = test_peer();
+        drifted.id = "other-id".into();
+        assert_eq!(count_unmatched_devices(&layout, &[drifted]), 0);
+
+        // 完全不相干的 peer(不同 key/名称/host)→ 远端设备计 1。
+        let mut stranger = test_peer();
+        stranger.id = "stranger".into();
+        stranger.name = "Someone else".into();
+        stranger.host = "other-box".into();
+        stranger.transport_public_key = "stranger-key".into();
+        assert_eq!(count_unmatched_devices(&layout, &[stranger]), 1);
+    }
+
+    /// P1-1:同一设备 30s 内只告警一次。
+    #[test]
+    fn unmatched_warn_is_rate_limited_per_device() {
+        let mut last = HashMap::new();
+        assert!(unmatched_warn_due("dev-a", 1_000, &mut last));
+        assert!(!unmatched_warn_due("dev-a", 1_000 + 29_999, &mut last));
+        assert!(unmatched_warn_due("dev-a", 1_000 + 30_000, &mut last));
+        // 另一设备独立限频。
+        assert!(unmatched_warn_due("dev-b", 1_001, &mut last));
+    }
+
+    /// P1-2:时钟前跳超过保护窗口 → 跳过本轮删除;恢复正常后照常删除。
+    #[test]
+    fn prune_skips_on_clock_jump() {
+        let mut entries = vec![test_peer()];
+        entries[0].last_seen_ms = 0; // 远超 TTL,正常情况必删
+        let mut baseline = 0u64;
+
+        // 首轮建立基准(时钟稳定,过期 peer 正常删除)。
+        entries[0].last_seen_ms = 1_000_000 - PEER_TTL_MS - 1;
+        prune_stale_peer_entries_with_baseline(&mut entries, 1_000_000, &mut baseline);
+        assert!(entries.is_empty(), "stable clock must prune expired peers");
+
+        // 前跳 5 分钟以上 → 跳过本轮删除(即使 peer 已过期)。
+        entries.push(test_peer());
+        entries[0].last_seen_ms = 0;
+        let jumped = baseline + CLOCK_JUMP_GUARD_MS + 1;
+        assert!(clock_jump_guard_skips_prune(baseline, jumped));
+        prune_stale_peer_entries_with_baseline(&mut entries, jumped, &mut baseline);
+        assert_eq!(entries.len(), 1, "clock jump round must not delete peers");
+
+        // 时钟恢复稳定 → 照常删除过期 peer。
+        let stable = jumped + 1_000;
+        assert!(!clock_jump_guard_skips_prune(jumped, stable));
+        entries[0].last_seen_ms = stable - PEER_TTL_MS - 1;
+        prune_stale_peer_entries_with_baseline(&mut entries, stable, &mut baseline);
+        assert!(
+            entries.is_empty(),
+            "recovered clock must prune expired peers"
+        );
+    }
+
+    /// P1-2:临近 TTL(45s~90s)的 peer 进入 probe 名单;限频 10s/peer、
+    /// 单轮至多 4 个;未到阈值或已过期的不探。
+    #[test]
+    fn probe_keeps_nearing_ttl_peer_alive() {
+        let now = 10_000_000u64;
+        let mut peers: Vec<LanPeer> = Vec::new();
+        for index in 0..6 {
+            let mut peer = test_peer();
+            peer.id = format!("peer-{index}");
+            peer.ip = format!("10.0.0.{index}");
+            // 46s 未见:临近 TTL。
+            peer.last_seen_ms = now - 46_000;
+            peers.push(peer);
+        }
+        // 新鲜 peer 不探。
+        let mut fresh = test_peer();
+        fresh.id = "fresh".into();
+        fresh.ip = "10.0.0.7".into();
+        fresh.last_seen_ms = now - 1_000;
+        peers.push(fresh);
+        // 已过期 peer 不探(交给 prune)。
+        let mut expired = test_peer();
+        expired.id = "expired".into();
+        expired.ip = "10.0.0.8".into();
+        expired.last_seen_ms = now - PEER_TTL_MS - 1;
+        peers.push(expired);
+
+        let mut last_probe = HashMap::new();
+        let targets = peers_nearing_ttl_probe_targets(&peers, now, &last_probe);
+        assert_eq!(targets.len(), 4, "single round is capped at 4 probes");
+        assert!(targets
+            .iter()
+            .all(|(id, target)| { id.starts_with("peer-") && target.starts_with("10.0.0.") }));
+
+        // 记录后 10s 内不重复探:again 只含单轮上限(4 个)之外的 peer-4/5。
+        for (id, _) in &targets {
+            last_probe.insert(id.clone(), now);
+        }
+        let again = peers_nearing_ttl_probe_targets(&peers, now + 9_000, &last_probe);
+        let probed: Vec<&str> = targets.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            again.iter().all(|(id, _)| !probed.contains(&id.as_str())),
+            "per-peer rate limit must suppress re-probes"
+        );
+        assert_eq!(again.len(), 2, "peers beyond the round cap stay queued");
+        // 10s 后已探 peer 可再次进入名单。
+        let later = peers_nearing_ttl_probe_targets(&peers, now + 10_001, &last_probe);
+        assert_eq!(later.len(), 4);
+
+        // 无 IP 的 peer 不产生目标。
+        let mut no_ip = test_peer();
+        no_ip.id = "no-ip".into();
+        no_ip.ip = "  ".into();
+        no_ip.last_seen_ms = now - 46_000;
+        let targets = peers_nearing_ttl_probe_targets(&[no_ip], now, &HashMap::new());
+        assert!(targets.is_empty());
     }
 
     #[test]
