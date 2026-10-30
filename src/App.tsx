@@ -84,8 +84,7 @@ import {
   getLayoutBounds,
   getScreenById,
   moveScreen,
-  screenPositionOverlaps,
-  snapOverlappingScreenPosition,
+  separateOverlappingScreens,
   snapScreenPosition,
 } from "./layout";
 import type { FlattenedScreen, LayoutBounds } from "./layout";
@@ -1300,24 +1299,7 @@ function App() {
 
   const endDrag = useEffectEvent(() => {
     if (layout && dragState) {
-      const screen = getScreenById(layout, dragState.screenId);
-      const currentPosition = screen ? { x: screen.x, y: screen.y } : null;
-      const startPosition = { x: dragState.startX, y: dragState.startY };
-      const nextLayout =
-        screen &&
-        currentPosition &&
-        screenPositionOverlaps(layout, dragState.screenId, currentPosition)
-          ? moveScreen(
-              layout,
-              dragState.screenId,
-              snapOverlappingScreenPosition(
-                layout,
-                dragState.screenId,
-                currentPosition,
-                startPosition,
-              ) ?? startPosition,
-            )
-          : layout;
+      const nextLayout = separateOverlappingScreens(layout, dragState.screenId)
 
       setSnapshot((current) =>
         current ? { ...current, layout: nextLayout } : current,
@@ -1645,11 +1627,10 @@ function App() {
         y: currentScreen.y + delta.y,
       });
 
-      if (screenPositionOverlaps(layoutState, currentScreen.id, nextPosition)) {
-        return layoutState;
-      }
-
-      return moveScreen(layoutState, currentScreen.id, nextPosition);
+      return separateOverlappingScreens(
+        moveScreen(layoutState, currentScreen.id, nextPosition),
+        currentScreen.id,
+      );
     });
   }
 

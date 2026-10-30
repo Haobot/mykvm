@@ -8542,6 +8542,12 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
     let local_transport_port = layout.transport_port;
     let local_quic_port = layout.quic_port;
     let cluster_id = layout.cluster_id.clone();
+    let local_screens: Vec<Screen> = layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .map(|device| device.screens.clone())
+        .unwrap_or_default();
 
     // Pass 1a: resolve strong matches by index (ids may be retargeted below).
     let mut strong_matches: Vec<Option<usize>> = Vec::with_capacity(layout.devices.len());
@@ -8598,7 +8604,7 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
         if let Some(peer_index) = strong_matches[index] {
             claimed_peers[peer_index] = true;
             strong_matched[index] = true;
-            update_device_from_peer(device, &peers[peer_index]);
+            update_device_from_peer(device, &peers[peer_index], &local_screens);
         } else {
             device.online = false;
             device.input_ready = false;
@@ -8617,6 +8623,7 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
     log_unmatched_devices(layout, peers);
 
     refresh_paired_controller_addresses(layout, peers);
+    separate_layout_screen_overlaps(layout);
 }
 
 /// Second presence pass: restore `online`/`input_ready` for an offline device
@@ -8939,7 +8946,7 @@ fn sanitize_id(value: &str) -> String {
         .to_string()
 }
 
-fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
+fn update_device_from_peer(device: &mut Device, peer: &LanPeer, local_screens: &[Screen]) {
     device.online = true;
     device.input_ready = peer.input_ready;
     if device.source != "manual" {
@@ -8960,7 +8967,7 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
         device.name = peer.name.clone();
     }
     if !peer.screens.is_empty() {
-        device.screens = screens_from_peer(peer, &device.id, &device.screens);
+        device.screens = screens_from_peer(peer, &device.id, &device.screens, local_screens);
     }
     if peer.upgrading && !device.upgrading {
         device.upgrading_until_ms = now_ms() + 120_000;
@@ -8968,7 +8975,12 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.upgrading = peer.upgrading;
 }
 
-fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen]) -> Vec<Screen> {
+fn screens_from_peer(
+    peer: &LanPeer,
+    device_id: &str,
+    existing_screens: &[Screen],
+    local_screens: &[Screen],
+) -> Vec<Screen> {
     if peer.screens.is_empty() {
         return existing_screens.to_vec();
     }
@@ -9000,7 +9012,7 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
                 .find(|screen| screen.id == id)
                 .or_else(|| existing_screens.get(index).filter(|_| same_count));
 
-            Screen {
+            let screen = Screen {
                 id,
                 device_id: device_id.into(),
                 name: if peer_screen.name.trim().is_empty() {
@@ -9018,9 +9030,114 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
                 height: peer_screen.height,
                 scale: peer_screen.scale,
                 is_primary: peer_screen.is_primary,
+            };
+
+            // A freshly discovered screen defaults to the peer's own desktop
+            // origin, which lands exactly on top of this machine's primary
+            // screen. Nudge it clear so a new pairing never starts overlapping.
+            if existing_screen.is_none() {
+                separate_screen_from_overlaps(screen, local_screens)
+            } else {
+                screen
             }
         })
         .collect()
+}
+
+/// Nudges `screen` off every screen it overlaps, separating along the axis with
+/// the smaller overlap so the rectangles end up exactly touching. That shared
+/// edge is the geometry the crossing code needs to treat the boundary as
+/// crossable.
+fn separate_screen_from_overlaps(mut screen: Screen, others: &[Screen]) -> Screen {
+    for _ in 0..others.len() {
+        let mut target: Option<&Screen> = None;
+        let mut target_area = 0;
+        for other in others {
+            let area = screen_overlap_area(&screen, other);
+            if area > target_area {
+                target_area = area;
+                target = Some(other);
+            }
+        }
+
+        let Some(other) = target else {
+            break;
+        };
+        let (x, y) = separated_position(&screen, other);
+        screen.x = x;
+        screen.y = y;
+    }
+
+    screen
+}
+
+fn screen_overlap_area(a: &Screen, b: &Screen) -> i64 {
+    let width = (a.x + a.width).min(b.x + b.width) - a.x.max(b.x);
+    let height = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
+    if width > 0 && height > 0 {
+        i64::from(width) * i64::from(height)
+    } else {
+        0
+    }
+}
+
+fn separated_position(a: &Screen, b: &Screen) -> (i32, i32) {
+    let overlap_x = (a.x + a.width).min(b.x + b.width) - a.x.max(b.x);
+    let overlap_y = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
+    if overlap_x <= 0 || overlap_y <= 0 {
+        return (a.x, a.y);
+    }
+
+    let a_center_x = a.x + a.width / 2;
+    let a_center_y = a.y + a.height / 2;
+    let b_center_x = b.x + b.width / 2;
+    let b_center_y = b.y + b.height / 2;
+
+    if overlap_x <= overlap_y {
+        let x = if a_center_x <= b_center_x {
+            b.x - a.width
+        } else {
+            b.x + b.width
+        };
+        (x, a.y)
+    } else {
+        let y = if a_center_y <= b_center_y {
+            b.y - a.height
+        } else {
+            b.y + b.height
+        };
+        (a.x, y)
+    }
+}
+
+/// Normalizes an assembled layout so no two screens overlap. Only non-local
+/// screens move: the local machine's own arrangement is the reference the user
+/// cares about, and a peer screen that a stored layout left sitting on top of
+/// it would otherwise never become crossable.
+fn separate_layout_screen_overlaps(layout: &mut LayoutState) {
+    for device_index in 0..layout.devices.len() {
+        if layout.devices[device_index].role == "local" {
+            continue;
+        }
+
+        for screen_index in 0..layout.devices[device_index].screens.len() {
+            let moving = layout.devices[device_index].screens[screen_index].clone();
+            let mut others: Vec<Screen> = Vec::new();
+            for (other_device, device) in layout.devices.iter().enumerate() {
+                for (other_screen, screen) in device.screens.iter().enumerate() {
+                    if other_device == device_index && other_screen == screen_index {
+                        continue;
+                    }
+                    others.push(screen.clone());
+                }
+            }
+
+            let separated = separate_screen_from_overlaps(moving, &others);
+            let target = &mut layout.devices[device_index].screens[screen_index];
+            target.x = separated.x;
+            target.y = separated.y;
+        }
+    }
 }
 
 fn unique_peer_screen_id(device_id: &str, screen: &LanPeerScreen, index: usize) -> String {
@@ -13545,5 +13662,72 @@ mod tests {
         );
         // A non-numeric trailing segment stays part of a bare host.
         assert_eq!(split_host_port("myhost"), ("myhost".to_string(), None));
+    }
+
+    fn screen_at(id: &str, device_id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {
+        Screen {
+            id: id.into(),
+            device_id: device_id.into(),
+            name: id.into(),
+            x,
+            y,
+            width,
+            height,
+            scale: 1.0,
+            is_primary: false,
+        }
+    }
+
+    #[test]
+    fn separating_a_fully_covered_screen_lands_it_exactly_on_the_edge() {
+        let local = screen_at("local-display-1", "local-device", 0, 0, 1920, 1080);
+        let peer = screen_at("peer-display-1", "peer-device", 0, 0, 1920, 1080);
+
+        let separated = separate_screen_from_overlaps(peer, std::slice::from_ref(&local));
+
+        assert_eq!(separated.x, 0);
+        assert_eq!(separated.y, -1080);
+        assert_eq!(separated.y + separated.height, local.y);
+        assert_eq!(screen_overlap_area(&separated, &local), 0);
+    }
+
+    #[test]
+    fn separating_prefers_the_smaller_overlap_axis() {
+        let local = screen_at("local-display-1", "local-device", 0, 0, 1920, 1080);
+        let peer = screen_at("peer-display-1", "peer-device", 1800, 200, 1920, 1080);
+
+        let separated = separate_screen_from_overlaps(peer, std::slice::from_ref(&local));
+
+        assert_eq!(separated.x, local.x + local.width);
+        assert_eq!(separated.y, 200);
+        assert_eq!(screen_overlap_area(&separated, &local), 0);
+    }
+
+    #[test]
+    fn separating_settles_a_chain_of_overlaps() {
+        let first = screen_at("local-display-1", "local-device", 0, 0, 1000, 1000);
+        let second = screen_at("local-display-2", "local-device", 1000, 0, 1000, 1000);
+        let peer = screen_at("peer-display-1", "peer-device", 900, 900, 1000, 1000);
+
+        let separated = separate_screen_from_overlaps(peer, &[first.clone(), second.clone()]);
+
+        assert_eq!(separated.y, 1000);
+        assert_eq!(screen_overlap_area(&separated, &first), 0);
+        assert_eq!(screen_overlap_area(&separated, &second), 0);
+    }
+
+    #[test]
+    fn loading_a_layout_separates_a_peer_screen_saved_on_top_of_the_local_one() {
+        // test_layout 的两个屏幕都默认落在 (0,0,1920,1080)：这正是旧 layout.json
+        // 里“远端屏幕压在本机屏幕上”的状态，加载后必须自动纠正。
+        let mut layout = test_layout();
+
+        separate_layout_screen_overlaps(&mut layout);
+
+        let local = &layout.devices[0].screens[0];
+        let peer = &layout.devices[1].screens[0];
+        assert_eq!((local.x, local.y), (0, 0));
+        assert_eq!(screen_overlap_area(local, peer), 0);
+        assert_eq!(peer.y + peer.height, local.y);
     }
 }

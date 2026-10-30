@@ -26,76 +26,72 @@ export interface ScreenPosition {
   y: number
 }
 
-export function screenPositionOverlaps(
+/**
+ * Pushes a screen the minimum distance needed to stop overlapping any other
+ * screen. Separation runs along the axis with the smaller overlap, so the two
+ * rectangles end up exactly touching — exactly the edge geometry the Rust side
+ * needs to treat the boundary as crossable.
+ */
+export function separateOverlappingScreens(
   layout: LayoutState,
   screenId: string,
-  nextPosition: ScreenPosition,
-): boolean {
+): LayoutState {
   const movingScreen = getScreenById(layout, screenId)
   if (!movingScreen) {
-    return false
+    return layout
   }
 
-  const nextScreen = { ...movingScreen, ...nextPosition }
-  return flattenScreens(layout).some(
-    (screen) => screen.id !== screenId && screensOverlap(nextScreen, screen),
-  )
+  const others = flattenScreens(layout).filter((screen) => screen.id !== screenId)
+  let position: ScreenPosition = { x: movingScreen.x, y: movingScreen.y }
+
+  // Each pass separates from the largest overlapping screen; at most one pass
+  // per other screen is enough to settle a chain of overlaps.
+  for (let pass = 0; pass < others.length; pass += 1) {
+    let target: FlattenedScreen | null = null
+    let targetArea = 0
+    for (const screen of others) {
+      const area = screenOverlapArea({ ...movingScreen, ...position }, screen)
+      if (area > targetArea) {
+        target = screen
+        targetArea = area
+      }
+    }
+    if (!target) {
+      break
+    }
+
+    position = separateFromScreen({ ...movingScreen, ...position }, target)
+  }
+
+  return moveScreen(layout, screenId, position)
 }
 
-export function snapOverlappingScreenPosition(
-  layout: LayoutState,
-  screenId: string,
-  nextPosition: ScreenPosition,
-  startPosition: ScreenPosition,
-): ScreenPosition | null {
-  const movingScreen = getScreenById(layout, screenId)
-  if (!movingScreen) {
-    return null
+function separateFromScreen(moving: Screen, other: Screen): ScreenPosition {
+  const overlapX =
+    Math.min(moving.x + moving.width, other.x + other.width) - Math.max(moving.x, other.x)
+  const overlapY =
+    Math.min(moving.y + moving.height, other.y + other.height) - Math.max(moving.y, other.y)
+
+  if (overlapX <= 0 || overlapY <= 0) {
+    return { x: moving.x, y: moving.y }
   }
 
-  const nextScreen = { ...movingScreen, ...nextPosition }
-  let target: Screen | null = null
-  let targetOverlapArea = 0
-  for (const screen of flattenScreens(layout)) {
-    if (screen.id === screenId) {
-      continue
-    }
+  const movingCenterX = moving.x + moving.width / 2
+  const movingCenterY = moving.y + moving.height / 2
+  const otherCenterX = other.x + other.width / 2
+  const otherCenterY = other.y + other.height / 2
 
-    const area = screenOverlapArea(nextScreen, screen)
-    if (area > targetOverlapArea) {
-      target = screen
-      targetOverlapArea = area
+  if (overlapX <= overlapY) {
+    return {
+      x: movingCenterX <= otherCenterX ? other.x - moving.width : other.x + other.width,
+      y: moving.y,
     }
   }
 
-  if (!target) {
-    return null
+  return {
+    x: moving.x,
+    y: movingCenterY <= otherCenterY ? other.y - moving.height : other.y + other.height,
   }
-
-  const dx = nextPosition.x - startPosition.x
-  const dy = nextPosition.y - startPosition.y
-  const horizontal = Math.abs(dx) >= Math.abs(dy)
-  const movingCenterX = nextScreen.x + nextScreen.width / 2
-  const movingCenterY = nextScreen.y + nextScreen.height / 2
-  const targetCenterX = target.x + target.width / 2
-  const targetCenterY = target.y + target.height / 2
-  const snapped = horizontal
-    ? {
-        x:
-          movingCenterX < targetCenterX || (movingCenterX === targetCenterX && dx < 0)
-            ? target.x - movingScreen.width
-            : target.x + target.width,
-        y: nextPosition.y,
-      }
-    : {
-        x: nextPosition.x,
-        y:
-          movingCenterY < targetCenterY || (movingCenterY === targetCenterY && dy < 0)
-            ? target.y - movingScreen.height
-            : target.y + target.height,
-      }
-
-  return screenPositionOverlaps(layout, screenId, snapped) ? null : snapped
 }
 
 export function flattenScreens(layout: LayoutState): FlattenedScreen[] {
@@ -127,15 +123,6 @@ export function getLayoutBounds(screens: Screen[]): LayoutBounds {
     width: Math.max(maxX - minX, 1),
     height: Math.max(maxY - minY, 1),
   }
-}
-
-function screensOverlap(a: Screen, b: Screen) {
-  return (
-    a.x < b.x + b.width &&
-    a.x + a.width > b.x &&
-    a.y < b.y + b.height &&
-    a.y + a.height > b.y
-  )
 }
 
 function screenOverlapArea(a: Screen, b: Screen) {

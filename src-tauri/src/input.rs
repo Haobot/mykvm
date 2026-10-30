@@ -12383,4 +12383,17 @@ mod tests {
 
         assert!(targets.is_empty());
     }
+
+    #[test]
+    fn input_targets_treat_a_separated_screen_as_crossable() {
+        // 分离后的远端屏幕与本机恰好贴边（此处贴上边），必须能生成穿越目标。
+        let mut layout = layout_for_target_tests();
+        layout.devices[1].screens[0].x = 0;
+        layout.devices[1].screens[0].y = -1080;
+
+        let targets = build_input_targets(&layout, &layout);
+
+        assert_eq!(targets.len(), 1);
+        assert!(matches!(targets[0].edge, Edge::Top));
+    }
 }
