@@ -3141,11 +3141,36 @@ fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer
     if target_device_id == local_peer_id {
         return true;
     }
+    // 设备 id 由「主机名-LAN 地址」铸成（peer-{hostname}-{ip}），换 IP（重启/
+    // DHCP 续租/换网段）后本机自己推导出的 id 就变了，而配对控制器仍按配对时
+    // 存下的旧 id 寻址——逐包精确匹配会把整条输入流静默丢掉，表现为
+    // 「对端显示在线、发现正常、就是移不过去鼠标」。本检查之前的鉴权
+    //（cluster + pair secret + 钉扎的 transport key）已经完成，这里只是
+    // 多客户端间的路由消歧而非安全边界，所以放行任何由本机主机名铸成的 id，
+    // 不论它带着哪个时期的地址。
+    if let Some(prefix) = local_peer_host_prefix() {
+        if target_device_id.starts_with(prefix) {
+            return true;
+        }
+    }
 
     layout
         .devices
         .iter()
         .any(|device| device.role == "local" && device.id == target_device_id)
+}
+
+/// `peer-{hostname}-`：本机历代设备 id 共享的稳定前缀，尾段是会随网络变化的
+/// 地址。主机名进程内不变，缓存一次即可。
+fn local_peer_host_prefix() -> Option<&'static str> {
+    static PREFIX: OnceLock<Option<String>> = OnceLock::new();
+    PREFIX
+        .get_or_init(|| {
+            let host = crate::hostname()?;
+            let normalized = crate::sanitize_peer_id_part(&host);
+            (!normalized.is_empty()).then(|| format!("peer-{normalized}-"))
+        })
+        .as_deref()
 }
 
 fn decode_input_packet(payload: &[u8]) -> Option<InputPacket> {
@@ -10141,6 +10166,27 @@ mod tests {
         let active = crossing_target(&[top_neighbour_target()], 800.0, 0.0, 0.0, -3.0)
             .expect("an upward push at the top edge crosses");
         assert_eq!(active.target.edge, Edge::Top);
+    }
+
+    #[test]
+    fn stale_ip_derived_target_id_still_reaches_this_machine() {
+        // 回归：设备 id 由「主机名-LAN 地址」铸成，Mac 重启换 IP 后本机 id 变了，
+        // 配对控制器仍按配对时存下的旧 id（旧 IP 段）寻址，逐包精确匹配会把
+        // 整条输入流静默丢掉——「对端显示在线、发现正常、鼠标移不过去」。
+        let layout = layout_for_target_tests();
+        let host = crate::hostname().unwrap_or_else(|| "test-host".into());
+        let current = crate::local_peer_id(&host, "192.168.3.65");
+        let stale = crate::local_peer_id(&host, "192.168.3.42");
+
+        assert!(packet_targets_local(&layout, "", &current));
+        assert!(packet_targets_local(&layout, &current, &current));
+        // 旧 IP 段的同主机名 id 必须放行
+        assert!(packet_targets_local(&layout, &stale, &current));
+        // layout 里登记的本地设备 id 照旧放行
+        assert!(packet_targets_local(&layout, "local-device", &current));
+        // 其它主机名铸成的 id 不受影响
+        let other = crate::local_peer_id("some-other-host", "192.168.3.42");
+        assert!(!packet_targets_local(&layout, &other, &current));
     }
 
     #[test]

@@ -8800,8 +8800,19 @@ fn screen_to_peer_screen(screen: &Screen) -> LanPeerScreen {
 }
 
 fn local_peer_id(host: &str, ip: &str) -> String {
-    let seed = format!("{host}-{ip}");
-    let normalized = seed
+    let normalized = sanitize_peer_id_part(&format!("{host}-{ip}"));
+    if normalized.is_empty() {
+        "peer-local".into()
+    } else {
+        format!("peer-{normalized}")
+    }
+}
+
+/// peer-id 的归一化字母表：ASCII 字母数字转小写，其余一律映射为 `-`。
+/// `local_peer_id` 与接收端按主机名放行旧 id 的检查（input.rs 的
+/// `packet_targets_local`）共用它，避免两套归一化规则漂移。
+fn sanitize_peer_id_part(value: &str) -> String {
+    value
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
@@ -8812,13 +8823,7 @@ fn local_peer_id(host: &str, ip: &str) -> String {
         })
         .collect::<String>()
         .trim_matches('-')
-        .to_string();
-
-    if normalized.is_empty() {
-        "peer-local".into()
-    } else {
-        format!("peer-{normalized}")
-    }
+        .to_string()
 }
 
 fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, String> {
