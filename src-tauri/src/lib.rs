@@ -9878,19 +9878,33 @@ fn merge_peer_entry(peers: &mut Vec<LanPeer>, next_peer: LanPeer) {
 }
 
 fn active_peers(peers: &Arc<Mutex<Vec<LanPeer>>>, local_peer_id: &str) -> Vec<LanPeer> {
-    let now = now_ms();
     peers
         .lock()
         .map(|peers| {
-            peers
-                .iter()
-                .filter(|peer| {
-                    peer.id != local_peer_id && now.saturating_sub(peer.last_seen_ms) <= PEER_TTL_MS
-                })
-                .cloned()
-                .collect()
+            filter_active_peers(
+                peers.as_slice(),
+                local_peer_id,
+                now_ms(),
+                PRUNE_GRACE_UNTIL_MS.load(Ordering::Relaxed),
+            )
         })
         .unwrap_or_default()
+}
+
+/// Read-path TTL filter. Shares `peer_stale` with the prune path so a
+/// clock-jump grace window cannot tear devices (online via presence) away
+/// from the discovery peers list (empty via filter).
+fn filter_active_peers(
+    peers: &[LanPeer],
+    local_peer_id: &str,
+    now: u64,
+    grace_until: u64,
+) -> Vec<LanPeer> {
+    peers
+        .iter()
+        .filter(|peer| peer.id != local_peer_id && !peer_stale(now, peer.last_seen_ms, grace_until))
+        .cloned()
+        .collect()
 }
 
 fn peer_visible_to_layout(layout: &LayoutState, peer: &LanPeer) -> bool {
@@ -10268,24 +10282,45 @@ const CLOCK_JUMP_GUARD_MS: u64 = 300_000;
 
 static LAST_PRUNE_BASELINE_MS: AtomicU64 = AtomicU64::new(0);
 
+/// After a detected clock jump, peer expiry is suspended until this deadline.
+/// Skipping a single prune round is not enough: the *next* round (~0.5s later)
+/// no longer sees the jump and would delete every peer whose last_seen is
+/// still pre-sleep, flashing the whole fleet offline until the next announce
+/// (≤3s) merges it back. The grace window (≥ one announce period) covers that
+/// gap; peers that actually went silent still expire right after it.
+const CLOCK_JUMP_GRACE_MS: u64 = 5_000;
+
+static PRUNE_GRACE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
 fn prune_stale_peer_entries(peers: &mut Vec<LanPeer>, now: u64) {
     let mut baseline = LAST_PRUNE_BASELINE_MS.load(Ordering::Relaxed);
-    prune_stale_peer_entries_with_baseline(peers, now, &mut baseline);
+    let mut grace_until = PRUNE_GRACE_UNTIL_MS.load(Ordering::Relaxed);
+    prune_stale_peer_entries_with_baseline(peers, now, &mut baseline, &mut grace_until);
     LAST_PRUNE_BASELINE_MS.store(baseline, Ordering::Relaxed);
+    PRUNE_GRACE_UNTIL_MS.store(grace_until, Ordering::Relaxed);
 }
 
-fn prune_stale_peer_entries_with_baseline(peers: &mut Vec<LanPeer>, now: u64, baseline: &mut u64) {
+fn prune_stale_peer_entries_with_baseline(
+    peers: &mut Vec<LanPeer>,
+    now: u64,
+    baseline: &mut u64,
+    grace_until: &mut u64,
+) {
     if clock_jump_guard_skips_prune(*baseline, now) {
+        // Repeated jumps (or another jump inside the grace window) extend the
+        // deadline; the assignment is idempotent for same-moment jumps.
+        *grace_until = now + CLOCK_JUMP_GRACE_MS;
         log::warn!(
-            "discovery prune skipped after apparent clock jump now={} baseline_ms={}",
+            "discovery prune skipped after apparent clock jump now={} baseline_ms={} grace_until_ms={}",
             now,
-            baseline
+            baseline,
+            grace_until
         );
         *baseline = now;
         return;
     }
     *baseline = now;
-    prune_stale_peer_entries_at(peers, now);
+    prune_stale_peer_entries_at(peers, now, *grace_until);
 }
 
 /// True when the clock appears to have jumped forward past the guard between
@@ -10294,10 +10329,25 @@ fn clock_jump_guard_skips_prune(baseline: u64, now: u64) -> bool {
     baseline != 0 && now.saturating_sub(baseline) > CLOCK_JUMP_GUARD_MS
 }
 
-fn prune_stale_peer_entries_at(peers: &mut Vec<LanPeer>, now: u64) {
+/// The single stale predicate every TTL-based expiry check must use. A peer is
+/// stale only when it outlived the TTL *and* no clock-jump grace window is
+/// active — keeping prune and the read-path filter in lockstep prevents the
+/// "devices online but peers list empty" tear during the grace window.
+fn peer_stale(now: u64, peer_last_seen: u64, grace_until: u64) -> bool {
+    now.saturating_sub(peer_last_seen) > PEER_TTL_MS && now >= grace_until
+}
+
+fn prune_stale_peer_entries_at(peers: &mut Vec<LanPeer>, now: u64, grace_until: u64) {
+    let expired = peers
+        .iter()
+        .filter(|peer| peer_stale(now, peer.last_seen_ms, grace_until))
+        .count();
+    if expired == 0 {
+        return;
+    }
     for peer in peers
         .iter()
-        .filter(|peer| now.saturating_sub(peer.last_seen_ms) > PEER_TTL_MS)
+        .filter(|peer| peer_stale(now, peer.last_seen_ms, grace_until))
     {
         log::info!(
             "discovery peer stale id={} name={} ip={} last_seen_age_ms={} ttl_ms={}",
@@ -10308,7 +10358,11 @@ fn prune_stale_peer_entries_at(peers: &mut Vec<LanPeer>, now: u64) {
             PEER_TTL_MS
         );
     }
-    peers.retain(|peer| now.saturating_sub(peer.last_seen_ms) <= PEER_TTL_MS);
+    peers.retain(|peer| !peer_stale(now, peer.last_seen_ms, grace_until));
+    // A batch expiry right after a grace window means the fleet-wide gap was
+    // the clock jump itself, not real disconnects; one summary line makes the
+    // wake-up sequence grep-able in logs.
+    log::info!("discovery prune expired {expired} peers after grace");
 }
 
 /// TTL keep-alive: a peer whose last heartbeat is halfway to the TTL but has
@@ -12137,10 +12191,16 @@ mod tests {
         let mut entries = vec![test_peer()];
         entries[0].last_seen_ms = 0; // 远超 TTL,正常情况必删
         let mut baseline = 0u64;
+        let mut grace_until = 0u64;
 
         // 首轮建立基准(时钟稳定,过期 peer 正常删除)。
         entries[0].last_seen_ms = 1_000_000 - PEER_TTL_MS - 1;
-        prune_stale_peer_entries_with_baseline(&mut entries, 1_000_000, &mut baseline);
+        prune_stale_peer_entries_with_baseline(
+            &mut entries,
+            1_000_000,
+            &mut baseline,
+            &mut grace_until,
+        );
         assert!(entries.is_empty(), "stable clock must prune expired peers");
 
         // 前跳 5 分钟以上 → 跳过本轮删除(即使 peer 已过期)。
@@ -12148,18 +12208,149 @@ mod tests {
         entries[0].last_seen_ms = 0;
         let jumped = baseline + CLOCK_JUMP_GUARD_MS + 1;
         assert!(clock_jump_guard_skips_prune(baseline, jumped));
-        prune_stale_peer_entries_with_baseline(&mut entries, jumped, &mut baseline);
+        prune_stale_peer_entries_with_baseline(
+            &mut entries,
+            jumped,
+            &mut baseline,
+            &mut grace_until,
+        );
         assert_eq!(entries.len(), 1, "clock jump round must not delete peers");
 
-        // 时钟恢复稳定 → 照常删除过期 peer。
+        // 宽限期内即使时钟恢复稳定也不删(消除「第二轮整批删除」闪断)。
         let stable = jumped + 1_000;
         assert!(!clock_jump_guard_skips_prune(jumped, stable));
-        entries[0].last_seen_ms = stable - PEER_TTL_MS - 1;
-        prune_stale_peer_entries_with_baseline(&mut entries, stable, &mut baseline);
+        prune_stale_peer_entries_with_baseline(
+            &mut entries,
+            stable,
+            &mut baseline,
+            &mut grace_until,
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "grace window must keep peers alive across stable rounds"
+        );
+
+        // 宽限期结束 → 照常删除未续命的过期 peer。
+        let after_grace = jumped + CLOCK_JUMP_GRACE_MS + 1_000;
+        prune_stale_peer_entries_with_baseline(
+            &mut entries,
+            after_grace,
+            &mut baseline,
+            &mut grace_until,
+        );
         assert!(
             entries.is_empty(),
-            "recovered clock must prune expired peers"
+            "recovered clock must prune expired peers after grace"
         );
+    }
+
+    /// 行为验收 §4.1:跳变后连续多轮 prune(peers 不被批量删除),
+    /// 宽限期结束后的 prune 才淘汰未续命者。
+    #[test]
+    fn prune_grace_keeps_peers_through_announce_window() {
+        let now = 10_000_000u64;
+        let mut entries: Vec<LanPeer> = (0..3).map(|_| test_peer()).collect();
+        for peer in &mut entries {
+            peer.last_seen_ms = now - PEER_TTL_MS - 1; // 睡前已全部过期
+        }
+        let mut baseline = now - (CLOCK_JUMP_GUARD_MS + 1);
+        let mut grace_until = 0u64;
+
+        // 跳变轮:检出前跳,进入宽限期。
+        prune_stale_peer_entries_with_baseline(&mut entries, now, &mut baseline, &mut grace_until);
+        assert_eq!(entries.len(), 3, "jump round itself must not delete");
+        assert_eq!(grace_until, now + CLOCK_JUMP_GRACE_MS);
+
+        // 宽限期内按发现线程的节奏(每 ~0.5s)连续 prune:数量不减少。
+        for step in 1..=8u64 {
+            let tick = now + step * 500;
+            prune_stale_peer_entries_with_baseline(
+                &mut entries,
+                tick,
+                &mut baseline,
+                &mut grace_until,
+            );
+            assert_eq!(entries.len(), 3, "grace round {step} must not delete peers");
+        }
+
+        // 宽限期结束:未续命的过期 peer 才被淘汰。
+        let after = now + CLOCK_JUMP_GRACE_MS + 1;
+        prune_stale_peer_entries_with_baseline(
+            &mut entries,
+            after,
+            &mut baseline,
+            &mut grace_until,
+        );
+        assert!(
+            entries.is_empty(),
+            "peers must expire after the grace window closes"
+        );
+    }
+
+    /// 行为验收 §4.2:宽限期内读路径过滤(设备在线与 peers 计数)不撕裂。
+    #[test]
+    fn grace_survives_read_path_filtering() {
+        let now = 10_000_000u64;
+        let mut peer = test_peer();
+        peer.last_seen_ms = now - PEER_TTL_MS - 1;
+        let peers = vec![peer];
+
+        // 无宽限期:过期 peer 被读路径过滤掉(正常语义保留)。
+        assert!(filter_active_peers(&peers, "local-device", now, 0).is_empty());
+
+        // 跳变宽限期内:读路径与 prune 同谓词,peer 仍可见。
+        let grace_until = now + CLOCK_JUMP_GRACE_MS;
+        assert_eq!(
+            filter_active_peers(&peers, "local-device", now, grace_until).len(),
+            1
+        );
+        assert!(!peer_stale(now, peers[0].last_seen_ms, grace_until));
+
+        // 宽限期结束:读路径恢复正常过滤。
+        let after = now + CLOCK_JUMP_GRACE_MS + 1;
+        assert!(filter_active_peers(&peers, "local-device", after, grace_until).is_empty());
+    }
+
+    /// 行为验收 §4.3:宽限期内 announce 刷新 last_seen → 宽限期结束后
+    /// peer 依旧存活并回归正常 TTL 语义。
+    #[test]
+    fn grace_refreshed_by_announce_reuses_normal_ttl() {
+        let now = 10_000_000u64;
+        let mut entries = vec![test_peer()];
+        entries[0].last_seen_ms = now - PEER_TTL_MS - 1;
+        let mut baseline = now - (CLOCK_JUMP_GUARD_MS + 1);
+        let mut grace_until = 0u64;
+
+        prune_stale_peer_entries_with_baseline(&mut entries, now, &mut baseline, &mut grace_until);
+
+        // 宽限期内 announce 到达(不伪造 last_seen,只照常刷新)。
+        let announce_at = now + 2_000;
+        entries[0].last_seen_ms = announce_at;
+
+        // 宽限期结束后:被续命的 peer 存活。
+        let after = now + CLOCK_JUMP_GRACE_MS + 1;
+        prune_stale_peer_entries_with_baseline(
+            &mut entries,
+            after,
+            &mut baseline,
+            &mut grace_until,
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "announce-refreshed peer must survive grace"
+        );
+
+        // 之后走正常 TTL:announce 后再过一整个 TTL 才淘汰。
+        let beyond = announce_at + PEER_TTL_MS + 1;
+        prune_stale_peer_entries_with_baseline(
+            &mut entries,
+            beyond,
+            &mut baseline,
+            &mut grace_until,
+        );
+        assert!(entries.is_empty(), "normal TTL applies after grace");
     }
 
     /// P1-2:临近 TTL(45s~90s)的 peer 进入 probe 名单;限频 10s/peer、
