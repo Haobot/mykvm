@@ -89,6 +89,8 @@ export interface DiagnosticInfo {
   discoveryPort: number
   quicPort: number
   peerCount: number
+  /** 发现里可见、但强弱匹配都无法归到任何已保存设备的数量（P1-1）。 */
+  unmatchedDevices?: number
   logDir: string
   configDir: string
   networkHint: string

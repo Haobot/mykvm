@@ -6,10 +6,15 @@ import {
   fallbackScreen,
   findPeerDevice,
   findRepairDeviceForPeer,
+  identityDriftFingerprint,
+  listIdentityDrifts,
   normalizePlatform,
+  peerKey,
   repairHostCandidates,
+  uniqueWeakMatches,
   upsertPeerDevice,
 } from "./pairingRepair";
+import type { IdentityDrift } from "./pairingRepair";
 import {
   type CSSProperties,
   type Dispatch,
@@ -104,9 +109,13 @@ import type {
 } from "./types";
 import {
   blockingRuntimeDetail,
+  createIdentityDriftTracker,
   createRuntimeBlockerTracker,
+  dismissIdentityDrift,
   dismissRuntimeBlocker,
+  trackIdentityDrift,
   trackRuntimeBlocker,
+  type IdentityDriftTracker,
   type RuntimeBlockerTracker,
 } from "./runtimeBlocker";
 
@@ -125,6 +134,47 @@ function applyRuntimeBlockerDetail(
   if (update.clear !== null) {
     const cleared = update.clear;
     setErrorMessage((current) => (current === cleared ? null : current));
+  }
+}
+
+/// 证书漂移弹窗要展示的设备与实时对端。
+interface IdentityDriftDialog {
+  device: Device;
+  peer: LanPeer;
+}
+
+/// Applies one identity-drift poll to the dialog (P0-3). Same discipline as
+/// the runtime blocker above: the window polls every two seconds, so one
+/// (device, peer transport key) occurrence opens the dialog at most once,
+/// 「later」 keeps it quiet until the drift changes, and the dialog closes by
+/// itself once the drift clears (re-paired successfully or peer offline).
+/// Several simultaneous drifts never stack: only the first one is shown.
+function applyIdentityDriftPoll(
+  trackerRef: { current: IdentityDriftTracker },
+  drifts: IdentityDrift[],
+  setDialog: Dispatch<SetStateAction<IdentityDriftDialog | null>>,
+): void {
+  const update = trackIdentityDrift(
+    trackerRef.current,
+    drifts.map((drift) => ({
+      deviceId: drift.device.id,
+      fingerprint: identityDriftFingerprint(drift.peer),
+    })),
+  );
+  trackerRef.current = update.tracker;
+
+  const shown = update.show;
+  if (shown !== null) {
+    const match = drifts.find(
+      (drift) =>
+        drift.device.id === shown.deviceId &&
+        identityDriftFingerprint(drift.peer) === shown.fingerprint,
+    );
+    setDialog(match ? { device: match.device, peer: match.peer } : null);
+  } else if (update.clear) {
+    // 只有不再展示新漂移时才收起：同轮里「旧漂移解除 + 新漂移出现」要直接
+    // 换成新弹窗，不能被清空。
+    setDialog(null);
   }
 }
 
@@ -282,6 +332,8 @@ function App() {
   const [isPortable, setIsPortable] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [identityDriftDialog, setIdentityDriftDialog] =
+    useState<IdentityDriftDialog | null>(null);
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
   const [capturingDirection, setCapturingDirection] = useState<
@@ -294,6 +346,9 @@ function App() {
   const boardRef = useRef<HTMLDivElement | null>(null);
   const runtimeBlockerRef = useRef<RuntimeBlockerTracker>(
     createRuntimeBlockerTracker(),
+  );
+  const identityDriftRef = useRef<IdentityDriftTracker>(
+    createIdentityDriftTracker(),
   );
   const edgeSwitchHotkeyButtonRef = useRef<HTMLButtonElement | null>(null);
   const screenSwitchButtonRefs = useRef<
@@ -698,6 +753,20 @@ function App() {
               : null,
             setErrorMessage,
           );
+
+          // P0-3：证书轮换/空 key 身份漂移自动弹窗，与上面的 runtime blocker
+          // 共用「同因只弹一次、解除自动关」的轮询纪律；只有控制端（server）
+          // 才有设备列表需要修复。
+          applyIdentityDriftPoll(
+            identityDriftRef,
+            nextSnapshot.layout.machineRole === "server"
+              ? listIdentityDrifts(
+                  nextSnapshot.layout,
+                  nextRuntime.discovery.peers,
+                )
+              : [],
+            setIdentityDriftDialog,
+          );
         })
         .catch(() => {
           // Keep the current UI state if a transient refresh fails.
@@ -740,6 +809,11 @@ function App() {
   const appVersion = discovery?.localPeer.appVersion || APP_VERSION;
   const displayLayout = useMemo(
     () => (layout ? applyPeerPresence(layout, discovery?.peers ?? []) : null),
+    [layout, discovery],
+  );
+  // P0-3：证书漂移清单（设备行徽标与自动弹窗共用同一判定）。
+  const identityDrifts = useMemo(
+    () => (layout ? listIdentityDrifts(layout, discovery?.peers ?? []) : []),
     [layout, discovery],
   );
   const screens = useMemo(
@@ -2210,6 +2284,65 @@ function App() {
     );
   }
 
+  // 证书漂移弹窗的两个动作：「稍后处理」把本次 (设备, 对端公钥) 漂移记为
+  // 不再自动弹（设备行徽标仍显示）；「一键修复」同样先收起弹窗，然后走既有
+  // 配对码修复流程。修复成功后漂移消失，下一次轮询会复位 tracker，同设备的
+  // 新漂移（指纹变化）仍然可以再弹。
+  function dismissIdentityDriftDialog() {
+    identityDriftRef.current = dismissIdentityDrift(identityDriftRef.current);
+    setIdentityDriftDialog(null);
+  }
+
+  function handleRepairIdentityDrift() {
+    const dialog = identityDriftDialog;
+    if (!dialog) {
+      return;
+    }
+    dismissIdentityDriftDialog();
+    void handleRepairPeerDevice(dialog.peer, dialog.device);
+  }
+
+  function renderIdentityDriftDialog(dialog: IdentityDriftDialog) {
+    return (
+      <div className="pairing-modal-backdrop" role="presentation">
+        <section className="pairing-modal" role="alertdialog" aria-modal="true">
+          <div>
+            <p className="eyebrow">{ui.devices.pairingEyebrow}</p>
+            <h2>{ui.devices.certificateChangedTitle}</h2>
+            <p>
+              <strong>{dialog.device.name}</strong> ·{" "}
+              {dialog.peer.ip || dialog.peer.host}
+            </p>
+            <p>
+              {dialog.device.transportPublicKey.trim()
+                ? ui.devices.certificateChangedReasonRotated
+                : ui.devices.certificateChangedReasonMissingKey}
+            </p>
+            <p>{ui.devices.certificateChangedImpact}</p>
+          </div>
+          <div className="pairing-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={dismissIdentityDriftDialog}
+              disabled={isPairingDevice}
+            >
+              {ui.devices.repairLater}
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={handleRepairIdentityDrift}
+              disabled={isPairingDevice || dialog.peer.screens.length === 0}
+            >
+              {isPairingDevice ? ui.common.connecting : ui.devices.repairNow}
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   function renderInfoBanner(message: string) {
     return (
       <div className="info-banner" role="status">
@@ -2528,6 +2661,7 @@ function App() {
       </header>
 
       {errorMessage ? renderErrorDialog(errorMessage) : null}
+      {identityDriftDialog ? renderIdentityDriftDialog(identityDriftDialog) : null}
       {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
       {renderFileTransferToasts()}
       {shownInputServiceAction
@@ -2703,6 +2837,13 @@ function App() {
                   const staleDevice = addedDevice
                     ? undefined
                     : findRepairDeviceForPeer(layout, lanPeers, peer);
+                  // P0-3：证书漂移设备（弱匹配命中、key 不一致/为空）显示
+                  // 「证书已变化」徽标，修复与自动弹窗共用 handleRepairPeerDevice
+                  // 的配对码流程（绝不自动换证）。
+                  const driftDevice = addedDevice
+                    ? undefined
+                    : identityDrifts.find((drift) => drift.peer === peer)
+                        ?.device;
                   const screenCount =
                     peer.screens.length || addedDevice?.screens.length || 0;
                   // A client older than this controller can be updated from here.
@@ -2745,6 +2886,11 @@ function App() {
                                   {ui.settings.clientUpdateAvailable}
                                 </span>
                               ) : null}
+                              {driftDevice ? (
+                                <span className="tag-pill tag-pill-warning">
+                                  {ui.devices.certificateChanged}
+                                </span>
+                              ) : null}
                             </div>
                           </div>
                           <p className="connection-meta">
@@ -2773,19 +2919,23 @@ function App() {
                             type="button"
                             className="secondary-button compact-button"
                             onClick={() =>
-                              staleDevice
-                                ? void handleRepairPeerDevice(peer, staleDevice)
-                                : handleAddPeer(peer)
+                              driftDevice
+                                ? void handleRepairPeerDevice(peer, driftDevice)
+                                : staleDevice
+                                  ? void handleRepairPeerDevice(peer, staleDevice)
+                                  : handleAddPeer(peer)
                             }
                             disabled={peer.screens.length === 0 || isPairingDevice}
                           >
                             {peer.screens.length === 0
                               ? ui.devices.noScreens
-                              : staleDevice
-                                ? ui.devices.repair
-                                : peer.pairingRequired
-                                  ? ui.devices.pair
-                                  : ui.common.add}
+                              : driftDevice
+                                ? ui.devices.repairNow
+                                : staleDevice
+                                  ? ui.devices.repair
+                                  : peer.pairingRequired
+                                    ? ui.devices.pair
+                                    : ui.common.add}
                           </button>
                         )}
                       </div>
@@ -3943,6 +4093,33 @@ function screenStatusLabel(
 }
 
 function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
+  // 第一遍：强匹配（防冒充，判断逻辑与既有一致），并记录认领，供第二遍
+  // 弱匹配防抢占——已被强匹配认领的设备与 peer 都不再参与弱匹配。
+  const strongPeerByDeviceId = new Map<string, LanPeer>();
+  const claimedDeviceIds = new Set<string>();
+  const claimedPeerIds = new Set<string>();
+  for (const device of layout.devices) {
+    if (device.role === "local") {
+      continue;
+    }
+    const peer = peers.find((candidate) =>
+      deviceMatchesPeer(layout, device, candidate),
+    );
+    if (peer) {
+      strongPeerByDeviceId.set(device.id, peer);
+      claimedDeviceIds.add(device.id);
+      claimedPeerIds.add(peerKey(peer));
+    }
+  }
+  // 第二遍：弱匹配只恢复 online/inputReady 显示，绝不改写 key/host/ports/id
+  // （P0-2a 安全边界：证书更新只能走配对码流程）。
+  const weakPeerByDeviceId = uniqueWeakMatches(
+    layout,
+    peers,
+    claimedDeviceIds,
+    claimedPeerIds,
+  );
+
   const nextLayout = {
     ...layout,
     devices: layout.devices.map((device) => {
@@ -3957,14 +4134,21 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
         };
       }
 
-      const peer = peers.find((candidate) =>
-        deviceMatchesPeer(layout, device, candidate),
-      );
+      const peer = strongPeerByDeviceId.get(device.id);
       if (!peer) {
+        const weakPeer = weakPeerByDeviceId.get(device.id);
+        if (!weakPeer) {
+          return {
+            ...device,
+            online: false,
+            inputReady: false,
+          };
+        }
+
         return {
           ...device,
-          online: false,
-          inputReady: false,
+          online: true,
+          inputReady: weakPeer.inputReady,
         };
       }
 

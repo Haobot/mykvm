@@ -199,6 +199,16 @@ export const TEXT = {
       scanningCopy: "正在搜索同网络下的 MyKVM 设备…",
       pair: "配对",
       repair: "重新配对",
+      certificateChanged: "证书已变化",
+      certificateChangedTitle: "设备证书已变化",
+      certificateChangedReasonRotated:
+        "原因：对端设备的传输证书已更换（通常是重装或清除了配置）。",
+      certificateChangedReasonMissingKey:
+        "原因：本机尚未记录该设备的传输证书。",
+      certificateChangedImpact:
+        "影响：证书不一致时输入会被对端拒绝，设备会一直离线。请在对端屏幕显示验证码时完成一键修复。",
+      repairNow: "一键修复",
+      repairLater: "稍后处理",
       pointerSpeed: "指针速度",
       scrollSpeed: "滚轮速度",
       fileTransferSent: "已发送",
@@ -449,6 +459,16 @@ export const TEXT = {
       scanningCopy: "Searching for MyKVM devices on this network…",
       pair: "Pair",
       repair: "Re-pair",
+      certificateChanged: "Certificate changed",
+      certificateChangedTitle: "Device Certificate Changed",
+      certificateChangedReasonRotated:
+        "Reason: the peer's transport certificate was replaced (usually a reinstall or wiped config).",
+      certificateChangedReasonMissingKey:
+        "Reason: this machine has no transport certificate stored for this device.",
+      certificateChangedImpact:
+        "Impact: while the certificates differ, input from this machine is rejected and the device stays offline. Re-pair with the code shown on the peer's screen.",
+      repairNow: "Repair Now",
+      repairLater: "Later",
       pointerSpeed: "Pointer speed",
       scrollSpeed: "Scroll speed",
       fileTransferSent: "Sent",

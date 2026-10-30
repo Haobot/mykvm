@@ -58,6 +58,169 @@ export function findPeerDevice(
   );
 }
 
+/// Stable identity of a live peer inside one presence pass.
+export function peerKey(peer: LanPeer): string {
+  return peer.id.trim() || peerDeviceId(peer);
+}
+
+/// Pass-level claims for the weak match (P0-2a): strong matches always win,
+/// the weak pass may only look at what they left behind.
+export interface WeakMatchPass {
+  /// Devices participating in this pass (local devices never weak-match).
+  devices?: Device[];
+  /// Peers participating in this pass.
+  peers?: LanPeer[];
+  /// Devices already claimed by strong matches (or earlier weak matches).
+  claimedDeviceIds?: ReadonlySet<string>;
+  /// Peers already claimed (keyed by peerKey).
+  claimedPeerIds?: ReadonlySet<string>;
+}
+
+/// 弱匹配的「信号」条件（大小写不敏感、trim）：名称相同，或设备 host 按 "/"
+/// 拆段后任一段等于对端自报 host。与 Rust weak_device_match 同语义。
+function weakSignalMatches(device: Device, peer: LanPeer): boolean {
+  return (
+    textEquals(device.name, peer.name) || hostSegmentEqualsPeerHost(device.host, peer.host)
+  );
+}
+
+function hostSegmentEqualsPeerHost(deviceHost: string, peerHost: string): boolean {
+  const target = peerHost.trim().toLowerCase();
+  if (!target) {
+    return false;
+  }
+  return deviceHost
+    .split("/")
+    .some((part) => part.trim().toLowerCase() === target);
+}
+
+/// 弱匹配核心条件：同 cluster（非空）且对端不处于待配对状态，加上信号匹配。
+function weakCoreMatch(
+  layout: LayoutState,
+  device: Device,
+  peer: LanPeer,
+): boolean {
+  return (
+    layout.clusterId.trim().length > 0 &&
+    !peer.pairingRequired &&
+    peer.clusterId === layout.clusterId &&
+    weakSignalMatches(device, peer)
+  );
+}
+
+/**
+ * 弱匹配（P0-2a，与 Rust weak_device_match 同语义）：仅用于恢复
+ * online/inputReady 显示，绝不改写 key/host/ports/id（安全边界）。
+ * 生效条件全部满足：
+ * (a) 同 cluster 且非空、对端非 pairingRequired；
+ * (b) 信号匹配（名称，或设备 host 段等于对端 host）；
+ * (c) 双向唯一：设备与 peer 在本次 presence pass 内都未被强匹配认领，
+ *     且两侧都不存在第二个弱候选。
+ * pass 省略时以 layout.devices × [peer] 为本次 pass、无已认领集合。
+ */
+export function weakMatchesPeer(
+  layout: LayoutState,
+  device: Device,
+  peer: LanPeer,
+  pass?: WeakMatchPass,
+): boolean {
+  if (device.role === "local") {
+    return false;
+  }
+  if (pass?.claimedDeviceIds?.has(device.id)) {
+    return false;
+  }
+  if (pass?.claimedPeerIds?.has(peerKey(peer))) {
+    return false;
+  }
+
+  const devices = (pass?.devices ?? layout.devices).filter(
+    (candidate) =>
+      candidate.role !== "local" &&
+      !pass?.claimedDeviceIds?.has(candidate.id),
+  );
+  const peers = (pass?.peers ?? [peer]).filter(
+    (candidate) => !pass?.claimedPeerIds?.has(peerKey(candidate)),
+  );
+  if (!devices.some((candidate) => candidate.id === device.id)) {
+    return false;
+  }
+  if (!peers.some((candidate) => peerKey(candidate) === peerKey(peer))) {
+    return false;
+  }
+  if (!weakCoreMatch(layout, device, peer)) {
+    return false;
+  }
+  // 强匹配优先：任一强匹配命中都让弱匹配让路（防抢占）。
+  if (peers.some((candidate) => deviceMatchesPeer(layout, device, candidate))) {
+    return false;
+  }
+  if (devices.some((candidate) => deviceMatchesPeer(layout, candidate, peer))) {
+    return false;
+  }
+
+  // 双向唯一：设备侧与 peer 侧都必须是唯一弱候选。
+  const deviceSide = devices.filter((candidate) =>
+    weakCoreMatch(layout, candidate, peer),
+  );
+  if (deviceSide.length !== 1 || deviceSide[0].id !== device.id) {
+    return false;
+  }
+  const peerSide = peers.filter((candidate) =>
+    weakCoreMatch(layout, device, candidate),
+  );
+  return peerSide.length === 1 && peerKey(peerSide[0]) === peerKey(peer);
+}
+
+/**
+ * 第二遍弱匹配：对「剩余未认领设备 × 未认领 peer」做双向唯一匹配。
+ * 返回 device.id -> 唯一弱命中 peer；仅更新 online/inputReady 用。
+ */
+export function uniqueWeakMatches(
+  layout: LayoutState,
+  peers: LanPeer[],
+  claimedDeviceIds: ReadonlySet<string>,
+  claimedPeerIds: ReadonlySet<string>,
+): Map<string, LanPeer> {
+  const result = new Map<string, LanPeer>();
+  const devices = layout.devices.filter(
+    (device) => device.role !== "local" && !claimedDeviceIds.has(device.id),
+  );
+  const freePeers = peers.filter((peer) => !claimedPeerIds.has(peerKey(peer)));
+  if (devices.length === 0 || freePeers.length === 0) {
+    return result;
+  }
+
+  const peerCandidates = new Map<string, Device[]>();
+  const deviceCandidates = new Map<string, LanPeer[]>();
+  for (const device of devices) {
+    for (const peer of freePeers) {
+      if (!weakCoreMatch(layout, device, peer)) {
+        continue;
+      }
+      const forDevice = deviceCandidates.get(device.id) ?? [];
+      forDevice.push(peer);
+      deviceCandidates.set(device.id, forDevice);
+      const forPeer = peerCandidates.get(peerKey(peer)) ?? [];
+      forPeer.push(device);
+      peerCandidates.set(peerKey(peer), forPeer);
+    }
+  }
+
+  for (const device of devices) {
+    const candidates = deviceCandidates.get(device.id) ?? [];
+    if (candidates.length !== 1) {
+      continue;
+    }
+    const peer = candidates[0];
+    if ((peerCandidates.get(peerKey(peer)) ?? []).length !== 1) {
+      continue;
+    }
+    result.set(device.id, peer);
+  }
+  return result;
+}
+
 /**
  * 找出与某台已保存设备对应的实时对端，按匹配强度从高到低：
  * 1. 传输公钥相等（证书仍是同一份，只是地址变了）；
@@ -159,6 +322,101 @@ export function findRepairDeviceForPeer(
   );
 }
 
+/// 证书轮换自动弹窗（P0-3）的判定结果：设备与实时对端身份（传输公钥）漂移。
+export type IdentityDriftReason = "rotated" | "missingKey"
+
+export interface IdentityDrift {
+  device: Device
+  peer: LanPeer
+  reason: IdentityDriftReason
+}
+
+/// 漂移指纹：同一 (device.id, peer 传输公钥) 组合视为同一次漂移（同因只弹一次）。
+export function identityDriftFingerprint(peer: LanPeer): string {
+  return peer.transportPublicKey.trim()
+}
+
+function identityDriftReason(
+  device: Device,
+  peer: LanPeer,
+): IdentityDriftReason | null {
+  const deviceKey = device.transportPublicKey.trim()
+  if (!deviceKey) {
+    // 设备从未记录证书而对端有证书：输入同样会被拒，需要走配对码补录。
+    return peer.transportPublicKey.trim() ? "missingKey" : null
+  }
+  return deviceKey === peer.transportPublicKey ? null : "rotated"
+}
+
+/**
+ * 找出所有「设备身份已漂移」的 (device, peer)（P0-3 判定函数）：
+ * - 第一遍强匹配认领（含空 key 设备按 id/host 命中——key 为空即漂移
+ *   missingKey）；
+ * - 第二遍对剩余设备做唯一弱匹配，再不行用 findLivePeerForDevice 兜底，
+ *   但都不抢第一遍已认领的设备与 peer（安全边界：不触碰信任）。
+ */
+export function listIdentityDrifts(
+  layout: LayoutState,
+  peers: LanPeer[],
+): IdentityDrift[] {
+  const drifts: IdentityDrift[] = []
+  const claimedDeviceIds = new Set<string>()
+  const claimedPeerIds = new Set<string>()
+
+  for (const peer of peers) {
+    for (const device of layout.devices) {
+      if (device.role === "local" || claimedDeviceIds.has(device.id)) {
+        continue
+      }
+      if (!deviceMatchesPeer(layout, device, peer)) {
+        continue
+      }
+      claimedDeviceIds.add(device.id)
+      claimedPeerIds.add(peerKey(peer))
+      const reason = identityDriftReason(device, peer)
+      if (reason) {
+        drifts.push({ device, peer, reason })
+      }
+    }
+  }
+
+  const weak = uniqueWeakMatches(
+    layout,
+    peers,
+    claimedDeviceIds,
+    claimedPeerIds,
+  )
+  for (const device of layout.devices) {
+    if (device.role === "local" || claimedDeviceIds.has(device.id)) {
+      continue
+    }
+    const freePeers = peers.filter(
+      (peer) => !claimedPeerIds.has(peerKey(peer)),
+    )
+    const peer =
+      weak.get(device.id) ??
+      (freePeers.length > 0
+        ? findLivePeerForDevice(layout, device, freePeers)
+        : undefined)
+    if (!peer) {
+      continue
+    }
+    const reason = identityDriftReason(device, peer)
+    if (reason) {
+      drifts.push({ device, peer, reason })
+    }
+  }
+  return drifts
+}
+
+/// 自动弹窗用：第一条身份漂移（多台同时漂移不堆叠，只显示第一条）。
+export function findIdentityDriftPeer(
+  layout: LayoutState,
+  peers: LanPeer[],
+): IdentityDrift | undefined {
+  return listIdentityDrifts(layout, peers)[0]
+}
+
 /**
  * 把实时对端写入布局。命中 preferredDeviceId（重新配对）时原位更新该设备，
  * 保留 id、颜色、指针/滚轮速度与屏幕摆放位置；否则沿用原有的按公钥/id 匹配。
@@ -219,7 +477,21 @@ function createDeviceFromPeer(
   manual = false,
   repair = false,
 ): Device {
-  const id = existingDevice?.id ?? peerDeviceId(peer);
+  // P0-2b.4：非 manual 设备的 id 自动跟随对端（与后端 peer_device_id 同规则），
+  // 彻底关闭「换 IP 后 id/host 双失配、设备永久离线」；manual 设备保留既有 id，
+  // 用户引用稳定。冲突防护：新 id 已被另一台设备占用时保留旧 id，绝不合并两台设备。
+  const followedId = peerDeviceId(peer);
+  const manualDevice = manual || existingDevice?.source === "manual";
+  const idTakenByOther =
+    !manualDevice &&
+    layout.devices.some(
+      (device) => device !== existingDevice && device.id === followedId,
+    );
+  const id = manualDevice
+    ? existingDevice?.id ?? followedId
+    : idTakenByOther
+      ? existingDevice?.id ?? followedId
+      : followedId;
   // 名称始终优先保留用户可见的既有名称（手动添加的别名），重新配对只刷新
   // 地址/证书/端口/屏幕，避免设备被悄悄改名（与 #26 的既有行为一致）。
   const name = alias || existingDevice?.name || peer.name;
@@ -246,8 +518,7 @@ function createDeviceFromPeer(
     online: true,
     inputReady: peer.inputReady,
     role: "client",
-    source:
-      manual || existingDevice?.source === "manual" ? "manual" : "detected",
+    source: manualDevice ? "manual" : "detected",
     ...(existingDevice?.pointerSpeed === undefined
       ? {}
       : { pointerSpeed: existingDevice.pointerSpeed }),
@@ -283,9 +554,14 @@ function createScreensFromPeer(
 
   return peerScreens.map((screen, index) => {
     const id = uniqueScreenId(deviceId, screen, index);
-    const existingScreen = existingDevice?.screens.find(
-      (candidate) => candidate.id === id,
-    );
+    const existingScreen =
+      existingDevice?.screens.find((candidate) => candidate.id === id) ??
+      // P0-2b：设备 id 跟随后屏幕 id 前缀变化，按 id 找不到旧屏；数量相同则
+      // 按 index 对位兜底取原坐标，用户摆放不回默认（与后端 screens_from_peer
+      // 的 index 对位兜底一致）。
+      (existingDevice && existingDevice.screens.length === peerScreens.length
+        ? existingDevice.screens[index]
+        : undefined);
 
     return {
       id,
