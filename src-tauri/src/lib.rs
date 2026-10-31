@@ -10273,12 +10273,16 @@ fn prune_stale_peers(peers: &Arc<Mutex<Vec<LanPeer>>>) {
     }
 }
 
-/// A forward clock jump larger than this between two prune calls (sleep/wake,
-/// NTP correction) makes every peer look stale at once. Skipping one prune
-/// round after such a jump costs at most one extra TTL window of stale rows
-/// and prevents a full-fleet offline flash; the next announce (≤3s) refreshes
-/// every entry anyway.
-const CLOCK_JUMP_GUARD_MS: u64 = 300_000;
+/// A prune-call gap larger than this can only mean the process was suspended
+/// (lid-close sleep) or the clock jumped: normal prune cadence is ≤2s
+/// (discovery thread 500ms tick + the frontend's 2s polling), so anything
+/// past a minute is pathological. The threshold must stay below
+/// `PEER_TTL_MS` — any pause long enough to expire peers has to enter the
+/// grace window below, otherwise mid-length sleeps (90s..6min, the common
+/// nap/short-away case) still flash the whole fleet offline until the next
+/// announce. The cost (≤5s of stale-peer tolerance) is negligible against
+/// the 90s TTL.
+const PRUNE_GAP_GRACE_TRIGGER_MS: u64 = 60_000;
 
 static LAST_PRUNE_BASELINE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -10306,7 +10310,7 @@ fn prune_stale_peer_entries_with_baseline(
     baseline: &mut u64,
     grace_until: &mut u64,
 ) {
-    if clock_jump_guard_skips_prune(*baseline, now) {
+    if prune_gap_guard_skips_prune(*baseline, now) {
         // Repeated jumps (or another jump inside the grace window) extend the
         // deadline; the assignment is idempotent for same-moment jumps.
         *grace_until = now + CLOCK_JUMP_GRACE_MS;
@@ -10323,10 +10327,11 @@ fn prune_stale_peer_entries_with_baseline(
     prune_stale_peer_entries_at(peers, now, *grace_until);
 }
 
-/// True when the clock appears to have jumped forward past the guard between
-/// two prune rounds, in which case this round must not delete peers.
-fn clock_jump_guard_skips_prune(baseline: u64, now: u64) -> bool {
-    baseline != 0 && now.saturating_sub(baseline) > CLOCK_JUMP_GUARD_MS
+/// True when the gap between two prune rounds exceeds the trigger — the
+/// process was suspended or the clock jumped — in which case this round must
+/// not delete peers and the grace window is (re)armed instead.
+fn prune_gap_guard_skips_prune(baseline: u64, now: u64) -> bool {
+    baseline != 0 && now.saturating_sub(baseline) > PRUNE_GAP_GRACE_TRIGGER_MS
 }
 
 /// The single stale predicate every TTL-based expiry check must use. A peer is
@@ -10362,7 +10367,7 @@ fn prune_stale_peer_entries_at(peers: &mut Vec<LanPeer>, now: u64, grace_until: 
     // A batch expiry right after a grace window means the fleet-wide gap was
     // the clock jump itself, not real disconnects; one summary line makes the
     // wake-up sequence grep-able in logs.
-    log::info!("discovery prune expired {expired} peers after grace");
+    log::info!("discovery prune expired {expired} peers");
 }
 
 /// TTL keep-alive: a peer whose last heartbeat is halfway to the TTL but has
@@ -12203,11 +12208,11 @@ mod tests {
         );
         assert!(entries.is_empty(), "stable clock must prune expired peers");
 
-        // 前跳 5 分钟以上 → 跳过本轮删除(即使 peer 已过期)。
+        // prune 间隔超过触发阈值(挂起/时钟跳变)→ 跳过本轮删除(即使已过期)。
         entries.push(test_peer());
         entries[0].last_seen_ms = 0;
-        let jumped = baseline + CLOCK_JUMP_GUARD_MS + 1;
-        assert!(clock_jump_guard_skips_prune(baseline, jumped));
+        let jumped = baseline + PRUNE_GAP_GRACE_TRIGGER_MS + 1;
+        assert!(prune_gap_guard_skips_prune(baseline, jumped));
         prune_stale_peer_entries_with_baseline(
             &mut entries,
             jumped,
@@ -12218,7 +12223,7 @@ mod tests {
 
         // 宽限期内即使时钟恢复稳定也不删(消除「第二轮整批删除」闪断)。
         let stable = jumped + 1_000;
-        assert!(!clock_jump_guard_skips_prune(jumped, stable));
+        assert!(!prune_gap_guard_skips_prune(jumped, stable));
         prune_stale_peer_entries_with_baseline(
             &mut entries,
             stable,
@@ -12254,7 +12259,7 @@ mod tests {
         for peer in &mut entries {
             peer.last_seen_ms = now - PEER_TTL_MS - 1; // 睡前已全部过期
         }
-        let mut baseline = now - (CLOCK_JUMP_GUARD_MS + 1);
+        let mut baseline = now - (PRUNE_GAP_GRACE_TRIGGER_MS + 1);
         let mut grace_until = 0u64;
 
         // 跳变轮:检出前跳,进入宽限期。
@@ -12319,7 +12324,7 @@ mod tests {
         let now = 10_000_000u64;
         let mut entries = vec![test_peer()];
         entries[0].last_seen_ms = now - PEER_TTL_MS - 1;
-        let mut baseline = now - (CLOCK_JUMP_GUARD_MS + 1);
+        let mut baseline = now - (PRUNE_GAP_GRACE_TRIGGER_MS + 1);
         let mut grace_until = 0u64;
 
         prune_stale_peer_entries_with_baseline(&mut entries, now, &mut baseline, &mut grace_until);
@@ -12343,14 +12348,84 @@ mod tests {
         );
 
         // 之后走正常 TTL:announce 后再过一整个 TTL 才淘汰。
+        // 按正常 prune 节奏(间隔 < 触发阈值)分步推进,避免大间隔被
+        // 误判为又一次挂起。
         let beyond = announce_at + PEER_TTL_MS + 1;
-        prune_stale_peer_entries_with_baseline(
-            &mut entries,
-            beyond,
-            &mut baseline,
-            &mut grace_until,
-        );
+        let mut tick = after;
+        while tick < beyond {
+            tick = (tick + PRUNE_GAP_GRACE_TRIGGER_MS / 2).min(beyond);
+            prune_stale_peer_entries_with_baseline(
+                &mut entries,
+                tick,
+                &mut baseline,
+                &mut grace_until,
+            );
+        }
         assert!(entries.is_empty(), "normal TTL applies after grace");
+    }
+
+    /// P1-2b §8.2.4:中短睡眠档(90s < 停顿 < 5min)也必须触发宽限期。
+    /// 核心约束:触发阈值 < PEER_TTL_MS,任何足以让 peer 超 TTL 的停顿
+    /// 都进入宽限,不再闪断。
+    #[test]
+    fn grace_triggers_for_sub_five_minute_suspension() {
+        // 评审复核三档:95s(TTL 刚过)/120s(午休档)/180s。
+        for gap_ms in [95_000u64, 120_000, 180_000] {
+            let now = 10_000_000u64;
+            let mut entries = vec![test_peer()];
+            // 睡前刚好压在 TTL 边缘,停顿后必然超 TTL。
+            entries[0].last_seen_ms = now - PEER_TTL_MS - 1;
+            let mut baseline = now - gap_ms;
+            let mut grace_until = 0u64;
+
+            assert!(
+                prune_gap_guard_skips_prune(baseline, now),
+                "gap {gap_ms}ms must trigger the grace window (threshold must stay < PEER_TTL_MS)"
+            );
+            prune_stale_peer_entries_with_baseline(
+                &mut entries,
+                now,
+                &mut baseline,
+                &mut grace_until,
+            );
+            assert_eq!(
+                entries.len(),
+                1,
+                "gap {gap_ms}ms: jump round must not delete"
+            );
+            assert_eq!(grace_until, now + CLOCK_JUMP_GRACE_MS);
+
+            // 宽限期内 announce 续命(last_seen 照常刷新,不伪造)。
+            entries[0].last_seen_ms = now + 2_000;
+
+            // 宽限期结束:被续命的 peer 存活,回归正常 TTL。
+            let after = now + CLOCK_JUMP_GRACE_MS + 1;
+            prune_stale_peer_entries_with_baseline(
+                &mut entries,
+                after,
+                &mut baseline,
+                &mut grace_until,
+            );
+            assert_eq!(
+                entries.len(),
+                1,
+                "gap {gap_ms}ms: announce-refreshed peer must survive"
+            );
+
+            // 未续命者宽限期结束即淘汰。
+            let stale_now = after + 1_000;
+            entries[0].last_seen_ms = stale_now - PEER_TTL_MS - 1;
+            prune_stale_peer_entries_with_baseline(
+                &mut entries,
+                stale_now,
+                &mut baseline,
+                &mut grace_until,
+            );
+            assert!(
+                entries.is_empty(),
+                "gap {gap_ms}ms: silent peer must expire after grace"
+            );
+        }
     }
 
     /// P1-2:临近 TTL(45s~90s)的 peer 进入 probe 名单;限频 10s/peer、
