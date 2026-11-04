@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -5353,6 +5353,153 @@ fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
     addresses
 }
 
+// ---- 网络抗干扰 P0 §3-A：本机地址多候选枚举与排序 ----
+
+/// announce 携带的本机地址候选上限（RFC N≤4）：再多就是地址风暴，
+/// probe fan-out 会被放大到不可控。
+const MAX_LOCAL_IP_CANDIDATES: usize = 4;
+
+/// 单个本机地址候选：地址 + 所属接口名（过滤与排序的依据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IpCandidate {
+    ip: IpAddr,
+    interface: String,
+}
+
+/// 接口名黑名单（小写子串匹配）：TUN/TAP 代理、AWDL、桥接、以及
+/// Hyper-V/WSL/VirtualBox 式虚拟交换机。172.16/12 私有段本身是企业内网
+/// 合法段，不在地址侧排除，只按接口名排虚拟交换机。if-addrs 在 Windows
+/// 返回 FriendlyName（"vEthernet (WSL)"）、macOS 返回 ifa_name（"utun3"），
+/// 两侧都能按名字命中。
+const EXCLUDED_INTERFACE_PATTERNS: [&str; 10] = [
+    "utun",
+    "tun",
+    "tap",
+    "awdl",
+    "bridge",
+    "vethernet",
+    "wsl",
+    "hyper-v",
+    "loopback",
+    "tailscale",
+];
+
+fn is_excluded_interface_name(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    EXCLUDED_INTERFACE_PATTERNS
+        .iter()
+        .any(|pattern| lowered.contains(pattern))
+}
+
+/// 地址特征过滤：复用既有 `usable_discovery_ipv4`（已排除 loopback、
+/// link-local 169.254/9、组播/广播、198.18/15 TUN 段）；发现协议是 IPv4
+/// LAN 协议，IPv6 候选一律丢弃。
+fn filter_ip_candidates(entries: &[IpCandidate]) -> Vec<IpCandidate> {
+    entries
+        .iter()
+        .filter(|entry| match entry.ip {
+            IpAddr::V4(ip) => usable_discovery_ipv4(ip),
+            IpAddr::V6(_) => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// 枚举本机全部 IPv4 地址候选（含接口名），按接口名启发式过滤，不排序。
+fn collect_local_ip_candidates() -> Vec<IpCandidate> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .iter()
+        .filter(|interface| !is_excluded_interface_name(&interface.name))
+        .filter_map(|interface| match &interface.addr {
+            if_addrs::IfAddr::V4(address) => Some(IpCandidate {
+                ip: IpAddr::V4(address.ip),
+                interface: interface.name.clone(),
+            }),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// RFC §3-A 排序（稳定，同输入必须同输出，防首选地址摇摆）：
+/// ① 与任一已配对对端同 /24 的地址（对端大概率可达的网段）；
+/// ② `preferred_hint`（现有 `local_ip_address()` 的"可用主地址"）；
+/// ③ 其余按接口名序 + 地址序。输出去重并截断至 `MAX_LOCAL_IP_CANDIDATES`。
+fn rank_local_ip_candidates(
+    entries: &[IpCandidate],
+    preferred_hint: Option<IpAddr>,
+    peer_hints: &[IpAddr],
+) -> Vec<IpAddr> {
+    let candidate_tier = |entry: &IpCandidate| -> u8 {
+        if peer_hints
+            .iter()
+            .any(|hint| shares_ipv4_subnet24(hint, &entry.ip))
+        {
+            0
+        } else if Some(entry.ip) == preferred_hint {
+            1
+        } else {
+            2
+        }
+    };
+
+    // 排序键：tier → 接口名 → 地址字节。sort_by 是稳定排序，完整键保证
+    // 同输入同输出；V6（理论上不会出现，防御性处理）排在所有 V4 之后。
+    let address_key = |ip: &IpAddr| -> (u8, [u8; 4]) {
+        match ip {
+            IpAddr::V4(ip) => (0, ip.octets()),
+            IpAddr::V6(_) => (1, [0_u8; 4]),
+        }
+    };
+
+    let mut ranked: Vec<&IpCandidate> = entries.iter().collect();
+    ranked.sort_by(|a, b| {
+        let key_a = (candidate_tier(a), a.interface.as_str(), address_key(&a.ip));
+        let key_b = (candidate_tier(b), b.interface.as_str(), address_key(&b.ip));
+        key_a.cmp(&key_b)
+    });
+
+    let mut result: Vec<IpAddr> = Vec::new();
+    for entry in ranked {
+        if !result.contains(&entry.ip) {
+            result.push(entry.ip);
+        }
+    }
+    result.truncate(MAX_LOCAL_IP_CANDIDATES);
+    result
+}
+
+/// 两个地址是否同 IPv4 /24 网段（peer_hints 匹配用）；非 V4 一律不同段。
+fn shares_ipv4_subnet24(a: &IpAddr, b: &IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => a.octets()[..3] == b.octets()[..3],
+        _ => false,
+    }
+}
+
+/// RFC §3-A 对外入口：枚举 + 过滤 + 排序。无 peer 提示的通用版本，
+/// `preferred_hint` 取现有 `local_ip_address()` 的结果（它代表"可用主地址"，
+/// 5s 缓存内零开销）。
+fn collect_local_ip_addresses() -> Vec<IpAddr> {
+    let entries = filter_ip_candidates(&collect_local_ip_candidates());
+    let preferred_hint = local_ip_address().and_then(|ip| ip.parse::<IpAddr>().ok());
+    rank_local_ip_candidates(&entries, preferred_hint, &[])
+}
+
+/// announce 广播面用 RFC §3-A 的过滤+排序列表（替代裸枚举，排掉
+/// TUN/虚拟交换机地址，广播不再打进 NAT 内网段）。
+fn ranked_local_ipv4_for_discovery() -> Vec<Ipv4Addr> {
+    collect_local_ip_addresses()
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
 fn default_route_ipv4_address() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -10506,7 +10653,7 @@ fn discovery_detail(peer_count: usize, listening: bool, port: u16) -> String {
 /// whole span — rather than a single port — lets us reach peers that drifted
 /// onto a neighbouring port when their preferred port was momentarily taken.
 pub(crate) fn broadcast_addrs(base_port: u16) -> Vec<String> {
-    broadcast_addrs_for_ips(base_port, &local_ipv4_addresses())
+    broadcast_addrs_for_ips(base_port, &ranked_local_ipv4_for_discovery())
 }
 
 fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
@@ -14174,5 +14321,203 @@ mod tests {
         assert_eq!((local.x, local.y), (0, 0));
         assert_eq!(screen_overlap_area(local, peer), 0);
         assert_eq!(peer.y + peer.height, local.y);
+    }
+
+    // ---- 网络抗干扰 P0 §3-A：本机地址枚举与排序 ----
+
+    /// 测试辅助：按地址+接口名构造候选。
+    fn candidate(octets: [u8; 4], interface: &str) -> IpCandidate {
+        IpCandidate {
+            ip: IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
+            interface: interface.to_string(),
+        }
+    }
+
+    #[test]
+    fn interface_filter_excludes_virtual_tunnel_and_awdl_adapters() {
+        // RFC §3-A：TUN/TAP、AWDL、虚拟交换机按接口名排除（忽略大小写）。
+        // 命中名单：utun/tun/tap/awdl/bridge/vEthernet/WSL/Hyper-V/Loopback/tailscale。
+        let excluded = [
+            ("utun3", "macOS TUN 代理"),
+            ("TUN Proxy Adapter", "显式 tun 命名"),
+            ("TAP-Win32 Adapter", "Windows TAP"),
+            ("awdl0", "macOS AWDL（AirDrop 链路）"),
+            ("bridge0", "macOS 桥接"),
+            ("vEthernet (WSL)", "Hyper-V WSL 虚拟交换机"),
+            ("vEthernet (Default Switch)", "Hyper-V 默认交换机"),
+            ("WSL", "WSL 适配器"),
+            ("Hyper-V Virtual Ethernet Adapter", "Hyper-V 命名"),
+            ("Tailscale", "Tailscale 隧道"),
+            ("tailscale0", "Tailscale 小写"),
+            ("Loopback Pseudo-Interface 1", "回环命名接口"),
+        ];
+        for (name, why) in excluded {
+            assert!(
+                is_excluded_interface_name(name),
+                "接口 {name:?}（{why}）必须被排除"
+            );
+        }
+
+        let kept = [
+            ("en0", "macOS Wi-Fi"),
+            ("en5", "macOS USB 网卡"),
+            ("eth0", "Linux 网卡"),
+            ("WLAN", "Windows Wi-Fi"),
+            ("以太网", "Windows 有线"),
+            ("Ethernet 2", "Windows 网卡"),
+            ("USB 10/100/1000 LAN", "USB 网卡（含 lan 字样但非黑名单）"),
+        ];
+        for (name, why) in kept {
+            assert!(
+                !is_excluded_interface_name(name),
+                "物理接口 {name:?}（{why}）不允许被误杀"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_collection_drops_loopback_and_link_local_but_keeps_enterprise_range() {
+        // RFC §3-A：127/8、169.254/9 排除；172.16/12 私有段是企业内网合法段，
+        // 接口名正常时必须保留。
+        let entries = [
+            candidate([127, 0, 0, 1], "lo0"),
+            candidate([169, 254, 12, 9], "en0"),
+            candidate([172, 16, 8, 20], "Ethernet 2"),
+            candidate([172, 31, 1, 5], "WLAN"),
+            candidate([192, 168, 1, 42], "en0"),
+        ];
+
+        let kept: Vec<Ipv4Addr> = filter_ip_candidates(&entries)
+            .into_iter()
+            .filter_map(|entry| match entry.ip {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+
+        assert_eq!(
+            kept,
+            vec![
+                Ipv4Addr::new(172, 16, 8, 20),
+                Ipv4Addr::new(172, 31, 1, 5),
+                Ipv4Addr::new(192, 168, 1, 42),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranking_prefers_candidates_sharing_a_subnet_with_paired_peers() {
+        // 第一档：与已配对对端同 /24 的地址最优先（对端大概率可达的网段）。
+        let entries = [
+            candidate([10, 0, 0, 4], "en5"),
+            candidate([192, 168, 1, 42], "en0"),
+            candidate([192, 168, 1, 7], "WLAN"),
+        ];
+        let peer_hints = [IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))];
+
+        let ranked = rank_local_ip_candidates(&entries, None, &peer_hints);
+
+        assert_eq!(
+            ranked,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 7),
+                Ipv4Addr::new(192, 168, 1, 42),
+                Ipv4Addr::new(10, 0, 0, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranking_falls_back_to_the_hinted_primary_address() {
+        // 第二档：preferred_hint（现有 local_ip_address() 的"可用主地址"），
+        // 在没有对端同段候选时压轴到最前。
+        let entries = [
+            candidate([10, 0, 0, 4], "en5"),
+            candidate([192, 168, 1, 42], "en0"),
+        ];
+        let hint = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)));
+
+        let ranked = rank_local_ip_candidates(&entries, hint, &[]);
+
+        assert_eq!(
+            ranked,
+            vec![Ipv4Addr::new(192, 168, 1, 42), Ipv4Addr::new(10, 0, 0, 4)]
+        );
+    }
+
+    #[test]
+    fn ranking_orders_remaining_candidates_stably_by_interface_then_address() {
+        // 第三档：接口名序 + 地址序；同输入必须同输出（防摇摆是硬要求）。
+        let entries = [
+            candidate([10, 0, 0, 9], "WLAN"),
+            candidate([10, 0, 0, 2], "en0"),
+            candidate([172, 16, 3, 4], "Ethernet 2"),
+            candidate([10, 0, 0, 5], "en5"),
+        ];
+
+        let first = rank_local_ip_candidates(&entries, None, &[]);
+        let second = rank_local_ip_candidates(&entries, None, &[]);
+
+        // 接口名是第一排序键：Ethernet 2 < WLAN < en0 < en5（ASCII 序），
+        // 同接口内再按地址序。不同接口的地址不按地址大小混排。
+        assert_eq!(
+            first,
+            vec![
+                Ipv4Addr::new(172, 16, 3, 4), // "Ethernet 2" 最小
+                Ipv4Addr::new(10, 0, 0, 9),   // "WLAN"
+                Ipv4Addr::new(10, 0, 0, 2),   // "en0"
+                Ipv4Addr::new(10, 0, 0, 5),   // "en5"
+            ]
+        );
+        assert_eq!(first, second, "同输入必须得到同输出");
+    }
+
+    #[test]
+    fn ranking_tiers_keep_peer_subnet_above_the_primary_hint() {
+        // 三档并存时严格按 tier 顺序：对端同段 > preferred_hint > 其余。
+        let entries = [
+            candidate([10, 0, 0, 4], "en5"),
+            candidate([192, 168, 1, 42], "en0"),
+            candidate([192, 168, 1, 7], "WLAN"),
+        ];
+        let hint = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)));
+        let peer_hints = [IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))];
+
+        let ranked = rank_local_ip_candidates(&entries, hint, &peer_hints);
+
+        assert_eq!(
+            ranked,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 7),
+                Ipv4Addr::new(192, 168, 1, 42),
+                Ipv4Addr::new(10, 0, 0, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranking_caps_the_candidate_list_at_four_addresses() {
+        // RFC 上限 N≤4：候选再多也截断，防 announce/probe 地址风暴。
+        let entries = [
+            candidate([10, 0, 0, 1], "eth0"),
+            candidate([10, 0, 1, 1], "eth1"),
+            candidate([10, 0, 2, 1], "eth2"),
+            candidate([10, 0, 3, 1], "eth3"),
+            candidate([10, 0, 4, 1], "eth4"),
+            candidate([10, 0, 5, 1], "eth5"),
+        ];
+
+        let ranked = rank_local_ip_candidates(&entries, None, &[]);
+
+        assert_eq!(ranked.len(), MAX_LOCAL_IP_CANDIDATES);
+        assert_eq!(
+            ranked,
+            vec![
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 0, 1, 1),
+                Ipv4Addr::new(10, 0, 2, 1),
+                Ipv4Addr::new(10, 0, 3, 1),
+            ]
+        );
     }
 }
