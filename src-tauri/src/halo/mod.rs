@@ -11,6 +11,7 @@
 // dead_code fires on some items until the P2 dwell engine wires them up.
 #![allow(dead_code)]
 
+pub mod activator;
 pub mod engine;
 pub mod filter;
 pub mod input_probe;
@@ -21,6 +22,7 @@ pub mod state_machine;
 pub mod tracker;
 pub mod windows_layer;
 
+pub use activator::{create_activator, ActivationOutcome, WindowActivator};
 pub use engine::{spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase};
 pub use filter::OneEuroFilter;
 pub use input_probe::{InputActivityProbe, NullProbe, SystemInputProbe};
@@ -272,6 +274,9 @@ impl HaloRuntime {
             // field borrows `screen`, so it is initialized before `screen`
             // moves into the config.)
             window_service: Some(create_window_service(std::slice::from_ref(&screen))),
+            // P3 activation: the engine raises dwell targets and undoes
+            // switches through this backend.
+            activator: activator::create_activator(),
             screen,
         };
         let (engine_handle, engine_cmd_tx, engine_debug_rx) = engine::spawn(
@@ -376,6 +381,25 @@ impl HaloRuntime {
             self.forward(EngineCommand::SetCalibration(calibration));
         }
         self.calibration = calibration;
+    }
+
+    /// Undo the most recent dwell switch (P3). Forwarded to a running engine
+    /// as [`EngineCommand::UndoSwitch`]; a disabled runtime no-ops (and the
+    /// engine itself rejects undos during the emergency lock). The P3-B undo
+    /// hotkey calls this.
+    pub(crate) fn undo_switch(&mut self) {
+        if self.is_running() {
+            self.forward(EngineCommand::UndoSwitch);
+        }
+    }
+
+    /// Emergency stop (P3): suspend the pipeline for 5 s and clear the undo
+    /// stack via [`EngineCommand::EmergencyStop`]; a disabled runtime no-ops.
+    /// The P3-B emergency hotkey calls this.
+    pub(crate) fn emergency_stop(&mut self) {
+        if self.is_running() {
+            self.forward(EngineCommand::EmergencyStop);
+        }
     }
 
     /// Store the screen geometry; forwarded to a running engine and reused by
@@ -560,6 +584,9 @@ mod tests {
         assert_eq!(runtime.status_reason(), None);
         assert_eq!(runtime.latest_pose(), None);
         assert!(runtime.drain_debug().is_empty());
+        // P3 command entries are no-ops while disabled (must not panic).
+        runtime.undo_switch();
+        runtime.emergency_stop();
         // Disabling an already-disabled runtime is a no-op.
         runtime.disable();
     }

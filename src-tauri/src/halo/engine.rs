@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::halo::activator::WindowActivator;
 use crate::halo::filter::OneEuroFilter;
 use crate::halo::input_probe::InputActivityProbe;
 use crate::halo::mapping::{map_pose, CalibrationProfile};
@@ -32,6 +33,57 @@ const TICK_PERIOD: Duration = Duration::from_nanos(16_666_667);
 /// dt guard rails for filter feeding (timestamps can glitch).
 const MIN_DT: f64 = 0.001;
 const MAX_DT: f64 = 1.0;
+/// Emergency stop suspends the whole pipeline this long after the command
+/// (product: the hotkey buys 5 s of guaranteed quiet).
+pub(crate) const EMERGENCY_LOCK_MS: u64 = 5000;
+/// Undo-stack depth cap: the 8 most recent switches stay undoable.
+pub(crate) const UNDO_STACK_MAX: usize = 8;
+
+/// One undoable switch: the foreground window the halo took the user away
+/// from, and when the switch fired. `previous_foreground_id` is `None` when
+/// the foreground window was not in the enumerable set (or there was none) —
+/// undoing such an entry is a no-op pop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UndoEntry {
+    pub(crate) previous_foreground_id: Option<u64>,
+    pub(crate) switched_at_ms: u64,
+}
+
+/// Whether the emergency lock is up at `now_ms`: `until` is the lock's
+/// deadline (engine tick time), and a clock glitch backwards simply reads as
+/// "deadline passed" (no panic, no permanent lock).
+pub(crate) fn emergency_locked(until: Option<u64>, now_ms: u64) -> bool {
+    until.is_some_and(|deadline| now_ms < deadline)
+}
+
+/// Push an undo entry with the depth cap: past [`UNDO_STACK_MAX`] the oldest
+/// entries fall off the front.
+pub(crate) fn undo_push(stack: &mut Vec<UndoEntry>, entry: UndoEntry) {
+    stack.push(entry);
+    if stack.len() > UNDO_STACK_MAX {
+        let overflow = stack.len() - UNDO_STACK_MAX;
+        stack.drain(0..overflow);
+    }
+}
+
+/// Undo-stack top consumption: pops and discards expired tops first (each
+/// older than `undo_ms` at `now_ms`), then pops the top when it is still
+/// fresh. Returns the popped entry's `previous_foreground_id` (`Some(None)` =
+/// recorded switch whose undo is a no-op), or `None` when nothing was
+/// undoable (empty stack / every entry expired).
+pub(crate) fn undo_take(
+    stack: &mut Vec<UndoEntry>,
+    now_ms: u64,
+    undo_ms: u64,
+) -> Option<Option<u64>> {
+    while let Some(top) = stack.last() {
+        if now_ms.saturating_sub(top.switched_at_ms) <= undo_ms {
+            break;
+        }
+        stack.pop();
+    }
+    stack.pop().map(|entry| entry.previous_foreground_id)
+}
 
 /// Coarse engine phase as consumed by the debug channel (P1-D). Both
 /// suspension reasons render as `HaloVisual::Suspended`; the split exists so
@@ -86,6 +138,10 @@ pub struct EngineConfig {
     /// machine entirely (pure-follow mode): used by halo_manual and by
     /// platforms without a window layer, where the halo just follows.
     pub window_service: Option<Box<dyn WindowService>>,
+    /// Window activation backend (P3): consumes the dwell machine's switch
+    /// events and undo requests. Always present — even a placeholder
+    /// activator keeps the engine logic uniform.
+    pub activator: Box<dyn WindowActivator>,
 }
 
 /// Commands the engine thread accepts while running.
@@ -100,6 +156,13 @@ pub enum EngineCommand {
     SetCalibration(CalibrationProfile),
     /// Screen moved/resized/scale changed.
     SetScreen(OverlayScreenGeometry),
+    /// Undo the most recent switch if it fired within `undo_ms` (P3-B undo
+    /// hotkey lands here via HaloRuntime::undo_switch).
+    UndoSwitch,
+    /// Emergency stop: suspend the pipeline for [`EMERGENCY_LOCK_MS`] and
+    /// clear the undo stack (P3-B emergency hotkey lands here via
+    /// HaloRuntime::emergency_stop).
+    EmergencyStop,
 }
 
 /// All mutable engine state, threaded through the pure [`step`].
@@ -134,6 +197,13 @@ pub(crate) struct EngineState {
     /// `None` (halo_manual, unsupported platforms) keeps the engine in
     /// pure-follow mode: no hit-tests, dwell machine bypassed.
     window_service: Option<Box<dyn WindowService>>,
+    /// P3 activation backend for switch events and undo requests.
+    pub(crate) activator: Box<dyn WindowActivator>,
+    /// Most recent switches, newest last (`undo_push` keeps at most
+    /// [`UNDO_STACK_MAX`]).
+    pub(crate) undo_stack: Vec<UndoEntry>,
+    /// Emergency-lock deadline in tick time; `None`/past deadline = unlocked.
+    pub(crate) emergency_until: Option<u64>,
 }
 
 impl EngineState {
@@ -158,6 +228,9 @@ impl EngineState {
             dwell: DwellState::default(),
             current_border: None,
             window_service: config.window_service,
+            activator: config.activator,
+            undo_stack: Vec::new(),
+            emergency_until: None,
         }
     }
 }
@@ -254,12 +327,17 @@ pub(crate) fn step(
         state.norm.1 * state.screen.height,
     );
 
+    // P3 emergency lock: another suspend source next to face/input — the
+    // dwell machine gets suspend=true (visual Suspended, no timing), so no
+    // new candidates or switches can fire while the lock is up.
+    let emergency = emergency_locked(state.emergency_until, now_ms);
+
     // P2 dwell machine: one hit-test per tick (the window service caches its
     // enumeration for 300 ms) feeds the pure state machine. `None` service
     // bypasses it entirely — pure-follow mode for halo_manual and platforms
     // without a window layer.
-    let (dwell_phase, hit_frame) = match state.window_service.as_mut() {
-        None => (DwellPhase::Idle, None),
+    let (dwell_phase, hit_frame, switch_event) = match state.window_service.as_mut() {
+        None => (DwellPhase::Idle, None, None),
         Some(service) => {
             // WindowInfo frames and hit_test live in the layout board's
             // logical space, so the halo center is converted from
@@ -275,17 +353,52 @@ pub(crate) fn step(
                 speed_norm: state.speed_norm,
                 hit: hit.as_ref(),
                 foreground_id: None,
-                suspend: phase != EnginePhase::Idle,
+                suspend: phase != EnginePhase::Idle || emergency,
             };
             let (phase_out, event) = advance(&mut state.dwell, &input, &cfg);
-            // P2 only observes the switch; a later phase consumes the event
-            // for real activation.
-            if let Some(event) = event {
-                log::info!("halo: dwell switch fired window={}", event.window_id);
-            }
-            (phase_out, hit_frame)
+            (phase_out, hit_frame, event)
         }
     };
+
+    // P3 switch consumption: capture the pre-switch foreground, push the
+    // undo entry, then activate. Runs outside the window-service borrow
+    // above so the activator call stays a disjoint field borrow.
+    // Product note: after a switch the halo ring and the mouse stay exactly
+    // where they are — no pointer move, no overlay relocation — which needs
+    // no action here (nothing else in the tick touches them); activation is
+    // the sole side effect.
+    if let Some(event) = switch_event {
+        log::info!("halo: dwell switch fired window={}", event.window_id);
+        // Previous foreground, captured BEFORE activation (the enumerate is
+        // served from the same 300 ms cache as the hit-test, so the mark may
+        // lag reality by up to the TTL — accepted for undo purposes).
+        // `None` = foreground not in the enumerable set: undo becomes a
+        // no-op pop for this entry.
+        let previous_foreground = match state.window_service.as_mut() {
+            Some(service) => service.enumerate().ok().and_then(|windows| {
+                windows
+                    .iter()
+                    .find(|window| window.is_foreground)
+                    .map(|w| w.id)
+            }),
+            None => None,
+        };
+        undo_push(
+            &mut state.undo_stack,
+            UndoEntry {
+                previous_foreground_id: previous_foreground,
+                switched_at_ms: now_ms,
+            },
+        );
+        let outcome = state.activator.activate(event.window_id);
+        log::info!(
+            "halo: switch activate window={} activated={} fell_back={} detail={}",
+            event.window_id,
+            outcome.activated,
+            outcome.fell_back,
+            outcome.detail
+        );
+    }
 
     // Candidate-window border: wanted exactly while dwelling on a candidate,
     // following the hit window's frame each tick (a moving/resized window
@@ -293,22 +406,27 @@ pub(crate) fn step(
     // calls via `border_command`.
     let wanted_border = border_for_phase(dwell_phase, hit_frame);
 
-    let visual = match phase {
-        EnginePhase::SuspendedFace | EnginePhase::SuspendedInput => HaloVisual::Suspended,
-        EnginePhase::Idle => match dwell_phase {
-            DwellPhase::Candidate { progress, .. } => HaloVisual::Candidate {
-                // show_progress=false keeps the candidate ring but hides the
-                // arc (progress 0 renders no sweep).
-                progress: if state.settings.show_progress {
-                    progress
-                } else {
-                    0.0
+    let visual = if emergency {
+        // Emergency lock renders as Suspended regardless of face/input state.
+        HaloVisual::Suspended
+    } else {
+        match phase {
+            EnginePhase::SuspendedFace | EnginePhase::SuspendedInput => HaloVisual::Suspended,
+            EnginePhase::Idle => match dwell_phase {
+                DwellPhase::Candidate { progress, .. } => HaloVisual::Candidate {
+                    // show_progress=false keeps the candidate ring but hides
+                    // the arc (progress 0 renders no sweep).
+                    progress: if state.settings.show_progress {
+                        progress
+                    } else {
+                        0.0
+                    },
                 },
+                // Transient: the tick a switch fired flashes the ring.
+                DwellPhase::Switched { .. } => HaloVisual::SwitchPulse,
+                DwellPhase::Idle | DwellPhase::Cooldown => HaloVisual::Idle,
             },
-            // Transient: the tick a switch fired flashes the ring.
-            DwellPhase::Switched { .. } => HaloVisual::SwitchPulse,
-            DwellPhase::Idle | DwellPhase::Cooldown => HaloVisual::Idle,
-        },
+        }
     };
     let snapshot = DebugSnapshot {
         ts_ms: now_ms,
@@ -390,6 +508,77 @@ pub fn spawn(
     (handle, cmd_tx, debug_rx)
 }
 
+/// One command dispatch, extracted from [`run_loop`] so the command paths
+/// (undo, emergency stop) are unit-testable without a live thread. Returns
+/// `true` when the loop must shut down.
+fn handle_command(
+    state: &mut EngineState,
+    cmd: EngineCommand,
+    now_ms: u64,
+    overlay: &mut dyn OverlayBackend,
+    probe: &mut dyn InputActivityProbe,
+) -> bool {
+    match cmd {
+        EngineCommand::Shutdown => true,
+        EngineCommand::SetSettings(settings) => {
+            state.settings = settings.sanitized();
+            probe.set_keyboard_suspends(state.settings.keyboard_suspends);
+            false
+        }
+        EngineCommand::SetCalibration(calibration) => {
+            state.calibration = calibration;
+            false
+        }
+        EngineCommand::SetScreen(screen) => {
+            state.screen = screen;
+            overlay.set_screen(screen);
+            false
+        }
+        EngineCommand::UndoSwitch => {
+            // During the emergency lock the product leaves undo undefined;
+            // EmergencyStop already cleared the stack, this guard just keeps
+            // a racing hotkey from acting on a re-built stack inside the
+            // lock.
+            if emergency_locked(state.emergency_until, now_ms) {
+                return false;
+            }
+            let undo_ms = state.settings.undo_ms as u64;
+            match undo_take(&mut state.undo_stack, now_ms, undo_ms) {
+                Some(Some(previous)) => {
+                    let outcome = state.activator.activate(previous);
+                    log::info!(
+                        "halo: undo switch -> window={} activated={} fell_back={} detail={}",
+                        previous,
+                        outcome.activated,
+                        outcome.fell_back,
+                        outcome.detail
+                    );
+                }
+                Some(None) => {
+                    log::info!("halo: undo switch: previous foreground not enumerable, no-op");
+                }
+                None => {
+                    log::info!("halo: undo switch: nothing eligible");
+                }
+            }
+            false
+        }
+        EngineCommand::EmergencyStop => {
+            state.emergency_until = Some(now_ms.saturating_add(EMERGENCY_LOCK_MS));
+            // Product note: undo-after-emergency is undefined by spec; the
+            // chosen semantics are "emergency clears the undo stack" — an
+            // undo racing a deliberate stop is more surprise than help, and
+            // 5 s of no-response must also not resurrect old switches.
+            state.undo_stack.clear();
+            log::info!(
+                "halo: emergency stop, pipeline suspended for {} ms, undo stack cleared",
+                EMERGENCY_LOCK_MS
+            );
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_loop(
     mut state: EngineState,
@@ -409,31 +598,23 @@ fn run_loop(
         opacity: state.settings.halo_opacity,
     };
     let mut debug_connected = true;
-    // Engine-own monotonic clock: face/input timers and snapshot timestamps
-    // all use this, so wall-clock (NTP) jumps cannot distort the 4 s / 1 s
-    // suspension windows.
+    // Engine-own monotonic clock: face/input timers, the emergency/undo
+    // windows, and snapshot timestamps all use this, so wall-clock (NTP)
+    // jumps cannot distort the suspension windows.
     let tick_epoch = Instant::now();
     let mut next_tick = Instant::now();
 
     loop {
+        // 0. Tick time first: commands and the step share one timestamp so
+        //    undo/emergency windows and dwell timers stay consistent.
+        let now_ms = tick_epoch.elapsed().as_millis() as u64;
+
         // 1. Commands (drain).
         let mut shutdown = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                EngineCommand::Shutdown => {
-                    shutdown = true;
-                }
-                EngineCommand::SetSettings(settings) => {
-                    state.settings = settings.sanitized();
-                    probe.set_keyboard_suspends(state.settings.keyboard_suspends);
-                }
-                EngineCommand::SetCalibration(calibration) => {
-                    state.calibration = calibration;
-                }
-                EngineCommand::SetScreen(screen) => {
-                    state.screen = screen;
-                    overlay.set_screen(screen);
-                }
+            if handle_command(&mut state, cmd, now_ms, overlay.as_mut(), probe.as_mut()) {
+                shutdown = true;
+                break;
             }
         }
         if shutdown {
@@ -460,7 +641,6 @@ fn run_loop(
 
         // 3. Probe + tick.
         let input_active = probe.physical_input_active();
-        let now_ms = tick_epoch.elapsed().as_millis() as u64;
         let (visual, local, snapshot) = step(&mut state, latest, now_ms, input_active);
 
         // 4. Drive the overlay. The frame object is only rebuilt when the
@@ -511,8 +691,10 @@ fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::halo::activator::ActivationOutcome;
     use crate::halo::params::FocusHaloSettings;
     use crate::halo::windows_layer::WindowInfo;
+    use std::sync::{Arc, Mutex};
 
     fn test_screen() -> OverlayScreenGeometry {
         OverlayScreenGeometry {
@@ -526,12 +708,43 @@ mod tests {
         }
     }
 
+    /// Activation recorder: ids land in the shared log, so tests assert on
+    /// the calls made through the `Box<dyn WindowActivator>` inside state.
+    struct FakeActivator {
+        calls: Arc<Mutex<Vec<u64>>>,
+        succeed: bool,
+    }
+
+    impl WindowActivator for FakeActivator {
+        fn activate(&mut self, window_id: u64) -> ActivationOutcome {
+            self.calls.lock().unwrap().push(window_id);
+            ActivationOutcome {
+                activated: self.succeed,
+                fell_back: false,
+                detail: "fake".into(),
+            }
+        }
+    }
+
+    fn fake_activator() -> (Box<dyn WindowActivator>, Arc<Mutex<Vec<u64>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (
+            Box::new(FakeActivator {
+                calls: Arc::clone(&calls),
+                succeed: true,
+            }),
+            calls,
+        )
+    }
+
     fn test_state() -> EngineState {
+        let (activator, _) = fake_activator();
         EngineState::new(EngineConfig {
             settings: FocusHaloSettings::default(),
             calibration: CalibrationProfile::default(),
             screen: test_screen(),
             window_service: None,
+            activator,
         })
     }
 
@@ -554,12 +767,70 @@ mod tests {
     }
 
     fn test_state_with_window(window: Option<WindowInfo>) -> EngineState {
+        let (activator, _) = fake_activator();
         EngineState::new(EngineConfig {
             settings: FocusHaloSettings::default(),
             calibration: CalibrationProfile::default(),
             screen: test_screen(),
             window_service: Some(Box::new(FixedWindowService { window })),
+            activator,
         })
+    }
+
+    /// State over a service whose hit-test target differs from the
+    /// enumeration list: a candidate window to dwell on plus a separate
+    /// foreground window the undo entry should record.
+    struct CandidateAndForegroundService {
+        candidate: WindowInfo,
+        foreground: Option<WindowInfo>,
+    }
+
+    impl WindowService for CandidateAndForegroundService {
+        fn enumerate(&mut self) -> Result<Vec<WindowInfo>, String> {
+            Ok(self.foreground.iter().cloned().collect())
+        }
+
+        fn hit_test(&mut self, _x: f64, _y: f64) -> Result<Option<WindowInfo>, String> {
+            Ok(Some(self.candidate.clone()))
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
+    fn test_state_candidate_and_foreground(
+        candidate: WindowInfo,
+        foreground: Option<WindowInfo>,
+    ) -> (EngineState, Arc<Mutex<Vec<u64>>>) {
+        let (activator, calls) = fake_activator();
+        let state = EngineState::new(EngineConfig {
+            settings: FocusHaloSettings::default(),
+            calibration: CalibrationProfile::default(),
+            screen: test_screen(),
+            window_service: Some(Box::new(CandidateAndForegroundService {
+                candidate,
+                foreground,
+            })),
+            activator,
+        });
+        (state, calls)
+    }
+
+    /// Drive a command through `handle_command` with inert overlay/probe
+    /// backends (the real ones need platform windows).
+    fn drive(state: &mut EngineState, cmd: EngineCommand, now_ms: u64) {
+        let mut probe = crate::halo::input_probe::NullProbe;
+        let mut overlay = NoopOverlay;
+        handle_command(state, cmd, now_ms, &mut overlay, &mut probe);
+    }
+
+    /// Minimal OverlayBackend for command tests.
+    struct NoopOverlay;
+
+    impl OverlayBackend for NoopOverlay {
+        fn show(&mut self) {}
+        fn hide(&mut self) {}
+        fn set_screen(&mut self, _geometry: OverlayScreenGeometry) {}
+        fn update(&mut self, _local: (f64, f64), _frame: &HaloFrame) {}
     }
 
     fn sample(ts_ms: u64, face: bool, yaw: f64, pitch: f64) -> HeadSample {
@@ -902,15 +1173,218 @@ mod tests {
             }
             fn invalidate(&mut self) {}
         }
+        let (activator, _) = fake_activator();
         let mut s = EngineState::new(EngineConfig {
             settings: FocusHaloSettings::default(),
             calibration: CalibrationProfile::default(),
             screen: test_screen(),
             window_service: Some(Box::new(ExplodingService)),
+            activator,
         });
         let (visual, _, snap) = step(&mut s, Some(sample(0, true, 0.0, 0.0)), 0, false);
         assert_eq!(visual, HaloVisual::Idle, "hit-test failure == blank area");
         assert_eq!(snap.candidate, None);
         assert_eq!(snap.phase_str, "idle");
+    }
+
+    // ----- P3: emergency lock, undo stack, switch consumption -----
+
+    fn undo_entry(previous: Option<u64>, switched_at_ms: u64) -> UndoEntry {
+        UndoEntry {
+            previous_foreground_id: previous,
+            switched_at_ms,
+        }
+    }
+
+    #[test]
+    fn emergency_locked_covers_only_the_open_window() {
+        assert!(!emergency_locked(None, 0));
+        assert!(!emergency_locked(None, 9_999));
+        // Deadline 1000: locked strictly before it, unlocked from it on.
+        assert!(emergency_locked(Some(1000), 0));
+        assert!(emergency_locked(Some(1000), 999));
+        assert!(!emergency_locked(Some(1000), 1000));
+        assert!(!emergency_locked(Some(1000), 1001));
+        // Clock glitch (now after the deadline) reads as unlocked.
+        assert!(!emergency_locked(Some(500), 5000));
+    }
+
+    #[test]
+    fn undo_push_caps_depth_dropping_the_oldest() {
+        let mut stack = Vec::new();
+        for i in 0..(UNDO_STACK_MAX + 2) as u64 {
+            undo_push(&mut stack, undo_entry(Some(i), i * 10));
+        }
+        assert_eq!(stack.len(), UNDO_STACK_MAX);
+        // Oldest entries (0, 1) fell off; the newest (last id) is on top.
+        assert_eq!(stack.first().unwrap().previous_foreground_id, Some(2));
+        assert_eq!(
+            stack.last().unwrap().previous_foreground_id,
+            Some((UNDO_STACK_MAX + 1) as u64)
+        );
+    }
+
+    #[test]
+    fn undo_take_discards_expired_tops_then_pops_the_fresh_top() {
+        let undo_ms = 5000;
+        // Everything expired: nothing undoable, stack drained.
+        let mut stack = vec![undo_entry(Some(1), 0), undo_entry(Some(2), 100)];
+        assert_eq!(undo_take(&mut stack, 7000, undo_ms), None);
+        assert!(stack.is_empty());
+
+        // Top fresh, entries below expired: the top pops, stale ones stay
+        // (they are only discarded when they reach the top).
+        let mut stack = vec![undo_entry(Some(1), 0), undo_entry(Some(2), 4000)];
+        assert_eq!(undo_take(&mut stack, 6000, undo_ms), Some(Some(2)));
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0].previous_foreground_id, Some(1));
+
+        // Exactly at the undo_ms boundary still counts as fresh (<=).
+        let mut stack = vec![undo_entry(Some(3), 1000)];
+        assert_eq!(
+            undo_take(&mut stack, 1000 + undo_ms, undo_ms),
+            Some(Some(3))
+        );
+
+        // One ms past it: expired.
+        let mut stack = vec![undo_entry(Some(3), 1000)];
+        assert_eq!(undo_take(&mut stack, 1000 + undo_ms + 1, undo_ms), None);
+
+        // Fresh top with a None previous id: popped and reported as a no-op
+        // undo.
+        let mut stack = vec![undo_entry(None, 100)];
+        assert_eq!(undo_take(&mut stack, 200, undo_ms), Some(None));
+        assert!(stack.is_empty());
+
+        // Empty stack: None.
+        let mut stack = Vec::new();
+        assert_eq!(undo_take(&mut stack, 100, undo_ms), None);
+
+        // Clock rollback (now < switched_at) saturates to age 0: fresh.
+        let mut stack = vec![undo_entry(Some(9), 10_000)];
+        assert_eq!(undo_take(&mut stack, 5_000, undo_ms), Some(Some(9)));
+    }
+
+    fn candidate_window(id: u64) -> WindowInfo {
+        WindowInfo {
+            id,
+            title: format!("cand{id}"),
+            process: "app".into(),
+            frame: (0.0, 0.0, 1000.0, 500.0),
+            is_foreground: false,
+        }
+    }
+
+    fn foreground_window(id: u64) -> WindowInfo {
+        let mut window = candidate_window(id);
+        window.is_foreground = true;
+        window
+    }
+
+    /// Drive the full dwell chain (settle at t=0, dwell to the switch at
+    /// t=1100) over the candidate/foreground service and return the tick-1100
+    /// snapshot.
+    fn dwell_to_switch(state: &mut EngineState) -> DebugSnapshot {
+        step(state, Some(sample(0, true, 0.0, 0.0)), 0, false);
+        step(state, None, 200, false);
+        let (_, _, snap) = step(state, None, 1100, false);
+        snap
+    }
+
+    #[test]
+    fn switch_fires_activation_and_records_the_previous_foreground() {
+        let (mut s, calls) =
+            test_state_candidate_and_foreground(candidate_window(9), Some(foreground_window(5)));
+        let snap = dwell_to_switch(&mut s);
+        assert_eq!(snap.phase_str, "switched");
+        // The switch target was activated…
+        assert_eq!(*calls.lock().unwrap(), vec![9]);
+        // …and the undo entry recorded the pre-switch foreground.
+        assert_eq!(s.undo_stack.len(), 1);
+        assert_eq!(s.undo_stack[0].previous_foreground_id, Some(5));
+        assert_eq!(s.undo_stack[0].switched_at_ms, 1100);
+    }
+
+    #[test]
+    fn undo_command_within_window_activates_the_previous_foreground() {
+        let (mut s, calls) =
+            test_state_candidate_and_foreground(candidate_window(9), Some(foreground_window(5)));
+        dwell_to_switch(&mut s);
+        assert_eq!(*calls.lock().unwrap(), vec![9]);
+
+        // Undo 1 s after the switch: well inside the default undo_ms (5000).
+        drive(&mut s, EngineCommand::UndoSwitch, 2100);
+        assert_eq!(*calls.lock().unwrap(), vec![9, 5]);
+        assert!(s.undo_stack.is_empty(), "the entry was popped");
+    }
+
+    #[test]
+    fn undo_command_after_window_discards_and_reports_nothing() {
+        let (mut s, calls) =
+            test_state_candidate_and_foreground(candidate_window(9), Some(foreground_window(5)));
+        dwell_to_switch(&mut s);
+        // Default undo_ms is 5000: at 7000 the entry is expired.
+        drive(&mut s, EngineCommand::UndoSwitch, 1100 + 5900);
+        assert_eq!(*calls.lock().unwrap(), vec![9], "no undo activation");
+        assert!(s.undo_stack.is_empty(), "expired entry was discarded");
+    }
+
+    #[test]
+    fn undo_without_enumerable_foreground_is_a_no_op_pop() {
+        // Foreground not enumerable (None): the switch still activates and
+        // pushes, but undo pops without calling the activator again.
+        let (mut s, calls) = test_state_candidate_and_foreground(candidate_window(9), None);
+        dwell_to_switch(&mut s);
+        assert_eq!(s.undo_stack[0].previous_foreground_id, None);
+        drive(&mut s, EngineCommand::UndoSwitch, 1500);
+        assert_eq!(*calls.lock().unwrap(), vec![9], "undo stayed a no-op");
+        assert!(s.undo_stack.is_empty());
+    }
+
+    #[test]
+    fn emergency_stop_suspends_clears_undo_and_expires_after_5s() {
+        let (mut s, calls) =
+            test_state_candidate_and_foreground(candidate_window(9), Some(foreground_window(5)));
+        dwell_to_switch(&mut s);
+        assert_eq!(s.undo_stack.len(), 1);
+
+        // Emergency at 1200: lock until 6200, stack cleared.
+        drive(&mut s, EngineCommand::EmergencyStop, 1200);
+        assert_eq!(s.emergency_until, Some(1200 + EMERGENCY_LOCK_MS));
+        assert!(s.undo_stack.is_empty(), "emergency clears the undo stack");
+
+        // Undo during the lock: no-op even if an entry existed.
+        drive(&mut s, EngineCommand::UndoSwitch, 1300);
+        assert_eq!(*calls.lock().unwrap(), vec![9]);
+
+        // While the lock is up the dwell machine is force-suspended: the
+        // halo over the same candidate renders Suspended and never switches.
+        let (visual, _, snap) = step(&mut s, Some(sample(1400, true, 0.0, 0.0)), 1400, false);
+        assert_eq!(visual, HaloVisual::Suspended);
+        assert_eq!(snap.candidate, None, "no candidate under the lock");
+        let (visual, _, _) = step(&mut s, Some(sample(6000, true, 0.0, 0.0)), 6000, false);
+        assert_eq!(visual, HaloVisual::Suspended, "still locked at 6000 < 6200");
+
+        // After the deadline the machine is usable again: a fresh settle
+        // starts (idle renders, no carried-over dwell).
+        let (visual, _, _) = step(&mut s, Some(sample(6300, true, 0.0, 0.0)), 6300, false);
+        assert_eq!(visual, HaloVisual::Idle);
+        // …and needs the full settle+dwell again (switch only at 6300+150+900).
+        let (visual, _, snap) = step(&mut s, None, 6300 + 150, false);
+        assert_eq!(visual, HaloVisual::Candidate { progress: 0.0 });
+        assert_eq!(snap.phase_str, "candidate");
+        let (_, _, snap) = step(&mut s, None, 6300 + 1050, false);
+        assert_eq!(snap.phase_str, "switched");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![9, 9],
+            "second switch activated"
+        );
+    }
+
+    #[test]
+    fn constants_and_config_carry_the_p3_fields() {
+        assert_eq!(EMERGENCY_LOCK_MS, 5000);
+        assert_eq!(UNDO_STACK_MAX, 8);
     }
 }

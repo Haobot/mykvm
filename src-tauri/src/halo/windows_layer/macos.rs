@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 
-use core_foundation::base::{CFRelease, CFType, TCFType};
+use core_foundation::base::{CFRelease, CFRetain, CFType, TCFType};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
@@ -187,10 +187,14 @@ unsafe fn ns_app_names_by_pid() -> HashMap<u32, String> {
 // Accessibility title fallback
 // ---------------------------------------------------------------------------
 
-/// One AX window: global frame plus its title.
-struct AxWindow {
-    frame: CGRect,
-    title: String,
+/// One AX window: global frame, its title, and the AX element (+1 retained —
+/// every caller must `CFRelease` it, including the enumerate path that only
+/// reads frame/title). Retaining here lets the activator keep a matched
+/// element alive past this list's lifetime to perform `AXRaise` on it.
+pub(crate) struct AxWindow {
+    pub(crate) frame: CGRect,
+    pub(crate) title: String,
+    pub(crate) element: AxElement,
 }
 
 /// Copy one AX attribute value (+1, caller must `CFRelease`), `None` on
@@ -259,7 +263,8 @@ fn ax_size(element: AxElement) -> Option<CGSize> {
 
 /// Every AX window of one application (pid), or an empty list when the app
 /// exposes no accessibility windows (or hangs past the messaging timeout).
-fn ax_windows_for_pid(pid: u32) -> Vec<AxWindow> {
+/// Each returned window carries a +1 element reference (see [`AxWindow`]).
+pub(crate) fn ax_windows_for_pid(pid: u32) -> Vec<AxWindow> {
     unsafe {
         let application = AXUIElementCreateApplication(pid as i32);
         if application.is_null() {
@@ -279,12 +284,16 @@ fn ax_windows_for_pid(pid: u32) -> Vec<AxWindow> {
                     continue;
                 };
                 let title = ax_string_attribute(element, "AXTitle").unwrap_or_default();
+                // Get-rule element from the array: retain it so the +1 field
+                // contract holds after `CFRelease(list)` below.
+                CFRetain(element);
                 windows.push(AxWindow {
                     frame: CGRect {
                         origin: position,
                         size,
                     },
                     title,
+                    element,
                 });
             }
             // AXUIElementCopyAttributeValue handed us a +1 array.
@@ -295,7 +304,41 @@ fn ax_windows_for_pid(pid: u32) -> Vec<AxWindow> {
     }
 }
 
-fn frames_match(a: CGRect, b: CGRect) -> bool {
+/// (CGWindowNumber, owner pid, bounds) for every on-screen window, no
+/// filtering: the activator looks window ids up by exact number and only
+/// needs pid + frame from this raw pass.
+pub(crate) fn cg_window_table() -> Result<Vec<(u64, u32, CGRect)>, String> {
+    let array = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
+        .ok_or_else(|| "CGWindowListCopyWindowInfo returned no array".to_string())?;
+    let mut out = Vec::new();
+    unsafe {
+        let array_ref = array.as_concrete_TypeRef();
+        let count = CFArrayGetCount(array_ref as CfArrayRef).max(0);
+        for index in 0..(count as usize).min(RAW_CANDIDATE_CAP) {
+            let pointer = CFArrayGetValueAtIndex(array_ref as CfArrayRef, index as isize);
+            if pointer.is_null() {
+                continue;
+            }
+            let dict = WindowDict::wrap_under_get_rule(pointer.cast());
+            let Some(id) = cf_number_u32(&dict, kCGWindowNumber) else {
+                continue;
+            };
+            let Some(pid) = cf_number_i32(&dict, kCGWindowOwnerPID) else {
+                continue;
+            };
+            if pid <= 0 {
+                continue;
+            }
+            let Some(frame) = cf_bounds(&dict) else {
+                continue;
+            };
+            out.push((id as u64, pid as u32, frame));
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn frames_match(a: CGRect, b: CGRect) -> bool {
     (a.origin.x - b.origin.x).abs() <= AX_FRAME_EPSILON
         && (a.origin.y - b.origin.y).abs() <= AX_FRAME_EPSILON
         && (a.size.width - b.size.width).abs() <= AX_FRAME_EPSILON
@@ -447,6 +490,11 @@ impl RawEnumerator for MacOSWindowService {
                     {
                         raw[index].title = ax.title.clone();
                     }
+                }
+                // The enumerate path only read frame/title: release every
+                // retained element (see AxWindow's +1 contract).
+                for ax in &ax_windows {
+                    CFRelease(ax.element);
                 }
             }
 

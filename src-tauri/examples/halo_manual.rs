@@ -7,6 +7,8 @@
 //!        [diameter] [resize_to resize_after_ms]
 //!   cargo run --example halo_manual -- border x y w h [clear_after_ms]
 //!   cargo run --example halo_manual -- clear
+//!   cargo run --example halo_manual -- windows
+//!   cargo run --example halo_manual -- activate <window_id>
 //!
 //! Examples:
 //!   halo_manual 756 491 idle 160            # static ring at screen center
@@ -14,12 +16,15 @@
 //!   halo_manual 400 300 candidate 160       # dwell-progress arc
 //!   halo_manual border 200 150 800 500      # breathing border around a rect
 //!   halo_manual border 200 150 800 500 6000 # ...auto-clear after 6 s
+//!   halo_manual windows                     # P2 window enumeration
+//!   halo_manual activate 12345              # P3 activate the window with
+//!                                           # id from `windows` output
 //!
 //! The process just pumps the main run loop; Ctrl-C exits.
 
 use mykvm_lib::halo::{
-    create_window_service, BorderFrame, FocusHaloSettings, HaloRuntime, HaloVisual,
-    OverlayScreenGeometry,
+    create_activator, create_window_service, BorderFrame, FocusHaloSettings, HaloRuntime,
+    HaloVisual, OverlayScreenGeometry,
 };
 
 #[cfg(target_os = "macos")]
@@ -62,6 +67,10 @@ fn main() {
     match args.iter().nth(1).map(String::as_str) {
         Some("windows") => {
             run_windows_subcommand();
+            return;
+        }
+        Some("activate") => {
+            run_activate_subcommand(&args);
             return;
         }
         Some("border") => {
@@ -358,6 +367,30 @@ fn run_windows_subcommand() {
     {
         eprintln!("window enumeration is not available on this platform yet");
         std::process::exit(2);
+    }
+}
+
+/// `halo_manual activate <id>` (appended): P3 activation verification rig.
+/// Runs the platform activator once against the given window id (take ids
+/// from the `windows` subcommand output) and prints the outcome. This steals
+/// focus on purpose — it is the real-machine check for the dwell-switch path.
+fn run_activate_subcommand(args: &[String]) {
+    let Some(window_id) = args.get(2).and_then(|value| value.parse::<u64>().ok()) else {
+        eprintln!("usage: halo_manual activate <window_id>");
+        std::process::exit(2);
+    };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        init_nsapp();
+    }
+    let mut activator = create_activator();
+    let outcome = activator.activate(window_id);
+    println!(
+        "activate {window_id}: activated={} fell_back={} detail={}",
+        outcome.activated, outcome.fell_back, outcome.detail
+    );
+    if !outcome.activated {
+        std::process::exit(1);
     }
 }
 
