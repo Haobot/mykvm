@@ -2895,6 +2895,14 @@ pub(crate) fn handle_input_datagram_with_sink(
         return handle_control_packet(&layout, packet, source, &local_peer_id, sink);
     }
 
+    // P4 cross-machine focus: the last schema in the decode chain. A halo
+    // focus packet is consumed here (authorized + dispatched to the halo
+    // runtime's passive highlight) and returns true so the caller counts it
+    // as a transport packet; anything still undecoded stays a silent drop.
+    if crate::halo::focus_router::try_dispatch_received_focus(layout_state, payload) {
+        return true;
+    }
+
     false
 }
 

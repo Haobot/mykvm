@@ -14,10 +14,12 @@
 pub mod activator;
 pub mod engine;
 pub mod filter;
+pub mod focus_router;
 pub mod input_probe;
 pub mod mapping;
 pub mod overlay;
 pub mod params;
+pub mod protocol;
 pub mod state_machine;
 pub mod tracker;
 pub mod windows_layer;
@@ -25,23 +27,52 @@ pub mod windows_layer;
 pub use activator::{create_activator, ActivationOutcome, WindowActivator};
 pub use engine::{spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase};
 pub use filter::OneEuroFilter;
+pub use focus_router::{
+    apply_focus_event, install_receive_hook, BoardScreen, FocusDisplayOutcome, FocusEmission,
+    FocusForwarder, FocusPhase, FocusRouter, FocusScreen, Observation,
+};
 pub use input_probe::{InputActivityProbe, NullProbe, SystemInputProbe};
 pub use mapping::{map_pose, CalibrationProfile};
 pub use overlay::{BorderFrame, HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
 pub use params::FocusHaloSettings;
+pub use protocol::{
+    decode_halo_focus_packet, FocusSender, HaloFocusEvent, HaloFocusPacket, HALO_FOCUS_PROTOCOL,
+};
 pub use state_machine::{
     advance as advance_dwell, DwellConfig, DwellPhase, DwellState, SwitchEvent,
 };
 pub use tracker::{default_models_dir, Frame, HeadSample, PoseEngine};
 pub use windows_layer::{create_window_service, WindowInfo, WindowService};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tracker::camera::CameraControl;
+
+/// How long a remote-focus highlight stays on screen without a refresh
+/// heartbeat from the sender. The sender refreshes identical state at 1 Hz
+/// (protocol::UNCHANGED_REFRESH), so the timeout is 5x that: a highlight
+/// survives lost refresh packets, and a sender that dies mid-dwell still
+/// clears within seconds.
+const REMOTE_HIGHLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Remote-highlight overlay state, shared with the auto-clear watcher
+/// threads so a highlight can expire without holding the halo Mutex. Only
+/// ever populated while the tracking pipeline is disabled: `enable` releases
+/// it first, because both platform backends must not have two live instances
+/// fighting for the same overlay window.
+#[derive(Default)]
+struct RemoteHighlightUi {
+    overlay: Option<Box<dyn OverlayBackend>>,
+    /// halo_diameter the overlay was built with (rebuilt on change).
+    built_diameter: f64,
+    /// Border currently shown; `None` after a clear or watcher expiry, which
+    /// is what makes an identical re-show draw again.
+    border: Option<BorderFrame>,
+}
 
 /// Cap of the sample channel between the tracker and the engine. The engine
 /// drains it every tick (60 Hz), so the cap only guards against a short
@@ -127,6 +158,13 @@ pub struct HaloRuntime {
     camera_ok: bool,
     /// Last enable failure reason, surfaced by `halo_get_status`.
     last_error: Option<String>,
+    /// P4 passive peer display: the border highlight shown when a remote
+    /// halo-sender points at this machine. Shared with watcher threads (see
+    /// [`RemoteHighlightUi`]).
+    remote_ui: Arc<Mutex<RemoteHighlightUi>>,
+    /// Generation counter of remote highlights; watcher threads compare it
+    /// before clearing so a newer highlight survives an older timer.
+    remote_seq: Arc<AtomicU64>,
 }
 
 impl HaloRuntime {
@@ -147,6 +185,8 @@ impl HaloRuntime {
             latest_raw_pose: Arc::new(Mutex::new(None)),
             camera_ok: false,
             last_error: None,
+            remote_ui: Arc::new(Mutex::new(RemoteHighlightUi::default())),
+            remote_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -190,6 +230,11 @@ impl HaloRuntime {
         screen: OverlayScreenGeometry,
     ) -> Result<(), String> {
         let settings = settings.sanitized();
+        // A remote-focus highlight window (if any) must be gone before the
+        // engine builds its own overlay: the platform backends share one
+        // overlay window per process, and the engine needs exclusive
+        // ownership of it.
+        self.release_remote_overlay();
         if self.is_running() {
             // Idempotent re-enable: forward instead of restarting the camera.
             self.settings = settings;
@@ -351,6 +396,9 @@ impl HaloRuntime {
         self.engine_debug_rx = None;
         self.overlay = None;
         self.built_diameter = 0.0;
+        // Return to zero windows: the remote-highlight overlay (if any was
+        // shown while running, which show_remote_highlight refuses) goes too.
+        self.release_remote_overlay();
         if let Ok(mut latest) = self.latest_raw_pose.lock() {
             *latest = None;
         }
@@ -496,6 +544,116 @@ impl HaloRuntime {
         }
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.hide();
+        }
+    }
+
+    /// P4 passive peer display: show (or refresh) the border highlight a
+    /// remote halo-sender pointed at. `frame` is in layout-board logical
+    /// coordinates and `geometry` is the screen the highlight window should
+    /// live on (the screen the sender aimed at, resolved by the caller).
+    ///
+    /// Works while the tracking pipeline is disabled — the normal state of a
+    /// machine being controlled. While running it returns false (the engine
+    /// owns the overlay visuals and a remote border would fight its 60 Hz
+    /// updates). Returns true when the border was drawn/changed; false means
+    /// "unchanged", letting callers skip redundant logging.
+    ///
+    /// A watcher thread auto-clears the border after
+    /// [`REMOTE_HIGHLIGHT_TIMEOUT`] unless a newer highlight arrived first
+    /// (generation check), so a sender that dies mid-dwell cannot leave a
+    /// stale highlight behind. An identical refresh (the sender's 1 Hz
+    /// heartbeat) does not redraw, but it does re-arm the watcher: a
+    /// continuous dwell keeps the highlight alive instead of flickering off
+    /// every timeout.
+    pub fn show_remote_highlight(
+        &mut self,
+        frame: BorderFrame,
+        geometry: OverlayScreenGeometry,
+    ) -> bool {
+        if self.is_running() || !overlay::overlay_supported() {
+            return false;
+        }
+        let unchanged;
+        let generation;
+        {
+            let Ok(mut ui) = self.remote_ui.lock() else {
+                return false;
+            };
+            unchanged = ui.border == Some(frame);
+            if !unchanged {
+                let diameter = self.settings.halo_diameter;
+                let needs_build =
+                    ui.overlay.is_none() || (ui.built_diameter - diameter).abs() > f64::EPSILON;
+                if needs_build {
+                    ui.overlay = Some(overlay::create_overlay(&self.settings));
+                    ui.built_diameter = diameter;
+                }
+                if let Some(overlay) = ui.overlay.as_mut() {
+                    overlay.set_screen(geometry);
+                    overlay.set_border(Some(frame));
+                }
+                ui.border = Some(frame);
+            }
+            // Bump the generation on every accepted refresh so the expiring
+            // watcher is retired, and a fresh lease starts below.
+            // `fetch_add` returns the previous value; +1 is this lease's
+            // generation, read atomically with the bump.
+            generation = self.remote_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        }
+        let ui = Arc::clone(&self.remote_ui);
+        let seq = Arc::clone(&self.remote_seq);
+        let spawn_result = std::thread::Builder::new()
+            .name("halo-remote-clear".into())
+            .spawn(move || {
+                std::thread::sleep(REMOTE_HIGHLIGHT_TIMEOUT);
+                if seq.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if let Ok(mut ui) = ui.lock() {
+                    // Recheck under the lock: a highlight that raced in just
+                    // before we took it must survive this watcher.
+                    if seq.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    if let Some(overlay) = ui.overlay.as_mut() {
+                        overlay.set_border(None);
+                    }
+                    ui.border = None;
+                    log::info!(
+                        "halo focus: remote highlight expired after {REMOTE_HIGHLIGHT_TIMEOUT:?}"
+                    );
+                }
+            });
+        if spawn_result.is_err() {
+            log::warn!("halo focus: failed to spawn remote-highlight watcher; highlight will not auto-clear");
+        }
+        !unchanged
+    }
+
+    /// P4 passive peer display: drop the remote border highlight immediately
+    /// (a Clear arrived, or the caller is tearing the display down).
+    /// Pending watcher threads become no-ops via the generation bump.
+    pub fn clear_remote_highlight(&mut self) {
+        // Invalidate any pending watcher first so it cannot resurrect the
+        // border after we cleared it.
+        self.remote_seq.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut ui) = self.remote_ui.lock() {
+            if ui.border.take().is_some() {
+                if let Some(overlay) = ui.overlay.as_mut() {
+                    overlay.set_border(None);
+                }
+            }
+        }
+    }
+
+    /// Drop the remote-highlight overlay window entirely (enable/teardown
+    /// path): dropping the backend closes the window, and the freed platform
+    /// singleton lets the engine build its own overlay.
+    fn release_remote_overlay(&mut self) {
+        self.clear_remote_highlight();
+        if let Ok(mut ui) = self.remote_ui.lock() {
+            ui.overlay = None;
+            ui.built_diameter = 0.0;
         }
     }
 }
@@ -647,6 +805,63 @@ mod tests {
         runtime.hide();
         // Still inert: the factory returned a NoopBackend, nothing to assert
         // beyond "did not panic".
+    }
+
+    #[test]
+    fn remote_highlight_draws_dedupes_and_clears() {
+        let mut runtime = HaloRuntime::new();
+        let geometry = OverlayScreenGeometry {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 500.0,
+            scale: 1.0,
+            native_x: 0.0,
+            native_y: 0.0,
+        };
+        let frame = BorderFrame {
+            x: 40.0,
+            y: 30.0,
+            w: 300.0,
+            h: 200.0,
+        };
+        if !overlay::overlay_supported() {
+            // Unsupported platforms: an honest no-op that reports false.
+            assert!(!runtime.show_remote_highlight(frame, geometry));
+            runtime.clear_remote_highlight();
+            runtime.disable();
+            return;
+        }
+        assert!(
+            runtime.show_remote_highlight(frame, geometry),
+            "first highlight draws"
+        );
+        assert!(
+            !runtime.show_remote_highlight(frame, geometry),
+            "identical refresh dedupes (sender heartbeat)"
+        );
+        let moved = BorderFrame {
+            x: 40.0,
+            y: 30.0,
+            w: 320.0,
+            h: 200.0,
+        };
+        assert!(
+            runtime.show_remote_highlight(moved, geometry),
+            "a changed frame redraws"
+        );
+        runtime.clear_remote_highlight();
+        assert!(
+            runtime.show_remote_highlight(frame, geometry),
+            "after a clear the same frame draws again (watcher had reset the state)"
+        );
+        // disable() releases the remote overlay; showing again rebuilds it.
+        runtime.disable();
+        assert!(
+            runtime.show_remote_highlight(frame, geometry),
+            "highlight works after a disable/enable cycle"
+        );
+        runtime.clear_remote_highlight();
     }
 
     #[test]

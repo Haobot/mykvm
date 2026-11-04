@@ -9,6 +9,7 @@
 //!   cargo run --example halo_manual -- clear
 //!   cargo run --example halo_manual -- windows
 //!   cargo run --example halo_manual -- activate <window_id>
+//!   cargo run --example halo_manual -- focus-receive <kind> <screen_id> <x> <y>
 //!
 //! Examples:
 //!   halo_manual 756 491 idle 160            # static ring at screen center
@@ -19,12 +20,17 @@
 //!   halo_manual windows                     # P2 window enumeration
 //!   halo_manual activate 12345              # P3 activate the window with
 //!                                           # id from `windows` output
+//!   halo_manual focus-receive candidate screen-0 700 300
+//!                                           # P4: simulate a remote halo
+//!                                           # event through the real
+//!                                           # receive path (no second
+//!                                           # machine needed)
 //!
 //! The process just pumps the main run loop; Ctrl-C exits.
 
 use mykvm_lib::halo::{
-    create_activator, create_window_service, BorderFrame, FocusHaloSettings, HaloRuntime,
-    HaloVisual, OverlayScreenGeometry,
+    apply_focus_event, create_activator, create_window_service, BorderFrame, FocusHaloSettings,
+    FocusScreen, HaloFocusEvent, HaloRuntime, HaloVisual, OverlayScreenGeometry,
 };
 
 #[cfg(target_os = "macos")]
@@ -79,6 +85,10 @@ fn main() {
         }
         Some("clear") => {
             run_border_clear();
+            return;
+        }
+        Some("focus-receive") => {
+            run_focus_receive_subcommand(&args);
             return;
         }
         _ => {}
@@ -367,6 +377,106 @@ fn run_windows_subcommand() {
     {
         eprintln!("window enumeration is not available on this platform yet");
         std::process::exit(2);
+    }
+}
+
+/// `halo_manual focus-receive <kind> <screen_id> <x> <y>` (appended): P4
+/// receive-side verification rig. Simulates one remote halo focus event and
+/// runs it through the exact same processing function the app's receive hook
+/// uses (apply_focus_event): screen selection, window hit-test, passive
+/// border highlight (auto-cleared by the runtime's 5 s watcher) and, for
+/// `activate`, window activation. Coordinates are board/global logical
+/// points; screen ids here are the synthesized `screen-<index>` of the
+/// locally attached displays, and a point inside a display also resolves by
+/// containment, so any on-screen coordinate works.
+fn run_focus_receive_subcommand(args: &[String]) {
+    let kind = args.get(2).map(String::as_str).unwrap_or("");
+    let screen_id = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "screen-0".to_string());
+    let parse_point = |index: usize, fallback: f64| -> f64 {
+        args.get(index)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(fallback)
+    };
+    let x = parse_point(4, 0.0);
+    let y = parse_point(5, 0.0);
+    let event = match kind {
+        "edge" => HaloFocusEvent::Edge {
+            screen_id: screen_id.clone(),
+            x,
+            y,
+        },
+        "candidate" => HaloFocusEvent::Candidate {
+            screen_id: screen_id.clone(),
+            x,
+            y,
+        },
+        "activate" => HaloFocusEvent::Activate {
+            screen_id: screen_id.clone(),
+            x,
+            y,
+        },
+        "clear" => HaloFocusEvent::Clear,
+        _ => {
+            eprintln!("usage: halo_manual focus-receive <edge|candidate|activate|clear> <screen_id> <x> <y>");
+            std::process::exit(2);
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        init_nsapp();
+    }
+    let screens: Vec<FocusScreen> = subcommand_screen_geometries()
+        .into_iter()
+        .enumerate()
+        .map(|(index, geometry)| FocusScreen {
+            id: format!("screen-{index}"),
+            geometry,
+        })
+        .collect();
+    if screens.is_empty() {
+        eprintln!("no screens detected; cannot simulate focus receive");
+        std::process::exit(2);
+    }
+    let geometries: Vec<OverlayScreenGeometry> =
+        screens.iter().map(|screen| screen.geometry).collect();
+    println!(
+        "halo_manual focus-receive: kind={kind} screen={screen_id} point=({x},{y}) screens={}",
+        screens.len()
+    );
+    let mut runtime = HaloRuntime::new();
+    let mut windows = create_window_service(&geometries);
+    let mut activator = create_activator();
+    let outcome = apply_focus_event(
+        &event,
+        &mut runtime,
+        &screens,
+        &mut *windows,
+        &mut *activator,
+    );
+    println!(
+        "outcome: kind={} window={:?} highlighted={} activated={} {}",
+        outcome.kind, outcome.window_title, outcome.highlighted, outcome.activated, outcome.detail
+    );
+    if kind != "clear" {
+        println!(
+            "highlight auto-clears after 5 s; keep the process running (Ctrl-C exits) to watch it"
+        );
+    }
+    // Keep pumping so the overlay's async blocks execute and the runtime's
+    // watcher thread can clear the highlight on schedule.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        run_main_loop();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        loop {
+            std::thread::park();
+        }
     }
 }
 

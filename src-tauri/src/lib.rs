@@ -930,8 +930,28 @@ impl AppRuntime {
         let pairing_challenge_for_stream = Arc::clone(&self.pairing_challenge);
         let config_path_for_pairing = self.config_path.clone();
         let peers_for_pairing = Arc::clone(&self.peers);
+        let layout_for_halo_focus = Arc::clone(&self.layout);
+        let transport_packets_for_halo_focus = Arc::clone(&self.transport_packets);
+
+        // P4 cross-machine focus: install the receive hook once at transport
+        // startup. The hook is the only place that turns an authorized halo
+        // focus packet into UI work (window hit-test + passive highlight),
+        // because the input datagram chain has no AppHandle.
+        {
+            let app_handle_for_halo = self.app_handle.clone();
+            let _ = halo::focus_router::install_receive_hook(Box::new(move |packet| {
+                handle_remote_halo_focus(&app_handle_for_halo, packet);
+            }));
+        }
 
         let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
+            // Halo focus packets are display-only: a machine in controller
+            // mode (input_receive_enabled == false) must still show the
+            // remote highlight, so they are consumed before the receive gate.
+            if halo::focus_router::try_dispatch_received_focus(&layout_for_halo_focus, &payload) {
+                transport_packets_for_halo_focus.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if !input_receive_enabled.load(Ordering::Relaxed) {
                 return;
             }
@@ -1883,6 +1903,93 @@ fn halo_tracking_geometry(state: &AppRuntime) -> Result<halo::OverlayScreenGeome
     })
 }
 
+/// All of this machine's screens as focus-display screens (P4 receive side):
+/// layout-board ids preserved so a remote landing `screen_id` can select the
+/// right overlay host screen.
+fn halo_focus_screens(layout: &LayoutState) -> Vec<halo::FocusScreen> {
+    layout
+        .devices
+        .iter()
+        .filter(|device| device.role == "local")
+        .flat_map(|device| device.screens.iter())
+        .map(|screen| {
+            let (native_x, native_y) = halo_native_origin(screen);
+            halo::FocusScreen {
+                id: screen.id.clone(),
+                geometry: halo::OverlayScreenGeometry {
+                    x: screen.x as f64,
+                    y: screen.y as f64,
+                    width: screen.width as f64,
+                    height: screen.height as f64,
+                    scale: screen.scale,
+                    native_x,
+                    native_y,
+                },
+            }
+        })
+        .collect()
+}
+
+/// P4 receive hook (installed at transport startup): apply one authorized
+/// remote halo focus event to this machine's passive display. Lock order
+/// follows the repo contract: the layout lock is taken alone for the screen
+/// snapshot and released before the halo lock; window enumeration and
+/// activation run after both locks are gone.
+fn handle_remote_halo_focus(app: &AppHandle, packet: &halo::HaloFocusPacket) {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return;
+    };
+    let focus_screens = match state.layout.lock() {
+        Ok(layout) => halo_focus_screens(&layout),
+        Err(_) => {
+            log::warn!(
+                "halo focus: layout lock poisoned; dropping packet from {}",
+                packet.source_device_id
+            );
+            return;
+        }
+    };
+    if focus_screens.is_empty() {
+        log::warn!("halo focus: no local screens detected; cannot display highlight");
+        return;
+    }
+    let geometries: Vec<halo::OverlayScreenGeometry> =
+        focus_screens.iter().map(|screen| screen.geometry).collect();
+    let mut halo = match state.halo.lock() {
+        Ok(halo) => halo,
+        Err(_) => {
+            log::warn!(
+                "halo focus: halo lock poisoned; dropping packet from {}",
+                packet.source_device_id
+            );
+            return;
+        }
+    };
+    match &packet.event {
+        halo::HaloFocusEvent::Clear => {
+            halo.clear_remote_highlight();
+            log::info!(
+                "halo focus: clear highlight (from {})",
+                packet.source_device_id
+            );
+        }
+        event => {
+            // A fresh window service per event: remote focus traffic is
+            // state-change-only plus a 1 Hz refresh, so the enumeration
+            // cost (a few ms) is negligible and no cache outlives the event.
+            let mut windows = halo::create_window_service(&geometries);
+            let mut activator = halo::create_activator();
+            let _outcome = halo::apply_focus_event(
+                event,
+                &mut halo,
+                &focus_screens,
+                &mut *windows,
+                &mut *activator,
+            );
+        }
+    }
+}
+
 /// Snapshot the sanitized settings from the stored layout (lock acquired and
 /// released alone; never nested with the halo lock).
 fn halo_settings_snapshot(state: &AppRuntime) -> halo::FocusHaloSettings {
@@ -2172,6 +2279,11 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
     let spawn_result = std::thread::Builder::new()
         .name("halo-debug-pump".into())
         .spawn(move || {
+            // P4 send side: the focus router + throttle live on this thread.
+            // The pump is the only consumer of engine telemetry, so the
+            // cross-machine decision state has a single owner and no locks.
+            let mut focus_forwarder = halo::FocusForwarder::new();
+            let mut focus_last_logged_kind = String::new();
             loop {
                 // try_state returns None while the app is being torn down;
                 // holding the AppHandle clone does not block exit (the event
@@ -2189,6 +2301,12 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
                     runtime.drain_debug().pop()
                 };
                 if let Some(snapshot) = snapshot {
+                    halo_focus_pump_tick(
+                        state.inner(),
+                        &snapshot,
+                        &mut focus_forwarder,
+                        &mut focus_last_logged_kind,
+                    );
                     let _ = handle.emit(HALO_DEBUG_EVENT, snapshot);
                 }
                 drop(state);
@@ -2198,6 +2316,156 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
         });
     if spawn_result.is_err() {
         HALO_DEBUG_PUMP_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Event kind of a halo focus event, for rate-aware logging.
+fn halo_focus_event_kind(event: &halo::HaloFocusEvent) -> &'static str {
+    match event {
+        halo::HaloFocusEvent::Edge { .. } => "edge",
+        halo::HaloFocusEvent::Candidate { .. } => "candidate",
+        halo::HaloFocusEvent::Activate { .. } => "activate",
+        halo::HaloFocusEvent::Clear => "clear",
+    }
+}
+
+/// P4 send side, driven from the debug pump (5 Hz): route one engine
+/// snapshot through the focus router + throttle and, when a state change
+/// survives, emit the halo focus packet to the aimed peer over the QUIC
+/// datagram transport. Errors are logged, never propagated: telemetry must
+/// not take the tracking pipeline down.
+fn halo_focus_pump_tick(
+    state: &AppRuntime,
+    snapshot: &halo::DebugSnapshot,
+    forwarder: &mut halo::FocusForwarder,
+    last_logged_kind: &mut String,
+) {
+    // Layout snapshot under try_lock only: the pump must never stall behind
+    // a busy layout writer (save/discovery hold it briefly).
+    let Ok(layout) = state.layout.try_lock() else {
+        return;
+    };
+    let Some(local) = layout.devices.iter().find(|device| device.role == "local") else {
+        return;
+    };
+    // The engine tracks the local primary screen (halo_tracking_geometry);
+    // its board rect is what the norm coordinates are relative to.
+    let Some(local_screen) = local
+        .screens
+        .iter()
+        .find(|screen| screen.is_primary)
+        .or_else(|| local.screens.first())
+    else {
+        return;
+    };
+    let local_board = halo::BoardScreen {
+        id: local_screen.id.clone(),
+        device_id: local.id.clone(),
+        x: local_screen.x as f64,
+        y: local_screen.y as f64,
+        width: local_screen.width as f64,
+        height: local_screen.height as f64,
+    };
+    let peer_screens: Vec<halo::BoardScreen> = layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local" && device.online)
+        .flat_map(|device| {
+            device.screens.iter().map(move |screen| halo::BoardScreen {
+                id: screen.id.clone(),
+                device_id: device.id.clone(),
+                x: screen.x as f64,
+                y: screen.y as f64,
+                width: screen.width as f64,
+                height: screen.height as f64,
+            })
+        })
+        .collect();
+    let observation = halo::Observation {
+        norm: (snapshot.norm_x, snapshot.norm_y),
+        phase: halo::FocusPhase::from_phase_str(snapshot.phase_str),
+        local_screen: local_board,
+        peer_screens: &peer_screens,
+    };
+    let Some((event, seq, target_device_id)) = forwarder.observe(&observation) else {
+        return;
+    };
+    // Resolve the target device and credentials while the layout guard is
+    // held, then drop it before any transport work.
+    let target = layout
+        .devices
+        .iter()
+        .find(|device| device.id == target_device_id && device.role != "local")
+        .cloned();
+    let source_device_id = local_peer_from_layout(&layout).id;
+    let cluster_id = layout.cluster_id.clone();
+    let pair_secret = layout.pair_secret.clone();
+    drop(layout);
+
+    let kind = halo_focus_event_kind(&event);
+    let Some(target) = target else {
+        log::warn!(
+            "halo focus: aimed device {target_device_id} vanished from layout; dropped {kind}"
+        );
+        return;
+    };
+    if cluster_id.trim().is_empty() || pair_secret.trim().is_empty() {
+        return; // unpaired: no credentials to authorize with, stay silent
+    }
+    if !target.online || target.transport_public_key.trim().is_empty() {
+        return; // peer offline/unkeyed: the next state change retries
+    }
+    let packet = halo::HaloFocusPacket::new(source_device_id, cluster_id, pair_secret, event, seq);
+    let payload = match packet.encode() {
+        Ok(payload) => payload,
+        Err(error) => {
+            log::warn!("halo focus: {error}");
+            return;
+        }
+    };
+    let Some(transport) = state.quic_transport_handle() else {
+        return;
+    };
+    // Target resolution mirrors send_secure_attention_control.
+    let peer = transport.peer(
+        format!(
+            "{}:{}",
+            target.host,
+            normalize_quic_port(target.transport_port, target.quic_port)
+        ),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    match transport.send_datagram(peer, payload) {
+        Ok(true) => {
+            if *last_logged_kind != kind {
+                log::info!(
+                    "halo focus: sent {kind} to {} (seq {seq}, point {:?})",
+                    target.name,
+                    match &packet.event {
+                        halo::HaloFocusEvent::Edge { x, y, .. }
+                        | halo::HaloFocusEvent::Candidate { x, y, .. }
+                        | halo::HaloFocusEvent::Activate { x, y, .. } => Some((*x, *y)),
+                        halo::HaloFocusEvent::Clear => None,
+                    }
+                );
+                *last_logged_kind = kind.into();
+            } else {
+                log::debug!(
+                    "halo focus: refreshed {kind} heartbeat to {} (seq {seq})",
+                    target.name
+                );
+            }
+        }
+        Ok(false) => {
+            log::debug!(
+                "halo focus: peer {} reconnecting; {kind} dropped",
+                target.name
+            );
+        }
+        Err(error) => {
+            log::warn!("halo focus: send {kind} to {} failed: {error}", target.name);
+        }
     }
 }
 
