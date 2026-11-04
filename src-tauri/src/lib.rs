@@ -27,6 +27,7 @@ mod clipboard_exchange;
 #[cfg(any(target_os = "windows", test))]
 mod drag_buffer;
 mod folder_transfer;
+pub mod halo;
 #[cfg(target_os = "windows")]
 pub mod headless_client;
 mod input;
@@ -319,6 +320,11 @@ struct LayoutState {
     edge_switch_hotkey: String,
     #[serde(default)]
     screen_switch_hotkeys: ScreenSwitchHotkeys,
+    /// Frontend-owned FocusHalo settings: save_layout keeps these payload-driven
+    /// (only sanitized once before they hit disk), unlike the backend-owned
+    /// pairing fields merged by merge_runtime_owned_layout_fields.
+    #[serde(default)]
+    focus_halo: halo::FocusHaloSettings,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -669,6 +675,10 @@ struct AppRuntime {
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
+    /// P0 manual-test halo overlay; the P1 dwell engine will drive it later.
+    /// The overlay window is built lazily by the first show call, so a
+    /// disabled halo keeps the process thread-free.
+    halo: Mutex<halo::HaloRuntime>,
     #[cfg(target_os = "windows")]
     input_service_network_lease: Mutex<Option<std::fs::File>>,
 }
@@ -679,6 +689,7 @@ impl AppRuntime {
             .map(|saved_layout| normalize_saved_layout(saved_layout, detected_layout.clone()))
             .unwrap_or_else(|| detected_layout.clone());
         align_native_screen_ids(&mut detected_layout, &layout);
+        let halo_settings = layout.focus_halo.clone();
         let input_guard = SharedGuard::default();
         let notify_app = app_handle.clone();
         input_guard::set_notifier(
@@ -693,7 +704,7 @@ impl AppRuntime {
                 });
             }),
         );
-        Self {
+        let runtime = Self {
             app_handle,
             layout: Arc::new(Mutex::new(layout)),
             native_layout: Arc::new(Mutex::new(detected_layout.clone())),
@@ -726,9 +737,16 @@ impl AppRuntime {
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
             config_path,
+            halo: Mutex::new(halo::HaloRuntime::new()),
             #[cfg(target_os = "windows")]
             input_service_network_lease: Mutex::new(None),
+        };
+        // `layout` above already merged the on-disk config; seed the halo
+        // snapshot so the P0 test overlay follows the user's saved parameters.
+        if let Ok(mut halo) = runtime.halo.lock() {
+            halo.configure(halo_settings);
         }
+        runtime
     }
 
     fn snapshot(&self) -> AppStateSnapshot {
@@ -1645,6 +1663,10 @@ fn save_layout(
         saved_layout.input_protection = InputProtection::default();
         saved_layout.clipboard_on_demand = false;
         saved_layout.clipboard_paste_hotkey = default_clipboard_paste_hotkey();
+        // focus_halo is frontend-owned, so it travels with the incoming payload
+        // (no merge from `current`); a hand-edited snapshot must still be
+        // clamped back into range before it reaches disk or the overlay.
+        saved_layout.focus_halo = saved_layout.focus_halo.sanitized();
         validate_shared_hotkeys(&saved_layout)?;
         write_layout_to_disk(&state.config_path, &saved_layout)?;
         *stored_layout = saved_layout.clone();
@@ -1671,7 +1693,103 @@ fn save_layout(
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
     sync_clipboard_paste_shortcut(&state.app_handle)?;
+    // Halo parameters take effect immediately on save. `enabled` is irrelevant
+    // here: the overlay is created lazily by the first show call.
+    if let Ok(mut halo) = state.halo.lock() {
+        halo.configure(saved_layout.focus_halo.clone());
+    }
     Ok(state.snapshot())
+}
+
+/// Native global origin for a layout screen, matching the semantics of
+/// input.rs `platform_native_screen`: macOS CG global coordinates already are
+/// points (identity), while Windows wants physical pixel origins.
+#[cfg(target_os = "windows")]
+fn halo_native_origin(screen: &Screen) -> (f64, f64) {
+    let scale = if screen.scale.is_finite() && screen.scale > 0.0 {
+        screen.scale
+    } else {
+        1.0
+    };
+    (screen.x as f64 * scale, screen.y as f64 * scale)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn halo_native_origin(screen: &Screen) -> (f64, f64) {
+    (screen.x as f64, screen.y as f64)
+}
+
+/// P0 manual test hook: draw one halo frame on a detected local screen at a
+/// screen-local logical point. The configure call first refreshes the
+/// diameter/opacity snapshot so this entry point follows the user's settings.
+#[tauri::command]
+fn halo_test_overlay_show(
+    state: tauri::State<'_, AppRuntime>,
+    screen_id: String,
+    x: f64,
+    y: f64,
+    visual: String,
+    progress: Option<f32>,
+    diameter: Option<f64>,
+) -> Result<(), String> {
+    let native_layout = state.native_layout();
+    let screen = native_layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .and_then(|device| device.screens.iter().find(|screen| screen.id == screen_id))
+        .ok_or_else(|| format!("screen {screen_id} not found on this machine"))?;
+    let (native_x, native_y) = halo_native_origin(screen);
+    let geometry = halo::OverlayScreenGeometry {
+        x: screen.x as f64,
+        y: screen.y as f64,
+        width: screen.width as f64,
+        height: screen.height as f64,
+        scale: screen.scale,
+        native_x,
+        native_y,
+    };
+    let visual = match visual.as_str() {
+        "idle" => halo::HaloVisual::Idle,
+        "candidate" => halo::HaloVisual::Candidate {
+            progress: progress.unwrap_or(0.5).clamp(0.0, 1.0),
+        },
+        "pulse" => halo::HaloVisual::SwitchPulse,
+        "suspended" => halo::HaloVisual::Suspended,
+        other => return Err(format!("unknown halo visual: {other}")),
+    };
+    // Follow the settings the frontend currently holds (user-edited diameter,
+    // opacity, ...) before drawing; the halo lock must not be held while the
+    // layout lock is taken, so snapshot the settings first.
+    let mut settings = state
+        .layout
+        .lock()
+        .map_err(|_| "layout state lock poisoned".to_string())?
+        .focus_halo
+        .clone();
+    // Debug-only diameter override so the overlay's hot-resize path can be
+    // exercised without a saved-settings round trip.
+    if let Some(diameter) = diameter {
+        settings.halo_diameter = diameter;
+    }
+    let mut halo = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    halo.configure(settings);
+    halo.set_screen(geometry);
+    halo.show_test_halo((x, y), visual);
+    Ok(())
+}
+
+#[tauri::command]
+fn halo_test_overlay_hide(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?
+        .hide();
+    Ok(())
 }
 
 fn merge_runtime_owned_layout_fields(
@@ -3991,6 +4109,14 @@ pub fn run() {
             }));
             setup_single_instance_events(app.handle().clone());
 
+            // Dev builds show the main window at launch so overlay and capture
+            // work can be verified without hunting for the tray icon (release
+            // builds keep the tray-first behavior).
+            #[cfg(debug_assertions)]
+            if let Err(error) = show_main_window_handle(app.handle()) {
+                log::warn!("dev main-window auto-show failed: {error}");
+            }
+
             // Edge drag-drop (ShareMouse-style): the capture tap hands us drag
             // events as a local file drag crosses onto a controlled machine. A
             // Windows target gets a native OLE drag (icon + drop into any folder
@@ -4176,7 +4302,9 @@ pub fn run() {
             start_window_drag,
             open_repository_url,
             open_releases_url,
-            is_portable_mode
+            is_portable_mode,
+            halo_test_overlay_show,
+            halo_test_overlay_hide
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4688,6 +4816,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        focus_halo: halo::FocusHaloSettings::default(),
         devices: vec![Device {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
@@ -4737,6 +4866,7 @@ fn detect_fallback_layout() -> LayoutState {
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        focus_halo: halo::FocusHaloSettings::default(),
     }
 }
 
@@ -5062,6 +5192,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         modifier_map: normalize_modifier_map(&saved_layout.modifier_map),
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
         screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
+        focus_halo: saved_layout.focus_halo.clone(),
     }
 }
 
@@ -11082,6 +11213,7 @@ mod tests {
             modifier_map: default_modifier_map(),
             edge_switch_hotkey: default_edge_switch_hotkey(),
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+            focus_halo: halo::FocusHaloSettings::default(),
         }
     }
 

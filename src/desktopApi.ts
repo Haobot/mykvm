@@ -414,6 +414,44 @@ export async function isPortableMode(): Promise<boolean> {
   return invoke<boolean>('is_portable_mode')
 }
 
+export type HaloVisual = 'idle' | 'candidate' | 'pulse' | 'suspended'
+
+export interface HaloTestOverlayOptions {
+  screenId: string
+  /** Screen-local logical point (halo center). */
+  x: number
+  y: number
+  visual: HaloVisual
+  /** 0..1 progress arc, only used when visual === 'candidate'. */
+  progress?: number
+  /** Debug-only halo diameter override (logical px); exercises the hot-resize path. */
+  diameter?: number
+}
+
+// FocusHalo P0 debug entry: draw/hide one halo frame on a local screen.
+export async function haloTestOverlay(options: HaloTestOverlayOptions): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_test_overlay_show', {
+    screenId: options.screenId,
+    x: options.x,
+    y: options.y,
+    visual: options.visual,
+    progress: options.progress ?? null,
+    diameter: options.diameter ?? null,
+  })
+}
+
+export async function haloHideOverlay(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_test_overlay_hide')
+}
+
 export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
   if (!isTauri()) {
     return { available: false }

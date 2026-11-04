@@ -23,6 +23,29 @@ export interface ScreenSwitchHotkeys {
   down: string
 }
 
+/** Mirrors the Rust `halo::FocusHaloSettings` (serde camelCase). */
+export interface FocusHaloSettings {
+  enabled: boolean
+  dwellMs: number
+  settleMs: number
+  enterSpeed: number
+  cooldownMs: number
+  undoMs: number
+  deadZonePercent: number
+  gain: number
+  haloDiameter: number
+  haloOpacity: number
+  showProgress: boolean
+  switchZone: 'anywhere' | 'titlebar'
+  cameraPosition: 'top' | 'bottom'
+  keyboardSuspends: boolean
+  titleBlacklist: string[]
+  processBlacklist: string[]
+  emergencyStopHotkey: string
+  undoHotkey: string
+  recenterHotkey: string
+}
+
 export interface PairedController {
   id: string
   name: string
@@ -93,6 +116,7 @@ export interface LayoutState {
   modifierMap: ModifierMap
   edgeSwitchHotkey: string
   screenSwitchHotkeys: ScreenSwitchHotkeys
+  focusHalo?: FocusHaloSettings
 }
 
 export interface InputProtection {

@@ -10414,6 +10414,7 @@ mod tests {
             modifier_map: crate::default_modifier_map(),
             edge_switch_hotkey: crate::default_edge_switch_hotkey(),
             screen_switch_hotkeys: crate::ScreenSwitchHotkeys::default(),
+            focus_halo: crate::halo::FocusHaloSettings::default(),
         }
     }
 
