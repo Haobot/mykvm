@@ -128,6 +128,9 @@ const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
 const HELPER_PATH_ARG: &str = "--helper-path";
 const RUNTIME_STATE_EVENT: &str = "runtime-state-changed";
 const FILE_TRANSFER_PROGRESS_EVENT: &str = "file-transfer-progress";
+// FocusHalo P1 debug stream: one engine DebugSnapshot per emit, produced by
+// the 5 Hz pump thread spawned by halo_set_enabled.
+const HALO_DEBUG_EVENT: &str = "halo-debug";
 // Progress is emitted at most this often per file while sending (plus always on
 // completion) so a multi-GB transfer doesn't flood the webview with events.
 const FILE_TRANSFER_PROGRESS_INTERVAL_MS: u64 = 100;
@@ -569,6 +572,18 @@ struct FileTransferProgress {
     file_count: usize,
     done: bool,
     error: Option<String>,
+}
+
+/// FocusHalo runtime status for the settings UI (`halo_get_status`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HaloStatus {
+    /// Tracking pipeline (camera + tracker + engine threads) is running.
+    running: bool,
+    /// The camera session started successfully.
+    camera_ok: bool,
+    /// Last enable failure (missing model, camera error, ...), if any.
+    reason: Option<String>,
 }
 
 // Carries what a per-file send needs to emit progress. Optional throughout the
@@ -1577,6 +1592,12 @@ impl AppRuntime {
     /// process is gone — instead of sending into a dead connection until its
     /// 10 s idle timeout.
     fn hand_off_network(&self) {
+        // Release the halo tracking pipeline first (camera + its threads) so
+        // an update relaunch finds the camera free. Bounded joins, so this
+        // cannot hang the hand-off.
+        if let Ok(mut halo) = self.halo.lock() {
+            halo.disable();
+        }
         self.stop_input();
         self.stop_clipboard();
         self.stop_discovery();
@@ -1693,10 +1714,28 @@ fn save_layout(
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
     sync_clipboard_paste_shortcut(&state.app_handle)?;
-    // Halo parameters take effect immediately on save. `enabled` is irrelevant
-    // here: the overlay is created lazily by the first show call.
-    if let Ok(mut halo) = state.halo.lock() {
-        halo.configure(saved_layout.focus_halo.clone());
+    // Halo: an enabled-flag change starts/stops the tracking pipeline; the
+    // layout lock has been released above, so apply_halo_enabled can acquire
+    // the layout/native locks and the halo lock freely (it never nests them).
+    // A failed enable must not fail the already-persisted save; the reason is
+    // surfaced through halo_get_status instead.
+    let halo_enabled_changed =
+        previous_layout.focus_halo.enabled != saved_layout.focus_halo.enabled;
+    if halo_enabled_changed {
+        if let Err(error) = apply_halo_enabled(state.inner(), saved_layout.focus_halo.enabled) {
+            log::warn!(
+                "halo: failed to apply enabled={}: {error}",
+                saved_layout.focus_halo.enabled
+            );
+        }
+    } else if let Ok(mut halo) = state.halo.lock() {
+        if halo.is_running() {
+            // Parameters take effect immediately on save while tracking runs.
+            halo.set_settings(saved_layout.focus_halo.clone());
+        } else {
+            // Disabled: just refresh the snapshot the P0 test overlay reads.
+            halo.configure(saved_layout.focus_halo.clone());
+        }
     }
     Ok(state.snapshot())
 }
@@ -1790,6 +1829,286 @@ fn halo_test_overlay_hide(state: tauri::State<'_, AppRuntime>) -> Result<(), Str
         .map_err(|_| "halo runtime lock poisoned".to_string())?
         .hide();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FocusHalo P1: enable/disable the tracking pipeline and the calibration flow.
+//
+// Lock ordering contract (same as the P0 commands above): the halo lock may be
+// held for seconds (camera start, bounded thread joins), so it must NEVER be
+// held while acquiring the layout/native-layout locks, and vice versa. Every
+// helper below acquires one lock at a time, snapshots what it needs, and
+// releases before the next acquisition.
+// ---------------------------------------------------------------------------
+
+/// Resolve the overlay geometry for the tracking engine: the local device's
+/// primary screen (or its first screen as fallback), converted with the same
+/// origin rule as the P0 test overlay.
+fn halo_tracking_geometry(state: &AppRuntime) -> Result<halo::OverlayScreenGeometry, String> {
+    let native_layout = state.native_layout();
+    let device = native_layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .ok_or_else(|| "FocusHalo: no local device detected on this machine".to_string())?;
+    let screen = device
+        .screens
+        .iter()
+        .find(|screen| screen.is_primary)
+        .or_else(|| device.screens.first())
+        .ok_or_else(|| "FocusHalo: no local screen detected on this machine".to_string())?;
+    let (native_x, native_y) = halo_native_origin(screen);
+    Ok(halo::OverlayScreenGeometry {
+        x: screen.x as f64,
+        y: screen.y as f64,
+        width: screen.width as f64,
+        height: screen.height as f64,
+        scale: screen.scale,
+        native_x,
+        native_y,
+    })
+}
+
+/// Snapshot the sanitized settings from the stored layout (lock acquired and
+/// released alone; never nested with the halo lock).
+fn halo_settings_snapshot(state: &AppRuntime) -> halo::FocusHaloSettings {
+    state
+        .layout
+        .lock()
+        .map(|layout| layout.focus_halo.clone())
+        .unwrap_or_default()
+        .sanitized()
+}
+
+/// Shared implementation for `halo_set_enabled` and the `save_layout`
+/// enabled-changed hook. On enable this may block for seconds (camera start),
+/// which is why callers must invoke it outside any other lock.
+fn apply_halo_enabled(state: &AppRuntime, enabled: bool) -> Result<String, String> {
+    if !halo::overlay::overlay_supported() {
+        return Err(halo::overlay::overlay_unsupported_reason()
+            .unwrap_or("FocusHalo overlay is not supported on this platform")
+            .to_string());
+    }
+    let settings = halo_settings_snapshot(state);
+    let geometry = halo_tracking_geometry(state)?;
+    let mut runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    if enabled {
+        let calibration = settings.effective_calibration();
+        runtime.enable(settings, calibration, geometry)?;
+        drop(runtime);
+        spawn_halo_debug_pump(&state.app_handle);
+        Ok("running".into())
+    } else {
+        runtime.disable();
+        drop(runtime);
+        Ok("stopped".into())
+    }
+}
+
+#[tauri::command]
+fn halo_set_enabled(enabled: bool, state: tauri::State<'_, AppRuntime>) -> Result<String, String> {
+    apply_halo_enabled(state.inner(), enabled)
+}
+
+#[tauri::command]
+fn halo_get_status(state: tauri::State<'_, AppRuntime>) -> Result<HaloStatus, String> {
+    let runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    Ok(HaloStatus {
+        running: runtime.is_running(),
+        camera_ok: runtime.camera_ok(),
+        reason: runtime.status_reason(),
+    })
+}
+
+/// Read the latest raw head pose, optionally smoothed: 5 reads at 10 Hz with
+/// a short halo lock per read (the lock is never held across the sleeps).
+/// Fails when the tracker saw no face at all.
+fn sample_latest_pose(state: &AppRuntime, smoothed: bool) -> Result<(f64, f64), String> {
+    if !smoothed {
+        return state
+            .halo
+            .lock()
+            .map_err(|_| "halo runtime lock poisoned".to_string())?
+            .latest_pose()
+            .ok_or_else(|| "未检测到人脸".to_string());
+    }
+    let mut sum = (0.0_f64, 0.0_f64);
+    let mut count = 0_usize;
+    for _ in 0..5 {
+        if let Ok(runtime) = state.halo.lock() {
+            if let Some((yaw, pitch)) = runtime.latest_pose() {
+                sum.0 += yaw;
+                sum.1 += pitch;
+                count += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if count < 3 {
+        return Err("未检测到人脸".to_string());
+    }
+    Ok((sum.0 / count as f64, sum.1 / count as f64))
+}
+
+/// Mutate `focus_halo` in the stored layout and persist it to disk. Lock
+/// contract: layout lock acquired alone, released before any halo lock.
+fn update_layout_focus_halo<F>(state: &AppRuntime, mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut halo::FocusHaloSettings) -> Result<(), String>,
+{
+    let mut stored_layout = state
+        .layout
+        .lock()
+        .map_err(|_| "layout state lock poisoned".to_string())?;
+    let mut layout = stored_layout.clone();
+    mutate(&mut layout.focus_halo)?;
+    // Same normalization contract as save_layout before the write hits disk.
+    layout.focus_halo = layout.focus_halo.sanitized();
+    write_layout_to_disk(&state.config_path, &layout)?;
+    *stored_layout = layout;
+    Ok(())
+}
+
+/// Capture one calibration point. Order: center -> left -> right -> up ->
+/// down, then `finish`. Center is smoothed over 0.5 s; left/right record the
+/// absolute yaw reading; up/down record the pitch magnitude relative to the
+/// captured center. `finish` validates monotonicity and pushes the profile to
+/// a running engine.
+#[tauri::command]
+fn halo_capture_calibration_point(
+    point: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    let is_center = point == "center";
+    let pose = sample_latest_pose(state.inner(), is_center)?;
+
+    match point.as_str() {
+        "center" | "left" | "right" | "up" | "down" => {
+            let point = point;
+            update_layout_focus_halo(state.inner(), |focus_halo| {
+                let base = focus_halo.calibration.clone().unwrap_or_default();
+                if point != "center" && focus_halo.calibration.is_none() {
+                    return Err("请先采集中心点".to_string());
+                }
+                let mut next = base;
+                match point.as_str() {
+                    "center" => {
+                        next.center_yaw = pose.0;
+                        next.center_pitch = pose.1;
+                    }
+                    "left" => next.left_yaw = pose.0,
+                    "right" => next.right_yaw = pose.0,
+                    "up" => next.up_pitch = pose.1 - next.center_pitch,
+                    "down" => next.down_pitch = next.center_pitch - pose.1,
+                    _ => unreachable!("matched above"),
+                }
+                focus_halo.calibration = Some(next);
+                Ok(())
+            })
+        }
+        "finish" => {
+            let calibration = {
+                let focus_halo = halo_settings_snapshot(state.inner());
+                focus_halo
+                    .calibration
+                    .ok_or_else(|| "尚未采集任何校准点".to_string())?
+            };
+            halo::mapping::validate_calibration(&calibration)?;
+            // Push the validated profile to a running engine (halo lock taken
+            // alone, after the layout snapshot above was released).
+            let mut runtime = state
+                .halo
+                .lock()
+                .map_err(|_| "halo runtime lock poisoned".to_string())?;
+            if runtime.is_running() {
+                runtime.set_calibration(calibration);
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown halo calibration point: {other}")),
+    }
+}
+
+/// Recenter: shift the whole calibration profile so the current (smoothed)
+/// head pose maps to screen center, persist it, and push it to a running
+/// engine. Works from the default profile when nothing was calibrated yet.
+#[tauri::command]
+fn halo_recenter(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    let pose = sample_latest_pose(state.inner(), true)?;
+    let mut calibration = None;
+    update_layout_focus_halo(state.inner(), |focus_halo| {
+        let shifted = halo::mapping::recenter_calibration(
+            &focus_halo.calibration.clone().unwrap_or_default(),
+            pose,
+        );
+        focus_halo.calibration = Some(shifted);
+        calibration = Some(shifted);
+        Ok(())
+    })?;
+    let calibration = calibration.ok_or_else(|| "failed to apply recenter".to_string())?;
+    let mut runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    if runtime.is_running() {
+        runtime.set_calibration(calibration);
+    }
+    Ok(())
+}
+
+/// 5 Hz debug pump: drains the engine's telemetry channel and emits the
+/// newest snapshot on the `halo-debug` event. Exit conditions: the app
+/// runtime state is gone (teardown), the halo runtime is no longer running,
+/// or the debug channel disconnected. A single pump serves the whole process
+/// (`HALO_DEBUG_PUMP_ACTIVE` guards against duplicates): if a disable/enable
+/// cycle happens within one pump sleep, the existing pump simply keeps
+/// serving instead of two pumps racing on the same channel.
+static HALO_DEBUG_PUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn spawn_halo_debug_pump(app: &AppHandle) {
+    if HALO_DEBUG_PUMP_ACTIVE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let handle = app.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("halo-debug-pump".into())
+        .spawn(move || {
+            loop {
+                // try_state returns None while the app is being torn down;
+                // holding the AppHandle clone does not block exit (the event
+                // loop ends the process regardless of background threads).
+                let Some(state) = handle.try_state::<AppRuntime>() else {
+                    break;
+                };
+                let snapshot = {
+                    let Ok(mut runtime) = state.halo.lock() else {
+                        break;
+                    };
+                    if !runtime.is_running() {
+                        break;
+                    }
+                    runtime.drain_debug().pop()
+                };
+                if let Some(snapshot) = snapshot {
+                    let _ = handle.emit(HALO_DEBUG_EVENT, snapshot);
+                }
+                drop(state);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            HALO_DEBUG_PUMP_ACTIVE.store(false, Ordering::SeqCst);
+        });
+    if spawn_result.is_err() {
+        HALO_DEBUG_PUMP_ACTIVE.store(false, Ordering::SeqCst);
+    }
 }
 
 fn merge_runtime_owned_layout_fields(
@@ -4304,7 +4623,11 @@ pub fn run() {
             open_releases_url,
             is_portable_mode,
             halo_test_overlay_show,
-            halo_test_overlay_hide
+            halo_test_overlay_hide,
+            halo_set_enabled,
+            halo_get_status,
+            halo_capture_calibration_point,
+            halo_recenter
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

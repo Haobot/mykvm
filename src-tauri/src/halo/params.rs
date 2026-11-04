@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::halo::mapping::CalibrationProfile;
+
 const DWELL_MS: (u32, u32) = (600, 2000);
 const SETTLE_MS: (u32, u32) = (80, 400);
 const ENTER_SPEED: (f64, f64) = (0.05, 0.4);
@@ -81,6 +83,12 @@ pub struct FocusHaloSettings {
     pub undo_hotkey: String,
     #[serde(default = "d_recenter_hotkey")]
     pub recenter_hotkey: String,
+    /// Per-user head-pose calibration captured by the settings UI. `None`
+    /// means "not calibrated yet": the mapping falls back to the default
+    /// seated-range profile, so an uncalibrated halo still renders (it just
+    /// does not track the user's personal ranges).
+    #[serde(default)]
+    pub calibration: Option<CalibrationProfile>,
 }
 
 fn d_enabled() -> bool {
@@ -151,6 +159,7 @@ impl Default for FocusHaloSettings {
             emergency_stop_hotkey: d_emergency_stop_hotkey(),
             undo_hotkey: d_undo_hotkey(),
             recenter_hotkey: d_recenter_hotkey(),
+            calibration: None,
         }
     }
 }
@@ -182,7 +191,17 @@ impl FocusHaloSettings {
             emergency_stop_hotkey: self.emergency_stop_hotkey.clone(),
             undo_hotkey: self.undo_hotkey.clone(),
             recenter_hotkey: self.recenter_hotkey.clone(),
+            // Calibration values are degree readings written only by the
+            // capture flow, which validates monotonicity on finish; there is
+            // nothing sane to clamp them against here, so pass through.
+            calibration: self.calibration,
         }
+    }
+
+    /// The calibration profile the mapping layer should use: the captured one
+    /// when present, the default seated-range profile otherwise.
+    pub fn effective_calibration(&self) -> CalibrationProfile {
+        self.calibration.unwrap_or_default()
     }
 }
 
@@ -212,6 +231,12 @@ mod tests {
         assert_eq!(s.emergency_stop_hotkey, "disabled");
         assert_eq!(s.undo_hotkey, "disabled");
         assert_eq!(s.recenter_hotkey, "disabled");
+        assert_eq!(s.calibration, None);
+        assert_eq!(
+            s.effective_calibration(),
+            CalibrationProfile::default(),
+            "uncalibrated settings fall back to the default profile"
+        );
     }
 
     #[test]
@@ -288,6 +313,7 @@ mod tests {
             "emergencyStopHotkey",
             "undoHotkey",
             "recenterHotkey",
+            "calibration",
         ] {
             assert!(
                 json.contains(&format!("\"{key}\"")),
@@ -304,5 +330,32 @@ mod tests {
     fn legacy_config_without_new_fields_equals_default() {
         let legacy: FocusHaloSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy, FocusHaloSettings::default());
+    }
+
+    #[test]
+    fn calibration_field_round_trips_and_survives_sanitize() {
+        let cal = CalibrationProfile {
+            center_yaw: -1.5,
+            center_pitch: 0.5,
+            left_yaw: -16.0,
+            right_yaw: 14.0,
+            up_pitch: 9.0,
+            down_pitch: 11.0,
+        };
+        let s = FocusHaloSettings {
+            calibration: Some(cal),
+            ..FocusHaloSettings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains("\"centerYaw\":-1.5"),
+            "calibration must serialize nested camelCase: {json}"
+        );
+        let back: FocusHaloSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.calibration, Some(cal));
+        // sanitize() is applied on every save_layout; calibration passes
+        // through unchanged.
+        assert_eq!(s.sanitized().calibration, Some(cal));
+        assert_eq!(s.effective_calibration(), cal);
     }
 }

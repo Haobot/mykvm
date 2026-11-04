@@ -30,11 +30,16 @@ import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Theme } from "@tauri-apps/api/window";
 import "./App.css";
+import { defaultLayout } from "./defaultLayout";
 import {
   checkForAppUpdate,
   confirmLanPairing,
   dismissPairingRequest,
+  haloCaptureCalibrationPoint,
+  haloGetStatus,
   haloHideOverlay,
+  haloRecenter,
+  haloSetEnabled,
   haloTestOverlay,
   hideMainWindow,
   installInputService,
@@ -42,6 +47,7 @@ import {
   isAutostartEnabled,
   isPortableMode,
   loadAppState,
+  listenHaloDebug,
   minimizeMainWindow,
   openLogDirectory,
   openRepositoryUrl,
@@ -100,6 +106,8 @@ import type {
 import type {
   AppLanguage,
   Device,
+  HaloDebugSnapshot,
+  HaloStatus,
   LayoutState,
   MachineRole,
   ModifierMap,
@@ -213,6 +221,16 @@ type InputServiceAction = "install" | "uninstall";
 
 // FocusHalo P0 debug card: the backend's halo_test_overlay_show visual names.
 const HALO_VISUAL_OPTIONS = ["idle", "candidate", "pulse", "suspended"] as const;
+
+// FocusHalo calibration flow: five capture steps, sent to the backend in this
+// order; "finish" is sent after the last one and validated there.
+const HALO_CALIBRATION_STEPS = [
+  { point: "center", nameKey: "haloCalibCenter", copyKey: "haloCalibCenterCopy" },
+  { point: "left", nameKey: "haloCalibLeft", copyKey: "haloCalibLeftCopy" },
+  { point: "right", nameKey: "haloCalibRight", copyKey: "haloCalibRightCopy" },
+  { point: "up", nameKey: "haloCalibUp", copyKey: "haloCalibUpCopy" },
+  { point: "down", nameKey: "haloCalibDown", copyKey: "haloCalibDownCopy" },
+] as const;
 
 interface ServerPairingState {
   peer: LanPeer;
@@ -351,6 +369,16 @@ function App() {
   const [haloVisual, setHaloVisual] = useState<HaloVisual>("idle");
   const [haloProgress, setHaloProgress] = useState(50);
   const [haloDiameter, setHaloDiameter] = useState("160");
+  // FocusHalo P1 state: runtime status, calibration wizard, and the live
+  // debug snapshot from the backend's 5 Hz `halo-debug` pump.
+  const [haloStatus, setHaloStatus] = useState<HaloStatus | null>(null);
+  const [haloError, setHaloError] = useState<string | null>(null);
+  const [haloPending, setHaloPending] = useState(false);
+  const [haloCalibOpen, setHaloCalibOpen] = useState(false);
+  const [haloCalibStep, setHaloCalibStep] = useState(0);
+  const [haloCalibBusy, setHaloCalibBusy] = useState(false);
+  const [haloCalibError, setHaloCalibError] = useState<string | null>(null);
+  const [haloDebug, setHaloDebug] = useState<HaloDebugSnapshot | null>(null);
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
     () => getSystemTheme(),
   );
@@ -388,6 +416,56 @@ function App() {
   useEffect(() => {
     fileDragTargetIdRef.current = fileDragTargetId;
   }, [fileDragTargetId]);
+
+  // FocusHalo P1: echo the backend runtime status once on load so the
+  // settings card reflects a halo enabled through a previous session.
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+    let active = true;
+    void haloGetStatus()
+      .then((status) => {
+        if (active) {
+          setHaloStatus(status);
+        }
+      })
+      .catch(() => {
+        // Status is a mirror, not a requirement; leave the card at "stopped".
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Subscribe to the 5 Hz debug stream while it can actually flow: the backend
+  // pump only emits while tracking runs, and the calibration wizard needs the
+  // live face indicator even across a freshly enabled session. The snapshot is
+  // only rendered inside haloDebugEnabled-guarded sections, so a leftover
+  // value after unlistening is never shown — cleanup only unlistens.
+  const haloDebugEnabled = isTauri() && (haloStatus?.running || haloCalibOpen);
+  useEffect(() => {
+    if (!haloDebugEnabled) {
+      return;
+    }
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void listenHaloDebug((snapshot) => {
+      if (!disposed) {
+        setHaloDebug(snapshot);
+      }
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [haloDebugEnabled]);
 
   useEffect(() => {
     if (!isTauri()) {
@@ -2597,6 +2675,101 @@ function App() {
     });
   }
 
+  function haloErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  // Enable/disable: call the backend first and only persist the flag once it
+  // succeeded, so a failed camera/model start never writes enabled=true.
+  // The save_layout hook re-applies the same command; HaloRuntime treats a
+  // re-enable while running as "apply settings" (no camera restart).
+  async function handleHaloEnabled(next: boolean) {
+    if (haloPending) {
+      return;
+    }
+    setHaloPending(true);
+    setHaloError(null);
+    try {
+      await haloSetEnabled(next);
+      setHaloStatus((current) => ({
+        running: next,
+        cameraOk: true,
+        reason: next ? null : (current?.reason ?? null),
+      }));
+      updateLayout((layoutState) => {
+        // defaultLayout.focusHalo is always assigned; the optional typing comes
+        // from the LayoutState property itself.
+        const focusHalo = layoutState.focusHalo ?? defaultLayout.focusHalo!;
+        return {
+          ...layoutState,
+          focusHalo: { ...focusHalo, enabled: next },
+        };
+      });
+    } catch (error) {
+      setHaloError(haloErrorMessage(error));
+    } finally {
+      setHaloPending(false);
+    }
+  }
+
+  async function handleHaloRecenter() {
+    if (haloPending) {
+      return;
+    }
+    setHaloPending(true);
+    setHaloError(null);
+    try {
+      await haloRecenter();
+      // Recenter rewrote focus_halo on disk behind our snapshot; reload so a
+      // later unrelated save cannot roll the shifted calibration back.
+      setSnapshot(await loadAppState());
+    } catch (error) {
+      setHaloError(haloErrorMessage(error));
+    } finally {
+      setHaloPending(false);
+    }
+  }
+
+  function openHaloCalibration() {
+    setHaloCalibError(null);
+    setHaloCalibStep(0);
+    setHaloCalibOpen(true);
+  }
+
+  function closeHaloCalibration() {
+    if (!haloCalibBusy) {
+      setHaloCalibOpen(false);
+      setHaloCalibError(null);
+    }
+  }
+
+  // One wizard step: capture the current point, then advance; after the last
+  // point the backend validates monotonicity ("finish") before we close.
+  async function captureHaloCalibrationStep(stepIndex: number) {
+    if (haloCalibBusy) {
+      return;
+    }
+    setHaloCalibBusy(true);
+    setHaloCalibError(null);
+    try {
+      await haloCaptureCalibrationPoint(HALO_CALIBRATION_STEPS[stepIndex].point);
+      if (stepIndex + 1 < HALO_CALIBRATION_STEPS.length) {
+        setHaloCalibStep(stepIndex + 1);
+      } else {
+        await haloCaptureCalibrationPoint("finish");
+        setHaloCalibOpen(false);
+        // Same reason as recenter: the layout on disk now carries the
+        // captured calibration; refresh before any other save round-trips a
+        // stale snapshot over it.
+        setSnapshot(await loadAppState());
+      }
+    } catch (error) {
+      setHaloCalibError(haloErrorMessage(error));
+    } finally {
+      setHaloCalibBusy(false);
+    }
+  }
+
   function screenFileTransferTargetId(screen: FlattenedScreen) {
     if (
       !fileTransferEnabled ||
@@ -3638,7 +3811,150 @@ function App() {
               </section>
 
               <section className="surface-card settings-card">
-                <h2>{ui.settings.haloDebugTitle}</h2>
+                <div className="card-title-row">
+                  <h2>{ui.settings.haloTitle}</h2>
+                  <span
+                    className="muted-copy"
+                    title={haloStatus?.reason ?? undefined}
+                  >
+                    {haloStatus?.running
+                      ? ui.settings.haloStatusRunning
+                      : haloStatus?.reason
+                        ? `${ui.settings.haloStatusCameraError}: ${haloStatus.reason}`
+                        : ui.settings.haloStatusStopped}
+                  </span>
+                </div>
+                <p className="muted-copy">{ui.settings.haloCopy}</p>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.haloEnable}
+                    <InfoTip label={ui.settings.haloEnable} text={ui.settings.haloCalibrationHint} />
+                  </span>
+                  <div className="segmented-control" role="group" aria-label={ui.settings.haloEnable}>
+                    <button
+                      type="button"
+                      className={haloStatus?.running ? "active" : ""}
+                      aria-pressed={haloStatus?.running ?? false}
+                      disabled={haloPending || !isTauri()}
+                      onClick={() => void handleHaloEnabled(true)}
+                    >
+                      {ui.settings.autostartOn}
+                    </button>
+                    <button
+                      type="button"
+                      className={!haloStatus?.running ? "active" : ""}
+                      aria-pressed={!(haloStatus?.running ?? false)}
+                      disabled={haloPending || !isTauri()}
+                      onClick={() => void handleHaloEnabled(false)}
+                    >
+                      {ui.settings.autostartOff}
+                    </button>
+                  </div>
+                </div>
+                {haloError ? (
+                  <p className="muted-copy diagnostic-message">{haloError}</p>
+                ) : null}
+                <p className="muted-copy">{ui.settings.haloCalibrationHint}</p>
+                <div className="inline-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={openHaloCalibration}
+                    disabled={haloPending || !isTauri()}
+                  >
+                    {ui.settings.haloRecalibrate}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void handleHaloRecenter()}
+                    disabled={haloPending || !(haloStatus?.running ?? false)}
+                  >
+                    {ui.settings.haloRecenter}
+                  </button>
+                </div>
+              </section>
+
+              <section className="surface-card settings-card">
+                <div className="card-title-row">
+                  <h2>{ui.settings.haloDebugTitle}</h2>
+                  {haloStatus?.running ? (
+                    <span className="muted-copy">{ui.settings.haloStatusRunning}</span>
+                  ) : null}
+                </div>
+                {haloDebugEnabled ? (
+                  <>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveFace}</span>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        <span
+                          aria-hidden="true"
+                          style={{
+                            width: 10,
+                            height: 10,
+                            borderRadius: "50%",
+                            display: "inline-block",
+                            backgroundColor: haloDebug?.faceDetected ? "#34c759" : "#e0524f",
+                          }}
+                        />
+                        {haloDebug
+                          ? haloDebug.faceDetected
+                            ? ui.settings.haloPhaseIdle
+                            : ui.settings.haloPhaseSuspendedFace
+                          : ui.common.none}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveRaw}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {formatHaloDegrees(haloDebug?.rawYaw)} /{" "}
+                        {formatHaloDegrees(haloDebug?.rawPitch)}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveFiltered}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {formatHaloDegrees(haloDebug?.filteredYaw)} /{" "}
+                        {formatHaloDegrees(haloDebug?.filteredPitch)}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveNorm}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {haloDebug
+                          ? `${Math.round(haloDebug.normX * 100)}% / ${Math.round(
+                              haloDebug.normY * 100,
+                            )}%`
+                          : "--"}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveSpeed}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {haloDebug ? haloDebug.speedNorm.toFixed(2) : "--"}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLivePhase}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {haloDebug
+                          ? haloDebug.phase === "suspended_face"
+                            ? ui.settings.haloPhaseSuspendedFace
+                            : haloDebug.phase === "suspended_input"
+                              ? ui.settings.haloPhaseSuspendedInput
+                              : ui.settings.haloPhaseIdle
+                          : "--"}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveSource}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {ui.settings.haloLiveSourceCamera}
+                      </span>
+                    </div>
+                    <p className="muted-copy">{ui.settings.haloDebugManualHint}</p>
+                  </>
+                ) : null}
                 <div className="settings-control-row">
                   <span>{ui.settings.haloDebugScreen}</span>
                   <select
@@ -3726,7 +4042,7 @@ function App() {
                     type="button"
                     className="primary-button compact-button"
                     onClick={showHaloTestOverlay}
-                    disabled={!selectedHaloScreen || !isTauri()}
+                    disabled={!selectedHaloScreen || !isTauri() || haloStatus?.running}
                   >
                     {ui.settings.haloDebugShow}
                   </button>
@@ -3863,6 +4179,90 @@ function App() {
         </div>
       ) : null}
 
+      {haloCalibOpen ? (
+        <div className="pairing-modal-backdrop" role="presentation">
+          <div className="pairing-modal">
+            <div>
+              <p className="eyebrow">FocusHalo</p>
+              <h2>{ui.settings.haloCalibTitle}</h2>
+            </div>
+            {haloStatus?.running ? (
+              <>
+                <p className="muted-copy">
+                  {ui.settings.haloCalibStep} {haloCalibStep + 1}/
+                  {HALO_CALIBRATION_STEPS.length}
+                  {" · "}
+                  {ui.settings[HALO_CALIBRATION_STEPS[haloCalibStep].nameKey]}
+                </p>
+                <p>{ui.settings[HALO_CALIBRATION_STEPS[haloCalibStep].copyKey]}</p>
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloLiveFace}</span>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: "50%",
+                        display: "inline-block",
+                        backgroundColor: haloDebug?.faceDetected ? "#34c759" : "#e0524f",
+                      }}
+                    />
+                    {haloDebug?.faceDetected
+                      ? ui.settings.haloPhaseIdle
+                      : ui.settings.haloPhaseSuspendedFace}
+                  </span>
+                </div>
+                {haloCalibError ? (
+                  <p className="muted-copy diagnostic-message">{haloCalibError}</p>
+                ) : null}
+                <div className="pairing-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={closeHaloCalibration}
+                    disabled={haloCalibBusy}
+                  >
+                    {ui.settings.haloCalibClose}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={() => void captureHaloCalibrationStep(haloCalibStep)}
+                    disabled={haloCalibBusy}
+                  >
+                    {haloCalibBusy
+                      ? ui.common.pending
+                      : ui.settings.haloCalibCapture}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="muted-copy">{ui.settings.haloCalibNeedRunning}</p>
+                <div className="pairing-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={closeHaloCalibration}
+                  >
+                    {ui.settings.haloCalibClose}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={haloPending || !isTauri()}
+                    onClick={() => void handleHaloEnabled(true)}
+                  >
+                    {ui.settings.autostartOn}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+
       <footer className="app-footer">
         <span className="footer-copy">
           <span>
@@ -3927,6 +4327,15 @@ function getSystemTheme(): Exclude<ThemeMode, "system"> {
   }
 
   return "dark";
+}
+
+// Debug-panel degree readout: one decimal, always signed-safe; "--" when the
+// debug stream has not delivered a snapshot yet.
+function formatHaloDegrees(value: number | undefined): string {
+  if (value === undefined || Number.isNaN(value)) {
+    return "--";
+  }
+  return `${value.toFixed(1)}°`;
 }
 
 function resolveTheme(

@@ -32,6 +32,20 @@ impl InputActivityProbe for NullProbe {
     }
 }
 
+/// Build the platform probe for the tracking engine: the real event-source
+/// probe on macOS/Windows, the inert probe everywhere else.
+pub fn create_input_probe(keyboard_suspends: bool) -> Box<dyn InputActivityProbe> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        Box::new(SystemInputProbe::new(keyboard_suspends))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = keyboard_suspends;
+        Box::new(NullProbe)
+    }
+}
+
 /// How long after the last physical event the input still counts as "active".
 /// The engine additionally requires 1 s of quiet before resuming; this window
 /// only defines what the probe itself reports.

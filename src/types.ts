@@ -23,6 +23,16 @@ export interface ScreenSwitchHotkeys {
   down: string
 }
 
+/** Mirrors the Rust `halo::CalibrationProfile` (serde camelCase). */
+export interface HaloCalibration {
+  centerYaw: number
+  centerPitch: number
+  leftYaw: number
+  rightYaw: number
+  upPitch: number
+  downPitch: number
+}
+
 /** Mirrors the Rust `halo::FocusHaloSettings` (serde camelCase). */
 export interface FocusHaloSettings {
   enabled: boolean
@@ -44,6 +54,29 @@ export interface FocusHaloSettings {
   emergencyStopHotkey: string
   undoHotkey: string
   recenterHotkey: string
+  /** Captured calibration; absent until the first successful capture. */
+  calibration?: HaloCalibration | null
+}
+
+/** Mirrors the Rust `HaloStatus` (serde camelCase). */
+export interface HaloStatus {
+  running: boolean
+  cameraOk: boolean
+  reason: string | null
+}
+
+/** Mirrors the Rust `halo::DebugSnapshot` (serde camelCase, phase snake_case). */
+export interface HaloDebugSnapshot {
+  tsMs: number
+  faceDetected: boolean
+  rawYaw: number
+  rawPitch: number
+  filteredYaw: number
+  filteredPitch: number
+  normX: number
+  normY: number
+  speedNorm: number
+  phase: 'idle' | 'suspended_face' | 'suspended_input'
 }
 
 export interface PairedController {

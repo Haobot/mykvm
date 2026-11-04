@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 /// Axis half-range values small enough to be a calibration typo rather than a
 /// usable range; raw offsets beyond such a range clamp to the edge.
 const MIN_HALF_RANGE: f64 = 1e-3;
+/// Degree margin required between the captured center and the left/right
+/// extremes (and for the up/down magnitudes) so float noise from a lazy
+/// capture cannot pass as a monotonic calibration.
+const CAPTURE_MIN_EXTENT_DEG: f64 = 0.05;
 
 /// Per-user head pose calibration, in degrees, matching the 6DRepNet Euler
 /// convention used by `crate::halo::tracker` (positive pitch = looking up).
@@ -135,6 +139,43 @@ pub fn map_pose(
     (x, y)
 }
 
+/// Validate a freshly captured calibration profile: the yaw extremes must
+/// straddle the center monotonically (left < center < right, each by at least
+/// [`CAPTURE_MIN_EXTENT_DEG`]) and both pitch magnitudes must be positive by
+/// the same margin. Error strings are user-facing (the calibration UI shows
+/// them verbatim).
+pub fn validate_calibration(cal: &CalibrationProfile) -> Result<(), String> {
+    let margin = CAPTURE_MIN_EXTENT_DEG;
+    if cal.left_yaw >= cal.center_yaw - margin {
+        return Err("校准不完整：左转角度必须明显小于中心角度".into());
+    }
+    if cal.right_yaw <= cal.center_yaw + margin {
+        return Err("校准不完整：右转角度必须明显大于中心角度".into());
+    }
+    if cal.up_pitch <= margin {
+        return Err("校准不完整：抬头幅度必须大于 0".into());
+    }
+    if cal.down_pitch <= margin {
+        return Err("校准不完整：低头幅度必须大于 0".into());
+    }
+    Ok(())
+}
+
+/// Shift a captured profile so the current head pose maps to screen center:
+/// every absolute yaw/pitch reading moves by the same offset; the up/down
+/// magnitudes are relative and stay untouched. This is the "recenter" flow.
+pub fn recenter_calibration(cal: &CalibrationProfile, pose: (f64, f64)) -> CalibrationProfile {
+    let (yaw, pitch) = pose;
+    CalibrationProfile {
+        center_yaw: yaw,
+        center_pitch: pitch,
+        left_yaw: cal.left_yaw + (yaw - cal.center_yaw),
+        right_yaw: cal.right_yaw + (yaw - cal.center_yaw),
+        up_pitch: cal.up_pitch,
+        down_pitch: cal.down_pitch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +290,58 @@ mod tests {
     fn empty_json_uses_defaults() {
         let cal: CalibrationProfile = serde_json::from_str("{}").unwrap();
         assert_eq!(cal, CalibrationProfile::default());
+    }
+
+    #[test]
+    fn default_profile_passes_validation_and_degenerate_profiles_fail() {
+        assert_eq!(validate_calibration(&default_cal()), Ok(()));
+        // Left not clearly left of center.
+        let mut cal = default_cal();
+        cal.left_yaw = cal.center_yaw;
+        assert!(validate_calibration(&cal).is_err());
+        // Right not clearly right of center.
+        let mut cal = default_cal();
+        cal.right_yaw = cal.center_yaw + 0.01;
+        assert!(validate_calibration(&cal).is_err());
+        // Non-positive up/down magnitudes.
+        let mut cal = default_cal();
+        cal.up_pitch = 0.0;
+        assert!(validate_calibration(&cal).is_err());
+        let mut cal = default_cal();
+        cal.down_pitch = -1.0;
+        assert!(validate_calibration(&cal).is_err());
+    }
+
+    #[test]
+    fn recenter_shifts_every_absolute_reading() {
+        let cal = CalibrationProfile {
+            center_yaw: -2.0,
+            center_pitch: 1.0,
+            left_yaw: -20.0,
+            right_yaw: 16.0,
+            up_pitch: 10.0,
+            down_pitch: 14.0,
+        };
+        // User now sits 3 deg to the left and 2 deg lower than when captured.
+        let shifted = recenter_calibration(&cal, (-5.0, -1.0));
+        assert_eq!(shifted.center_yaw, -5.0);
+        assert_eq!(shifted.center_pitch, -1.0);
+        assert_eq!(shifted.left_yaw, -23.0);
+        assert_eq!(shifted.right_yaw, 13.0);
+        // Magnitudes are relative and must not move.
+        assert_eq!(shifted.up_pitch, 10.0);
+        assert_eq!(shifted.down_pitch, 14.0);
+        // The shifted profile keeps the same half-ranges, so the mapping still
+        // reaches every edge.
+        assert_eq!(validate_calibration(&shifted), Ok(()));
+        let (x, y) = map_pose(
+            (shifted.left_yaw, shifted.center_pitch),
+            &shifted,
+            0.0,
+            1.0,
+            false,
+        );
+        assert_eq!(x, 0.0);
+        assert_eq!(y, 0.5);
     }
 }
