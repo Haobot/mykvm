@@ -36,11 +36,13 @@ import {
   confirmLanPairing,
   dismissPairingRequest,
   haloCaptureCalibrationPoint,
+  haloEmergencyStop,
   haloGetStatus,
   haloHideOverlay,
   haloRecenter,
   haloSetEnabled,
   haloTestOverlay,
+  haloUndoSwitch,
   hideMainWindow,
   installInputService,
   installAppUpdate,
@@ -106,6 +108,7 @@ import type {
 import type {
   AppLanguage,
   Device,
+  FocusHaloSettings,
   HaloDebugSnapshot,
   HaloStatus,
   LayoutState,
@@ -379,6 +382,14 @@ function App() {
   const [haloCalibBusy, setHaloCalibBusy] = useState(false);
   const [haloCalibError, setHaloCalibError] = useState<string | null>(null);
   const [haloDebug, setHaloDebug] = useState<HaloDebugSnapshot | null>(null);
+  // FocusHalo P3: which halo hotkey recorder is capturing a combo (same
+  // recorder protocol as the edge-switch/screen-switch buttons).
+  const [capturingHaloHotkey, setCapturingHaloHotkey] = useState<
+    "emergencyStop" | "undo" | "recenter" | null
+  >(null);
+  const haloHotkeyButtonRefs = useRef<
+    Record<"emergencyStop" | "undo" | "recenter", HTMLButtonElement | null>
+  >({ emergencyStop: null, undo: null, recenter: null });
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
     () => getSystemTheme(),
   );
@@ -1850,6 +1861,72 @@ function App() {
     }));
   }
 
+  function setFocusHaloSetting<K extends keyof FocusHaloSettings>(
+    key: K,
+    value: FocusHaloSettings[K],
+  ) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      focusHalo: {
+        ...(layoutState.focusHalo ?? defaultLayout.focusHalo!),
+        [key]: value,
+      },
+    }));
+  }
+
+  function resetHaloDefaults() {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      focusHalo: { ...defaultLayout.focusHalo! },
+    }));
+  }
+
+  const captureHaloHotkey = useEffectEvent((event: KeyboardEvent) => {
+    const field = capturingHaloHotkey;
+    if (!field) {
+      return;
+    }
+    const hotkey = hotkeyFromKeyboardEvent(event, metaKeyLabel);
+    if (!hotkey) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    void setHotkeyRecording(false, hotkey).catch((error: unknown) => setErrorMessage(String(error)));
+    setFocusHaloSetting(haloHotkeyFieldKeys[field], hotkey);
+    setCapturingHaloHotkey(null);
+  });
+
+  useEffect(() => {
+    if (!capturingHaloHotkey) {
+      return;
+    }
+    const cancelIfOutsideRecorder = (event: Event) => {
+      const target = event.target;
+      const button = haloHotkeyButtonRefs.current[capturingHaloHotkey];
+      if (target instanceof Node && button?.contains(target)) {
+        return;
+      }
+      setCapturingHaloHotkey(null);
+    };
+    const cancelRecording = () => setCapturingHaloHotkey(null);
+
+    window.addEventListener("keydown", captureHaloHotkey, true);
+    document.addEventListener("pointerdown", cancelIfOutsideRecorder, true);
+    document.addEventListener("focusin", cancelIfOutsideRecorder, true);
+    window.addEventListener("blur", cancelRecording);
+    return () => {
+      window.removeEventListener("keydown", captureHaloHotkey, true);
+      document.removeEventListener(
+        "pointerdown",
+        cancelIfOutsideRecorder,
+        true,
+      );
+      document.removeEventListener("focusin", cancelIfOutsideRecorder, true);
+      window.removeEventListener("blur", cancelRecording);
+    };
+  }, [capturingHaloHotkey]);
+
   const captureScreenSwitchHotkey = useEffectEvent((event: KeyboardEvent) => {
     const direction = capturingDirection;
     if (!direction) {
@@ -1897,10 +1974,13 @@ function App() {
   }, [capturingDirection]);
 
   useEffect(() => {
-    const recording = isCapturingEdgeSwitchHotkey || capturingDirection !== null;
+    const recording =
+      isCapturingEdgeSwitchHotkey ||
+      capturingDirection !== null ||
+      capturingHaloHotkey !== null;
     void setHotkeyRecording(recording).catch(() => {});
     return () => { if (recording) void setHotkeyRecording(false).catch(() => {}); };
-  }, [isCapturingEdgeSwitchHotkey, capturingDirection]);
+  }, [isCapturingEdgeSwitchHotkey, capturingDirection, capturingHaloHotkey]);
 
   function setTransportPortMode(transportPortMode: TransportPortMode) {
     updateLayout((layoutState) => ({
@@ -2639,6 +2719,9 @@ function App() {
   const haloScreens =
     displayLayout.devices.find((device) => device.role === "local")?.screens ??
     [];
+  // FocusHalo settings card: fall back to the defaults when an older
+  // snapshot omits focusHalo entirely (same contract as handleHaloEnabled).
+  const haloSettings = layout.focusHalo ?? defaultLayout.focusHalo!;
   const selectedHaloScreen =
     haloScreens.find((screen) => screen.id === haloScreenId) ??
     haloScreens[0] ??
@@ -3873,6 +3956,302 @@ function App() {
                     {ui.settings.haloRecenter}
                   </button>
                 </div>
+                <HaloNumberField
+                  label={ui.settings.haloDwell}
+                  help={ui.settings.haloDwellHelp}
+                  value={haloSettings.dwellMs}
+                  min={600}
+                  max={2000}
+                  step={50}
+                  onCommit={(value) => setFocusHaloSetting("dwellMs", value)}
+                />
+                <HaloNumberField
+                  label={ui.settings.haloCooldown}
+                  help={ui.settings.haloCooldownHelp}
+                  value={haloSettings.cooldownMs}
+                  min={300}
+                  max={1500}
+                  step={50}
+                  onCommit={(value) => setFocusHaloSetting("cooldownMs", value)}
+                />
+                <HaloNumberField
+                  label={ui.settings.haloDiameter}
+                  help={ui.settings.haloDiameterHelp}
+                  value={haloSettings.haloDiameter}
+                  min={140}
+                  max={180}
+                  step={5}
+                  onCommit={(value) => setFocusHaloSetting("haloDiameter", value)}
+                />
+                <HaloNumberField
+                  label={ui.settings.haloOpacity}
+                  help={ui.settings.haloOpacityHelp}
+                  value={haloSettings.haloOpacity}
+                  min={0.35}
+                  max={0.9}
+                  step={0.05}
+                  onCommit={(value) => setFocusHaloSetting("haloOpacity", value)}
+                />
+                <details
+                  className="surface-card"
+                  style={{ marginTop: 12, padding: 12 }}
+                >
+                  <summary
+                    style={{
+                      cursor: "pointer",
+                      color: "#a1a1aa",
+                      fontSize: 14,
+                      userSelect: "none",
+                    }}
+                  >
+                    {ui.settings.haloAdvanced}
+                  </summary>
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 4,
+                      marginTop: 10,
+                    }}
+                  >
+                    <HaloNumberField
+                      label={ui.settings.haloSettle}
+                      help={ui.settings.haloSettleHelp}
+                      value={haloSettings.settleMs}
+                      min={80}
+                      max={400}
+                      step={10}
+                      onCommit={(value) => setFocusHaloSetting("settleMs", value)}
+                    />
+                    <HaloNumberField
+                      label={ui.settings.haloEnterSpeed}
+                      help={ui.settings.haloEnterSpeedHelp}
+                      value={haloSettings.enterSpeed}
+                      min={0.05}
+                      max={0.4}
+                      step={0.05}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("enterSpeed", value)
+                      }
+                    />
+                    <HaloNumberField
+                      label={ui.settings.haloUndoMs}
+                      help={ui.settings.haloUndoMsHelp}
+                      value={haloSettings.undoMs}
+                      min={1000}
+                      max={10000}
+                      step={250}
+                      onCommit={(value) => setFocusHaloSetting("undoMs", value)}
+                    />
+                    <HaloNumberField
+                      label={ui.settings.haloDeadZone}
+                      help={ui.settings.haloDeadZoneHelp}
+                      value={haloSettings.deadZonePercent}
+                      min={3}
+                      max={8}
+                      step={0.5}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("deadZonePercent", value)
+                      }
+                    />
+                    <HaloNumberField
+                      label={ui.settings.haloGain}
+                      help={ui.settings.haloGainHelp}
+                      value={haloSettings.gain}
+                      min={0.5}
+                      max={2}
+                      step={0.1}
+                      onCommit={(value) => setFocusHaloSetting("gain", value)}
+                    />
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloShowProgress}</span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={haloSettings.showProgress ? "active" : ""}
+                          onClick={() =>
+                            setFocusHaloSetting("showProgress", true)
+                          }
+                        >
+                          {ui.common.enabled}
+                        </button>
+                        <button
+                          type="button"
+                          className={!haloSettings.showProgress ? "active" : ""}
+                          onClick={() =>
+                            setFocusHaloSetting("showProgress", false)
+                          }
+                        >
+                          {ui.common.disabled}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloSwitchZone}</span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={
+                            haloSettings.switchZone === "anywhere" ? "active" : ""
+                          }
+                          onClick={() =>
+                            setFocusHaloSetting("switchZone", "anywhere")
+                          }
+                        >
+                          {ui.settings.haloSwitchZoneAnywhere}
+                        </button>
+                        <button
+                          type="button"
+                          className={
+                            haloSettings.switchZone === "titlebar" ? "active" : ""
+                          }
+                          onClick={() =>
+                            setFocusHaloSetting("switchZone", "titlebar")
+                          }
+                        >
+                          {ui.settings.haloSwitchZoneTitlebar}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloCameraPosition}</span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={
+                            haloSettings.cameraPosition === "top" ? "active" : ""
+                          }
+                          onClick={() =>
+                            setFocusHaloSetting("cameraPosition", "top")
+                          }
+                        >
+                          {ui.settings.haloCameraTop}
+                        </button>
+                        <button
+                          type="button"
+                          className={
+                            haloSettings.cameraPosition === "bottom"
+                              ? "active"
+                              : ""
+                          }
+                          onClick={() =>
+                            setFocusHaloSetting("cameraPosition", "bottom")
+                          }
+                        >
+                          {ui.settings.haloCameraBottom}
+                        </button>
+                      </div>
+                    </div>
+                    <HaloListField
+                      label={ui.settings.haloTitleBlacklist}
+                      help={ui.settings.haloBlacklistHelp}
+                      placeholder={ui.settings.haloBlacklistPlaceholder}
+                      value={haloSettings.titleBlacklist}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("titleBlacklist", value)
+                      }
+                    />
+                    <HaloListField
+                      label={ui.settings.haloProcessBlacklist}
+                      help={ui.settings.haloBlacklistHelp}
+                      placeholder={ui.settings.haloBlacklistPlaceholder}
+                      value={haloSettings.processBlacklist}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("processBlacklist", value)
+                      }
+                    />
+                    {(
+                      [
+                        ["emergencyStop", ui.settings.haloEmergencyHotkey, ui.settings.haloEmergencyHotkeyHelp],
+                        ["undo", ui.settings.haloUndoHotkey, ui.settings.haloUndoHotkeyHelp],
+                        ["recenter", ui.settings.haloRecenterHotkey, ui.settings.haloRecenterHotkeyHelp],
+                      ] as const
+                    ).map(([field, label, help]) => (
+                      <div className="settings-control-row" key={field}>
+                        <span>
+                          {label}
+                          <InfoTip label={label} text={help} />
+                        </span>
+                        <div
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 8,
+                          }}
+                        >
+                          <button
+                            type="button"
+                            ref={(el) => {
+                              haloHotkeyButtonRefs.current[field] = el;
+                            }}
+                            className={`hotkey-recorder-button ${
+                              capturingHaloHotkey === field ? "recording" : ""
+                            }`}
+                            aria-pressed={capturingHaloHotkey === field}
+                            onClick={() =>
+                              setCapturingHaloHotkey((current) =>
+                                current === field ? null : field,
+                              )
+                            }
+                          >
+                            {capturingHaloHotkey === field
+                              ? ui.settings.haloHotkeyRecording
+                              : renderHotkeyTags(
+                                  formatEdgeSwitchHotkeyForDisplay(
+                                    haloSettings[haloHotkeyFieldKeys[field]],
+                                    metaKeyLabel,
+                                  ),
+                                  localPlatform,
+                                )}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button compact-button"
+                            disabled={
+                              haloSettings[haloHotkeyFieldKeys[field]] ===
+                              "disabled"
+                            }
+                            onClick={() =>
+                              setFocusHaloSetting(
+                                haloHotkeyFieldKeys[field],
+                                "disabled",
+                              )
+                            }
+                          >
+                            {ui.settings.haloHotkeyClear}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        onClick={() => void haloUndoSwitch()}
+                        disabled={!isTauri()}
+                      >
+                        {ui.settings.haloUndoButton}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button compact-button danger-button"
+                        onClick={() => void haloEmergencyStop()}
+                        disabled={!isTauri()}
+                      >
+                        {ui.settings.haloEmergencyButton}
+                      </button>
+                    </div>
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        onClick={resetHaloDefaults}
+                      >
+                        {ui.settings.haloResetDefaults}
+                      </button>
+                    </div>
+                  </div>
+                </details>
               </section>
 
               <section className="surface-card settings-card">
@@ -4400,6 +4779,148 @@ function normalizePort(value: number) {
 function normalizeEdgeSwitchHotkeyInput(value: string) {
   const normalized = value.trim().toLowerCase().replace(/\s+/g, "");
   return normalized.length === 0 ? "alt+shift+k" : normalized;
+}
+
+/// Maps a halo hotkey recorder id to its FocusHaloSettings field.
+const haloHotkeyFieldKeys = {
+  emergencyStop: "emergencyStopHotkey",
+  undo: "undoHotkey",
+  recenter: "recenterHotkey",
+} as const satisfies Record<
+  "emergencyStop" | "undo" | "recenter",
+  keyof FocusHaloSettings
+>;
+
+/// One halo numeric settings row. Keeps a local draft so typing never fires
+/// a save per keystroke: in-range drafts commit on blur/Enter, out-of-range
+/// drafts are flagged (red border) and snap back to the persisted value. The
+/// backend clamps again on save_layout, so the committed value always lands
+/// inside the range even if the params table shifts.
+function HaloNumberField(props: {
+  label: string;
+  help: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(props.value));
+  const lastKnownValue = useRef(props.value);
+
+  // Resync the draft when the persisted value changes behind us (save-time
+  // clamping, reset-to-defaults, or a save from another window).
+  useEffect(() => {
+    if (lastKnownValue.current !== props.value) {
+      lastKnownValue.current = props.value;
+      setDraft(String(props.value));
+    }
+  }, [props.value]);
+
+  const parsed = Number(draft);
+  const valid =
+    draft.trim() !== "" &&
+    Number.isFinite(parsed) &&
+    parsed >= props.min &&
+    parsed <= props.max;
+
+  const commitDraft = () => {
+    if (valid && parsed !== props.value) {
+      lastKnownValue.current = parsed;
+      props.onCommit(parsed);
+    } else {
+      setDraft(String(props.value));
+    }
+  };
+
+  return (
+    <div className="settings-control-row">
+      <span>
+        {props.label}
+        <InfoTip label={props.label} text={props.help} />
+      </span>
+      <input
+        className="settings-number-input"
+        type="number"
+        min={props.min}
+        max={props.max}
+        step={props.step}
+        value={draft}
+        aria-invalid={valid ? undefined : "true"}
+        style={
+          valid
+            ? undefined
+            : {
+                borderColor: "rgba(248, 113, 113, 0.78)",
+                background: "rgba(127, 29, 29, 0.16)",
+              }
+        }
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commitDraft}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            (event.target as HTMLInputElement).blur();
+          }
+        }}
+      />
+    </div>
+  );
+}
+
+/// One halo comma-separated-list settings row (title/process blacklists).
+/// Same draft protocol as HaloNumberField: commits the parsed list on
+/// blur/Enter, otherwise snaps back to the persisted list.
+function HaloListField(props: {
+  label: string;
+  help: string;
+  placeholder: string;
+  value: string[];
+  onCommit: (value: string[]) => void;
+}) {
+  const joined = props.value.join(",");
+  const [draft, setDraft] = useState(joined);
+
+  useEffect(() => {
+    setDraft(joined);
+  }, [joined]);
+
+  const commitDraft = () => {
+    const parsed = draft
+      .split(",")
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+    const current = props.value;
+    const changed =
+      parsed.length !== current.length ||
+      parsed.some((part, index) => part !== current[index]);
+    if (changed) {
+      props.onCommit(parsed);
+    } else {
+      setDraft(joined);
+    }
+  };
+
+  return (
+    <div className="settings-control-row">
+      <span>
+        {props.label}
+        <InfoTip label={props.label} text={props.help} />
+      </span>
+      <input
+        className="settings-number-input"
+        type="text"
+        value={draft}
+        placeholder={props.placeholder}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commitDraft}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            (event.target as HTMLInputElement).blur();
+          }
+        }}
+      />
+    </div>
+  );
 }
 
 function renderHotkeyTags(displayHotkey: string, platform = "") {

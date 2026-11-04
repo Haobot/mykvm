@@ -261,6 +261,17 @@ impl Default for ScreenSwitchHotkeys {
     }
 }
 
+/// The three FocusHalo global hotkeys currently registered with the
+/// global-shortcut plugin. Values are canonical shortcut strings; an empty
+/// string means "not registered" ("disabled" or registration suppressed by
+/// recording/native-owner mode). Routing-only state, never serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct HaloShortcutSet {
+    emergency_stop: String,
+    undo: String,
+    recenter: String,
+}
+
 fn default_screen_switch_hotkey_left() -> String {
     "alt+left".into()
 }
@@ -689,6 +700,7 @@ struct AppRuntime {
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
+    halo_shortcuts: Mutex<HaloShortcutSet>,
     config_path: PathBuf,
     /// P0 manual-test halo overlay; the P1 dwell engine will drive it later.
     /// The overlay window is built lazily by the first show call, so a
@@ -751,6 +763,7 @@ impl AppRuntime {
             runtime_toggle_menu_item: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
+            halo_shortcuts: Mutex::new(HaloShortcutSet::default()),
             config_path,
             halo: Mutex::new(halo::HaloRuntime::new()),
             #[cfg(target_os = "windows")]
@@ -1714,6 +1727,7 @@ fn save_layout(
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
     sync_clipboard_paste_shortcut(&state.app_handle)?;
+    sync_halo_shortcuts(&state.app_handle)?;
     // Halo: an enabled-flag change starts/stops the tracking pipeline; the
     // layout lock has been released above, so apply_halo_enabled can acquire
     // the layout/native locks and the halo lock freely (it never nests them).
@@ -2040,9 +2054,17 @@ fn halo_capture_calibration_point(
 /// engine. Works from the default profile when nothing was calibrated yet.
 #[tauri::command]
 fn halo_recenter(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
-    let pose = sample_latest_pose(state.inner(), true)?;
+    halo_recenter_impl(state.inner())
+}
+
+/// Shared recenter body, reused by both the `halo_recenter` command and the
+/// recenter global hotkey. Never hold other locks across this call: it takes
+/// the layout lock (`update_layout_focus_halo`), sleeps in
+/// `sample_latest_pose`, and finally takes the halo lock.
+fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
+    let pose = sample_latest_pose(state, true)?;
     let mut calibration = None;
-    update_layout_focus_halo(state.inner(), |focus_halo| {
+    update_layout_focus_halo(state, |focus_halo| {
         let shifted = halo::mapping::recenter_calibration(
             &focus_halo.calibration.clone().unwrap_or_default(),
             pose,
@@ -2059,6 +2081,74 @@ fn halo_recenter(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
     if runtime.is_running() {
         runtime.set_calibration(calibration);
     }
+    Ok(())
+}
+
+/// Which halo control hotkey matched in `route_global_shortcut`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaloShortcutAction {
+    EmergencyStop,
+    UndoSwitch,
+    Recenter,
+}
+
+/// Run one halo hotkey action. Errors are logged, never propagated: a hotkey
+/// press must not surface a dialog (the caller cannot react to a global
+/// shortcut failure anyway).
+fn dispatch_halo_shortcut(state: &AppRuntime, action: HaloShortcutAction) {
+    match action {
+        HaloShortcutAction::EmergencyStop => {
+            // Emergency stop is a safety brake: respond even while the halo
+            // is disabled (HaloRuntime::emergency_stop no-ops then).
+            if let Ok(mut runtime) = state.halo.lock() {
+                runtime.emergency_stop();
+                log::info!("halo: emergency stop triggered by hotkey");
+            }
+        }
+        HaloShortcutAction::UndoSwitch => {
+            if let Ok(mut runtime) = state.halo.lock() {
+                runtime.undo_switch();
+                log::info!("halo: undo switch triggered by hotkey");
+            }
+        }
+        HaloShortcutAction::Recenter => {
+            // Recenter samples a smoothed pose (~0.5 s of bounded sleeps) and
+            // writes the layout; run it off the main thread so the shortcut
+            // handler never stalls the UI.
+            let app_handle = state.app_handle.clone();
+            std::thread::spawn(move || {
+                let state = app_handle.state::<AppRuntime>();
+                if let Err(error) = halo_recenter_impl(state.inner()) {
+                    log::warn!("halo: recenter hotkey failed: {error}");
+                } else {
+                    log::info!("halo: recenter triggered by hotkey");
+                }
+            });
+        }
+    }
+}
+
+/// Thin wrappers so the frontend buttons can drive the same actions as the
+/// global hotkeys (button-click fallback when a hotkey is not configured).
+#[tauri::command]
+fn halo_undo_switch(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    let mut runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    runtime.undo_switch();
+    log::info!("halo: undo switch triggered from UI");
+    Ok(())
+}
+
+#[tauri::command]
+fn halo_emergency_stop(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    let mut runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    runtime.emergency_stop();
+    log::info!("halo: emergency stop triggered from UI");
     Ok(())
 }
 
@@ -2634,10 +2724,16 @@ fn validate_shared_hotkeys(layout: &LayoutState) -> Result<(), String> {
         &layout.screen_switch_hotkeys.right,
         &layout.screen_switch_hotkeys.up,
         &layout.screen_switch_hotkeys.down,
+        // Halo hotkeys join the same dedup pool: they conflict with each
+        // other and with every existing global hotkey. "disabled" values
+        // canonicalize to None and are therefore exempt.
+        &layout.focus_halo.emergency_stop_hotkey,
+        &layout.focus_halo.undo_hotkey,
+        &layout.focus_halo.recenter_hotkey,
     ] {
         if let Some(shortcut) = canonical_runtime_toggle_shortcut(value)? {
             if !seen.insert(shortcut) {
-                return Err("启停、粘贴和切屏快捷键不能重复。".into());
+                return Err("启停、粘贴、切屏和 FocusHalo 快捷键不能重复。".into());
             }
         }
     }
@@ -2724,6 +2820,81 @@ fn empty_screen_switch_hotkeys() -> ScreenSwitchHotkeys {
     }
 }
 
+fn empty_halo_shortcuts() -> HaloShortcutSet {
+    HaloShortcutSet::default()
+}
+
+/// Canonical (or empty) strings for the three halo hotkeys. Mirrors
+/// `screen_switch_shortcuts_for_layout`: a client role never registers halo
+/// hotkeys, and an unparsable saved value silently resolves to empty (the
+/// save-time `validate_shared_hotkeys` is what rejects bad input).
+fn halo_shortcuts_for_layout(layout: &LayoutState) -> HaloShortcutSet {
+    if layout.machine_role != "server" {
+        return empty_halo_shortcuts();
+    }
+
+    let focus_halo = &layout.focus_halo;
+    HaloShortcutSet {
+        emergency_stop: canonical_halo_hotkey(&focus_halo.emergency_stop_hotkey)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        undo: canonical_halo_hotkey(&focus_halo.undo_hotkey)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        recenter: canonical_halo_hotkey(&focus_halo.recenter_hotkey)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+    }
+}
+
+/// Register/unregister the three halo control hotkeys so they stay in sync
+/// with the saved layout. Mirrors `sync_screen_switch_shortcuts`: compares
+/// against the stored values and only touches the ones that changed. Unlike
+/// the direction hotkeys these stay registered regardless of the input guard
+/// or local-only mode — emergency stop is the halo safety brake and must keep
+/// responding (the engine itself no-ops when the halo is not running).
+fn sync_halo_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return Ok(());
+    };
+    let layout = state.layout_snapshot();
+    let next = if input::hotkey_recording() || input::owns_native_shortcuts() {
+        empty_halo_shortcuts()
+    } else {
+        halo_shortcuts_for_layout(&layout)
+    };
+
+    let mut current = state
+        .halo_shortcuts
+        .lock()
+        .map_err(|_| "halo shortcuts lock poisoned".to_string())?;
+
+    for (next_str, prev_str) in [
+        (&next.emergency_stop, &current.emergency_stop),
+        (&next.undo, &current.undo),
+        (&next.recenter, &current.recenter),
+    ] {
+        if next_str == prev_str {
+            continue;
+        }
+        if !prev_str.is_empty() {
+            if let Err(error) = app.global_shortcut().unregister(prev_str.as_str()) {
+                log::warn!("failed to unregister halo shortcut {prev_str}: {error}");
+            }
+        }
+        if !next_str.is_empty() {
+            if let Err(error) = app.global_shortcut().register(next_str.as_str()) {
+                log::warn!("failed to register halo shortcut {next_str}: {error}");
+            } else {
+                log::info!("registered halo shortcut: {next_str}");
+            }
+        }
+    }
+
+    *current = next;
+    Ok(())
+}
+
 /// Dispatch a pressed global shortcut to its action. The runtime-toggle
 /// shortcut starts/stops capture; the four direction shortcuts post a switch
 /// request that the capture loop consumes.
@@ -2778,6 +2949,41 @@ fn route_global_shortcut(
     }
     drop(toggle);
 
+    // Halo control hotkeys (emergency stop / undo switch / recenter). These
+    // sit before the input-paused guard on purpose: emergency stop is the
+    // halo safety brake and must keep working while input is paused or
+    // local-only, and every branch no-ops by itself when the halo runtime is
+    // disabled.
+    let halo = state
+        .halo_shortcuts
+        .lock()
+        .map_err(|_| "halo shortcuts lock poisoned".to_string())?;
+    let halo_action = [
+        (
+            halo.emergency_stop.as_str(),
+            HaloShortcutAction::EmergencyStop,
+        ),
+        (halo.undo.as_str(), HaloShortcutAction::UndoSwitch),
+        (halo.recenter.as_str(), HaloShortcutAction::Recenter),
+    ]
+    .into_iter()
+    .find_map(|(stored, action)| {
+        if stored.is_empty() {
+            return None;
+        }
+        stored
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .ok()
+            .filter(|parsed| parsed == shortcut)
+            .map(|_| action)
+    });
+    drop(halo);
+
+    if let Some(action) = halo_action {
+        dispatch_halo_shortcut(state.inner(), action);
+        return Ok(());
+    }
+
     if input_guard::is_paused(&state.input_guard)
         || state.layout_snapshot().input_protection.local_only
     {
@@ -2827,6 +3033,21 @@ fn route_global_shortcut(
 }
 
 fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, String> {
+    canonical_hotkey_with_label(value, "快捷启停")
+}
+
+/// FocusHalo hotkeys (emergency stop / undo / recenter) share the exact
+/// normalization, alias and parse rules as the quick start/stop shortcut so a
+/// recorded combo behaves identically across every hotkey field.
+fn canonical_halo_hotkey(value: &str) -> Result<Option<String>, String> {
+    canonical_hotkey_with_label(value, "FocusHalo")
+}
+
+/// Shared hotkey canonicalization. `label` is only used in the error strings
+/// so each feature reports its own name. Returns `None` for "disabled" (and
+/// its aliases), or the canonical `control/alt/shift/super+Key` string that
+/// the global-shortcut plugin accepts.
+fn canonical_hotkey_with_label(value: &str, label: &str) -> Result<Option<String>, String> {
     let normalized = normalize_edge_switch_hotkey(value);
     if matches!(normalized.as_str(), "disabled" | "disable" | "off" | "none") {
         return Ok(None);
@@ -2846,19 +3067,21 @@ fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, Stri
             "meta" | "cmd" | "command" | "win" | "windows" | "super" | "os" => meta = true,
             raw_key => {
                 if key.is_some() {
-                    return Err("快捷启停快捷键只能包含一个主按键。".into());
+                    return Err(format!("{label}快捷键只能包含一个主按键。"));
                 }
                 key = Some(
                     canonical_runtime_toggle_key(raw_key)
-                        .ok_or_else(|| format!("无法识别快捷启停快捷键按键：{raw_key}"))?,
+                        .ok_or_else(|| format!("无法识别{label}快捷键按键：{raw_key}"))?,
                 );
             }
         }
     }
 
-    let key = key.ok_or_else(|| "快捷启停快捷键缺少主按键。".to_string())?;
+    let key = key.ok_or_else(|| format!("{label}快捷键缺少主按键。"))?;
     if !(ctrl || alt || shift || meta) && !allows_single_runtime_toggle_key(&key) {
-        return Err("快捷启停快捷键需要使用组合键，或使用 F1-F24 / ScrollLock。".into());
+        return Err(format!(
+            "{label}快捷键需要使用组合键，或使用 F1-F24 / ScrollLock。"
+        ));
     }
 
     let mut parts = Vec::new();
@@ -2878,7 +3101,7 @@ fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, Stri
     let shortcut = parts.join("+");
     shortcut
         .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .map_err(|error| format!("无法注册快捷启停快捷键 {normalized}: {error}"))?;
+        .map_err(|error| format!("无法注册{label}快捷键 {normalized}: {error}"))?;
 
     Ok(Some(shortcut))
 }
@@ -4416,6 +4639,9 @@ pub fn run() {
             if let Err(error) = sync_screen_switch_shortcuts(app.handle()) {
                 log::warn!("failed to register screen switch shortcuts: {error}");
             }
+            if let Err(error) = sync_halo_shortcuts(app.handle()) {
+                log::warn!("failed to register halo shortcuts: {error}");
+            }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
             let _ = sync_clipboard_paste_shortcut(app.handle());
@@ -4644,7 +4870,9 @@ pub fn run() {
             halo_set_enabled,
             halo_get_status,
             halo_capture_calibration_point,
-            halo_recenter
+            halo_recenter,
+            halo_undo_switch,
+            halo_emergency_stop
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -5947,6 +6175,7 @@ fn set_hotkey_recording(
     sync_runtime_toggle_shortcut(&app)?;
     sync_screen_switch_shortcuts(&app)?;
     sync_clipboard_paste_shortcut(&app)?;
+    sync_halo_shortcuts(&app)?;
     if recording {
         input::begin_shortcut_recording();
     }
@@ -11626,6 +11855,82 @@ mod tests {
     #[test]
     fn runtime_toggle_shortcut_rejects_single_letter_globals() {
         assert!(canonical_runtime_toggle_shortcut("k").is_err());
+    }
+
+    #[test]
+    fn halo_hotkey_canonicalization_matches_runtime_toggle_rules() {
+        // Halo hotkeys reuse the quick start/stop normalization: meta
+        // aliases fold to "super", function keys capitalize, "disabled"
+        // (and aliases) resolve to None.
+        assert_eq!(
+            canonical_halo_hotkey("command+9").expect("shortcut"),
+            Some("super+9".into())
+        );
+        assert_eq!(
+            canonical_halo_hotkey("meta+f8").expect("shortcut"),
+            Some("super+F8".into())
+        );
+        // A bare function key is allowed without modifiers.
+        assert_eq!(
+            canonical_halo_hotkey("f8").expect("shortcut"),
+            Some("F8".into())
+        );
+        assert_eq!(canonical_halo_hotkey("disabled").expect("disabled"), None);
+        assert_eq!(canonical_halo_hotkey("off").expect("alias"), None);
+        // Single letters still require a modifier, and unknown keys fail.
+        assert!(canonical_halo_hotkey("k").is_err());
+        assert!(canonical_halo_hotkey("ctrl+notakey").is_err());
+    }
+
+    #[test]
+    fn halo_hotkeys_reject_duplicates_within_and_across_features() {
+        // Two halo hotkeys colliding with each other.
+        let mut layout = test_layout();
+        layout.focus_halo.emergency_stop_hotkey = "alt+f9".into();
+        layout.focus_halo.undo_hotkey = "alt+f9".into();
+        assert!(validate_shared_hotkeys(&layout).is_err());
+
+        // A halo hotkey colliding with the quick start/stop shortcut.
+        let mut layout = test_layout();
+        layout.focus_halo.emergency_stop_hotkey = "alt+f9".into();
+        layout.edge_switch_hotkey = "alt+f9".into();
+        assert!(validate_shared_hotkeys(&layout).is_err());
+
+        // ... and with a screen-switch direction key.
+        let mut layout = test_layout();
+        layout.focus_halo.undo_hotkey = "alt+left".into();
+        assert!(validate_shared_hotkeys(&layout).is_err());
+
+        // Disabled values are exempt from the dedup: every halo hotkey off
+        // while the other defaults are active must pass.
+        let mut layout = test_layout();
+        layout.focus_halo.emergency_stop_hotkey = "disabled".into();
+        layout.focus_halo.undo_hotkey = "off".into();
+        layout.focus_halo.recenter_hotkey = "none".into();
+        assert!(validate_shared_hotkeys(&layout).is_ok());
+
+        // Distinct halo hotkeys coexist with the other defaults.
+        layout.focus_halo.emergency_stop_hotkey = "ctrl+shift+f9".into();
+        layout.focus_halo.undo_hotkey = "ctrl+shift+f10".into();
+        layout.focus_halo.recenter_hotkey = "ctrl+shift+f11".into();
+        assert!(validate_shared_hotkeys(&layout).is_ok());
+    }
+
+    #[test]
+    fn halo_shortcuts_for_layout_resolves_and_disables_for_client() {
+        let mut layout = test_layout();
+        layout.focus_halo.emergency_stop_hotkey = "command+f9".into();
+        layout.focus_halo.undo_hotkey = "disabled".into();
+        layout.focus_halo.recenter_hotkey = "alt+f11".into();
+
+        let shortcuts = halo_shortcuts_for_layout(&layout);
+        assert_eq!(shortcuts.emergency_stop, "super+F9");
+        assert_eq!(shortcuts.undo, "");
+        assert_eq!(shortcuts.recenter, "alt+F11");
+
+        // Client machines never register halo hotkeys.
+        layout.machine_role = "client".into();
+        assert_eq!(halo_shortcuts_for_layout(&layout), empty_halo_shortcuts());
     }
 
     #[test]

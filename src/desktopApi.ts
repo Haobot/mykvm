@@ -496,6 +496,24 @@ export async function haloRecenter(): Promise<void> {
   await invoke('halo_recenter')
 }
 
+// Button-click fallback for the undo-switch global hotkey.
+export async function haloUndoSwitch(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_undo_switch')
+}
+
+// Button-click fallback for the emergency-stop global hotkey.
+export async function haloEmergencyStop(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_emergency_stop')
+}
+
 /**
  * Subscribe to the FocusHalo debug stream (5 Hz while tracking runs).
  * Returns an unlisten function; resolves to a no-op outside the Tauri
