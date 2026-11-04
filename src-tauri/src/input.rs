@@ -54,6 +54,14 @@ const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
 const MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS: u64 = 16;
 #[cfg(target_os = "macos")]
 const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = 50;
+
+/// How long `decouple_pending` may block the periodic cursor re-assert before
+/// the loop forces the detach anyway. Pending normally clears on the first
+/// mouse event after a crossing (that event draws the hide); if events stop
+/// arriving (tap disabled mid-enter, no movement yet) the re-assert stays off
+/// and macOS's silent re-associate leaves the local cursor following the mouse
+/// while remote control is live — the "two cursors move at once" symptom.
+const PENDING_DECOUPLE_TIMEOUT_MS: u64 = 1_000;
 #[cfg(target_os = "macos")]
 const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
 #[cfg(target_os = "macos")]
@@ -1437,6 +1445,7 @@ fn start_platform_capture(
             tap_disabled: AtomicBool::new(false),
             just_crossed: AtomicBool::new(false),
             decouple_pending: AtomicBool::new(false),
+            decouple_pending_since: AtomicU64::new(0),
             suppress_next_mouse_delta: AtomicBool::new(false),
             local_screen_points: Mutex::new(BoundedPointCache::new(REMOTE_SCREEN_POINTS_CACHE_CAP)),
             display_snapshots,
@@ -1626,6 +1635,7 @@ fn start_platform_capture(
         set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
         show_macos_cursor_if_needed(&context);
         context.remote_active.store(false, Ordering::Relaxed);
+        clear_macos_decouple_pending(&context);
         clear_clipboard_target(&context.clipboard_target);
         clear_pending_edge_drop(&context);
     });
@@ -3726,6 +3736,12 @@ struct MacCaptureContext {
     // Crossed into a remote but no mouse event has arrived since: the cursor
     // stays attached until that event draws the hide (hide_and_pin_macos_cursor).
     decouple_pending: AtomicBool,
+    // When `decouple_pending` was armed (ms epoch, 0 = not armed). A pending
+    // that never gets consumed (tap disabled, no move event) must not disable
+    // the re-assert forever: after PENDING_DECOUPLE_TIMEOUT_MS the loop forces
+    // the detach anyway — an undrawn hide for one frame beats a cursor that
+    // keeps following the mouse while remote control is live.
+    decouple_pending_since: AtomicU64,
     suppress_next_mouse_delta: AtomicBool,
     local_screen_points: Mutex<BoundedPointCache<String>>,
     display_snapshots: Vec<MacDisplaySnapshot>,
@@ -5841,10 +5857,23 @@ fn handle_macos_mouse_move(
 
     let location = event.location();
     if let Ok(mut active) = context.active.lock() {
+        // A stale remote target can outlive `remote_active` (the shared flag is
+        // force-cleared when the runtime restarts in receive mode): forwarding
+        // would keep running while every re-assert/flush gate is closed —
+        // local cursor follows the mouse AND the remote one moves. The Windows
+        // hook path clears this on sight (see handle_windows_mouse_move);
+        // mirror that here.
+        if active.is_some() && !context.remote_active.load(Ordering::Relaxed) {
+            drop(active);
+            log::warn!("cleared a stale remote target after local control resumed");
+            return_to_local_macos(context);
+            return CallbackResult::Keep;
+        }
         if let Some(active_target) = active.as_mut() {
             // First mouse event since crossing: it moved the still-attached
             // cursor, which draws the hide. Now detach and pin.
             if context.decouple_pending.swap(false, Ordering::Relaxed) {
+                context.decouple_pending_since.store(0, Ordering::Relaxed);
                 set_macos_cursor_decoupled(true);
                 force_repin_macos_cursor_to_anchor(context);
             }
@@ -5881,6 +5910,7 @@ fn handle_macos_mouse_move(
                 context
                     .suppress_next_mouse_delta
                     .store(false, Ordering::Relaxed);
+                clear_macos_decouple_pending(context);
                 // Record the return instant so the crossing test can enforce a
                 // short cooldown — without it, landing flush on the edge (inset
                 // 0) would let a fast back-flick immediately re-cross.
@@ -5946,6 +5976,7 @@ fn handle_macos_mouse_move(
                     context
                         .suppress_next_mouse_delta
                         .store(false, Ordering::Relaxed);
+                    clear_macos_decouple_pending(context);
                     clear_clipboard_target(&context.clipboard_target);
                     reset_mouse_move_timer(&context.last_mouse_move_sent);
                     reset_cursor_repin_timer(context);
@@ -6011,6 +6042,7 @@ fn handle_macos_mouse_move(
             set_macos_cursor_decoupled(false);
             show_macos_cursor_if_needed(context);
             context.just_crossed.store(false, Ordering::Relaxed);
+            clear_macos_decouple_pending(context);
             return CallbackResult::Keep;
         }
         reset_mouse_move_timer(&context.last_mouse_move_sent);
@@ -7193,6 +7225,9 @@ fn hide_and_pin_macos_cursor(context: &MacCaptureContext, edge: Edge, anchor: (f
     // draws the hide; that event detaches it and pins it to the anchor.
     set_macos_cursor_decoupled(false);
     context.decouple_pending.store(true, Ordering::Relaxed);
+    context
+        .decouple_pending_since
+        .store(crate::now_ms(), Ordering::Relaxed);
     set_macos_warp_suppression_interval(0.0);
     let (inward_x, inward_y) = match edge {
         Edge::Right => (-1.0, 0.0),
@@ -7226,6 +7261,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
         context
             .suppress_next_mouse_delta
             .store(false, Ordering::Relaxed);
+        clear_macos_decouple_pending(context);
         return;
     }
     dismiss_macos_dock_ui_if_up();
@@ -7261,6 +7297,7 @@ fn return_to_local_macos(context: &MacCaptureContext) {
         Some(target) => target,
         None => return,
     };
+    clear_macos_decouple_pending(context);
     let point = local_hotkey_return_point(&active_target);
     let target = active_target.target.clone();
     let _ = send_remote_cursor_park(
@@ -7302,9 +7339,18 @@ fn return_to_local_macos(context: &MacCaptureContext) {
 /// those APIs are stack-based and must stay one enter paired with one return.
 #[cfg(target_os = "macos")]
 fn repin_macos_cursor_while_remote(context: &MacCaptureContext) {
-    // Detaching before the first mouse event would strand the hide undrawn.
+    // Detaching before the first mouse event would strand the hide undrawn,
+    // so a fresh pending defers the re-assert. But an unconsumed pending (tap
+    // disabled mid-enter, no movement yet) must not disable the re-assert
+    // forever — after the timeout, force the detach; one undrawn hide beats a
+    // cursor that keeps following the mouse while remote control is live.
     if context.decouple_pending.load(Ordering::Relaxed) {
-        return;
+        let armed = context.decouple_pending_since.load(Ordering::Relaxed);
+        if armed != 0 && crate::now_ms().saturating_sub(armed) < PENDING_DECOUPLE_TIMEOUT_MS {
+            return;
+        }
+        context.decouple_pending.store(false, Ordering::Relaxed);
+        context.decouple_pending_since.store(0, Ordering::Relaxed);
     }
     set_macos_cursor_decoupled(true);
     if !context.main_window_visible.load(Ordering::Relaxed) {
@@ -7384,6 +7430,7 @@ fn drain_switch_request_macos(context: &MacCaptureContext) {
             move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
             set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
             show_macos_cursor_if_needed(context);
+            clear_macos_decouple_pending(context);
         }
         SwitchOutcome::Noop => {
             log::warn!("screen switch {direction:?} ignored: no matching online target");
@@ -7495,6 +7542,16 @@ fn set_macos_cursor_decoupled(decoupled: bool) {
     unsafe {
         let _ = CGAssociateMouseAndMouseCursorPosition(connected);
     }
+}
+
+/// Every exit path must drop the first-mouse-event decouple deferral along
+/// with the rest of the remote state: a pending that survives into the next
+/// enter keeps the re-assert disabled from that enter until its first move
+/// event (see `repin_macos_cursor_while_remote`).
+#[cfg(target_os = "macos")]
+fn clear_macos_decouple_pending(context: &MacCaptureContext) {
+    context.decouple_pending.store(false, Ordering::Relaxed);
+    context.decouple_pending_since.store(0, Ordering::Relaxed);
 }
 
 /// macOS default: local hardware events stay suppressed for 0.25s after a warp.
@@ -7815,6 +7872,14 @@ fn repin_macos_cursor_if_drifted(
     };
     drop(anchor);
 
+    // When MyKVM is not frontmost, macOS can re-associate the cursor with the
+    // physical mouse despite CGAssociateMouseAndMouseCursorPosition(false).
+    // Re-assert the detach on every call — it is one idempotent FFI call and
+    // must NOT be gated behind the drift/interval checks below, or the first
+    // moves after a silent re-associate drag the local cursor (and the visible
+    // arrow) along with the mouse while remote injection continues.
+    set_macos_cursor_decoupled(true);
+
     let dx = location.x - x;
     let dy = location.y - y;
     if dx.abs() <= DRIFT_THRESHOLD_PX && dy.abs() <= DRIFT_THRESHOLD_PX {
@@ -7825,10 +7890,8 @@ fn repin_macos_cursor_if_drifted(
         return false;
     }
 
-    // When MyKVM is not frontmost, macOS can re-associate the cursor with the
-    // physical mouse despite CGAssociateMouseAndMouseCursorPosition(false).
-    // Re-pin only after actual drift and at a capped rate.
-    set_macos_cursor_decoupled(true);
+    // Re-pin the position at a capped rate (the decouple re-assert above is
+    // unconditional; only the warp is throttled).
     move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
     true
 }
