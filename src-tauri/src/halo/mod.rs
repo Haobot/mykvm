@@ -18,6 +18,7 @@ pub mod mapping;
 pub mod overlay;
 pub mod params;
 pub mod tracker;
+pub mod windows_layer;
 
 pub use engine::{spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase};
 pub use filter::OneEuroFilter;
@@ -26,6 +27,7 @@ pub use mapping::{map_pose, CalibrationProfile};
 pub use overlay::{HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
 pub use params::FocusHaloSettings;
 pub use tracker::{default_models_dir, Frame, HeadSample, PoseEngine};
+pub use windows_layer::{create_window_service, WindowInfo, WindowService};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
