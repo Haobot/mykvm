@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
@@ -1060,6 +1060,8 @@ impl AppRuntime {
         let transport_packets = Arc::clone(&self.transport_packets);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let heartbeat = Arc::new(DiscoveryHeartbeat::new());
+        let loop_heartbeat = Arc::clone(&heartbeat);
         socket
             .set_broadcast(true)
             .map_err(|error| format!("failed to enable UDP broadcast: {error}"))?;
@@ -1072,7 +1074,9 @@ impl AppRuntime {
         // recv_from, discovery silently dies and the other machine cannot scan this
         // one until the app is relaunched. A send timeout makes such a call return
         // instead of wedging the whole loop.
-        if let Err(error) = socket.set_write_timeout(Some(Duration::from_millis(500))) {
+        if let Err(error) =
+            socket.set_write_timeout(Some(Duration::from_millis(DISCOVERY_WRITE_TIMEOUT_MS)))
+        {
             log::warn!("failed to set discovery send timeout: {error}");
         }
         // Aim announces at the configured base port and the span above it, not
@@ -1103,6 +1107,7 @@ impl AppRuntime {
             let mut last_probe_by_peer: HashMap<String, u64> = HashMap::new();
 
             while !thread_stop.load(Ordering::Relaxed) {
+                loop_heartbeat.tick();
                 if last_local_identity_refresh.elapsed() >= LOCAL_IDENTITY_REFRESH_INTERVAL {
                     refresh_local_device_identity(&layout_state);
                     last_local_identity_refresh = Instant::now();
@@ -1318,6 +1323,33 @@ impl AppRuntime {
 
                 prune_stale_peers(&peers);
                 sync_layout_peer_presence(&layout_state, &peers);
+            }
+        });
+
+        // 看门狗：discovery 主循环一旦被意外的长时间阻塞卡死（写超时只是
+        // 把已知场景挡住，这里兜底报告未知卡死），心跳停止更新、gap 超过
+        // 阈值时报 error。同一卡死期只报一次，心跳恢复后重置。线程随 stop
+        // 标志退出，与 discovery 线程同生命周期；重启 discovery 会创建新的
+        // 心跳与看门狗，旧代自然作废。
+        let watchdog_stop = Arc::clone(&stop);
+        let watchdog_heartbeat = Arc::clone(&heartbeat);
+        thread::spawn(move || {
+            let mut already_reported = false;
+            while !watchdog_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(DISCOVERY_STALL_CHECK_INTERVAL_MS));
+                if watchdog_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let gap_ms = watchdog_heartbeat.stall_gap_ms();
+                let (should_report, next_state) =
+                    advance_discovery_stall_state(gap_ms, already_reported);
+                already_reported = next_state;
+                if should_report {
+                    log::error!(
+                        "discovery loop stalled for {}s; announces/probes are blocked",
+                        gap_ms / 1000
+                    );
+                }
             }
         });
 
@@ -9340,15 +9372,75 @@ fn sanitize_peer_id_part(value: &str) -> String {
         .to_string()
 }
 
+/// 发现链路 UDP socket 的写超时（毫秒），与 start_discovery 主 socket 同参；
+/// headless_client.rs 的主 discovery socket 复用同一参数。
+pub(crate) const DISCOVERY_WRITE_TIMEOUT_MS: u64 = 500;
+
+/// 看门狗检查发现循环心跳的间隔（毫秒）。
+const DISCOVERY_STALL_CHECK_INTERVAL_MS: u64 = 10_000;
+/// 心跳 gap 超过该值（毫秒）即视为发现循环卡死。
+const DISCOVERY_STALL_THRESHOLD_MS: u64 = 30_000;
+
+/// 看门狗判定/去重纯函数：输入当前心跳 gap 与"本卡死期是否已上报"，
+/// 返回（是否上报，下一轮状态）。心跳恢复时重置去重状态，允许下一次
+/// 卡死再次上报；同一卡死期只报一次。
+fn advance_discovery_stall_state(gap_ms: u64, already_reported: bool) -> (bool, bool) {
+    if gap_ms <= DISCOVERY_STALL_THRESHOLD_MS {
+        (false, false)
+    } else if already_reported {
+        (false, true)
+    } else {
+        (true, true)
+    }
+}
+
+/// 发现循环心跳：主循环每轮迭代更新一次刻度（线程内单调时钟相对
+/// discovery 启动的毫秒数），看门狗线程据此判定循环是否卡死。
+/// 每代 discovery 线程独享一份：重启后旧看门狗随旧 stop 标志退出，
+/// 新看门狗看新心跳，不会跨代误报。
+struct DiscoveryHeartbeat {
+    start: Instant,
+    last_tick_ms: AtomicU64,
+}
+
+impl DiscoveryHeartbeat {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_tick_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// 发现主循环每轮迭代调用：记录当前单调时钟刻度。
+    fn tick(&self) {
+        let tick_ms = self.start.elapsed().as_millis() as u64;
+        self.last_tick_ms.store(tick_ms, Ordering::Relaxed);
+    }
+
+    /// 当前心跳 gap（毫秒）：启动以来单调时钟与最后刻度之差。
+    /// Instant 是单调时钟，系统睡眠/休眠不推进它，唤醒不会造成假 gap。
+    fn stall_gap_ms(&self) -> u64 {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        elapsed_ms.saturating_sub(self.last_tick_ms.load(Ordering::Relaxed))
+    }
+}
+
+/// 为发现协议的临时 UDP socket 统一设置读/写超时。
+/// 写超时缺省曾在 macOS 网络扰动（IP 漂移/隐私会话重启）时令 sendto
+/// 永久阻塞并卡死发现线程，防护参数与主 socket 一致（见 start_discovery）。
+fn bind_timed_udp_socket(read_timeout: Duration) -> io::Result<UdpSocket> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(read_timeout))?;
+    socket.set_write_timeout(Some(Duration::from_millis(DISCOVERY_WRITE_TIMEOUT_MS)))?;
+    Ok(socket)
+}
+
 fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, String> {
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let socket = bind_timed_udp_socket(Duration::from_millis(250))
         .map_err(|error| format!("failed to open UDP scan socket: {error}"))?;
     socket
         .set_broadcast(true)
         .map_err(|error| format!("failed to enable UDP broadcast: {error}"))?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .map_err(|error| format!("failed to set UDP scan timeout: {error}"))?;
 
     for target in broadcast_addrs(base_port) {
         let _ = send_discovery_packet(&socket, "announce", local_peer, target);
@@ -9394,10 +9486,9 @@ fn probe_known_peer_targets_within(
         return Vec::new();
     }
 
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+    let Ok(socket) = bind_timed_udp_socket(Duration::from_millis(120)) else {
         return Vec::new();
     };
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
     for target in targets {
         let _ = send_discovery_packet(&socket, "probe", local_peer, target.as_str());
     }
@@ -9426,11 +9517,8 @@ fn probe_known_peer_targets_within(
 
 fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<LanPeer, String> {
     let (host, explicit_port) = split_host_port(host.trim());
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let socket = bind_timed_udp_socket(Duration::from_millis(250))
         .map_err(|error| format!("failed to open UDP probe socket: {error}"))?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .map_err(|error| format!("failed to set UDP probe timeout: {error}"))?;
 
     // With an explicit `host:port` probe exactly that port (e.g. a forwarded
     // public endpoint reached across NAT); otherwise the peer may have drifted
@@ -9499,11 +9587,8 @@ fn request_pairing_from_host(
     wait: Duration,
 ) -> Result<PairingRequestOutcome, String> {
     let (host, ports) = pairing_probe_targets(host, base_port);
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let socket = bind_timed_udp_socket(PAIRING_PROBE_READ_TIMEOUT)
         .map_err(|error| format!("failed to open UDP pairing socket: {error}"))?;
-    socket
-        .set_read_timeout(Some(PAIRING_PROBE_READ_TIMEOUT))
-        .map_err(|error| format!("failed to set UDP pairing timeout: {error}"))?;
 
     for port in &ports {
         let target = format!("{host}:{port}");
@@ -13837,6 +13922,100 @@ mod tests {
     fn discovery_target_ports_clamp_near_max() {
         let ports = discovery_target_ports(TRANSPORT_PORT_MAX - 1);
         assert_eq!(ports, vec![TRANSPORT_PORT_MAX - 1, TRANSPORT_PORT_MAX]);
+    }
+
+    #[test]
+    fn bind_timed_udp_socket_sets_both_read_and_write_timeouts() {
+        // 复盘：临时探测 socket 过去只设读超时，macOS 网络扰动（IP 漂移/
+        // 隐私会话重启）会让 sendto 无限期挂起并卡死整个发现线程；
+        // helper 必须同时给出读、写超时，写超时与主 socket 同参。
+        // Arrange & Act
+        let socket =
+            bind_timed_udp_socket(Duration::from_millis(120)).expect("临时 UDP socket 应能绑定");
+
+        // Assert：读超时透传调用方给定值，写超时固定为发现链路统一值。
+        assert_eq!(
+            socket.read_timeout().expect("应能读取读超时配置"),
+            Some(Duration::from_millis(120))
+        );
+        assert_eq!(
+            socket.write_timeout().expect("应能读取写超时配置"),
+            Some(Duration::from_millis(DISCOVERY_WRITE_TIMEOUT_MS))
+        );
+    }
+
+    #[test]
+    fn discovery_stall_watchdog_stays_silent_while_heartbeat_is_healthy() {
+        // 正常心跳（gap 小于阈值）不应触发上报，且保持"未上报"状态。
+        // Arrange & Act & Assert
+        let (should_report, next_state) = advance_discovery_stall_state(0, false);
+        assert!(!should_report, "心跳正常时不应上报");
+        assert!(!next_state, "心跳正常时不应进入已上报状态");
+
+        // 恰好等于阈值不算卡死（判定要求严格大于），不误报。
+        let (should_report, next_state) =
+            advance_discovery_stall_state(DISCOVERY_STALL_THRESHOLD_MS, false);
+        assert!(!should_report, "恰好等于阈值不应上报");
+        assert!(!next_state, "恰好等于阈值不应进入已上报状态");
+    }
+
+    #[test]
+    fn discovery_stall_watchdog_reports_once_when_loop_stalls() {
+        // gap 超过阈值且尚未上报：报一次，并进入"已上报"状态。
+        // Arrange & Act & Assert
+        let (should_report, next_state) =
+            advance_discovery_stall_state(DISCOVERY_STALL_THRESHOLD_MS + 1, false);
+        assert!(should_report, "超阈值且未上报过必须上报");
+        assert!(next_state, "上报后必须记住已上报");
+
+        // 同一卡死期的后续检查不再重复上报。
+        let (should_report, next_state) =
+            advance_discovery_stall_state(DISCOVERY_STALL_THRESHOLD_MS + 1, true);
+        assert!(!should_report, "同一卡死期只报一次");
+        assert!(next_state, "同一卡死期内保持已上报状态");
+    }
+
+    #[test]
+    fn discovery_stall_watchdog_can_report_again_after_recovery() {
+        // 心跳恢复（gap 回到阈值内）时重置去重状态，为下一次卡死做准备。
+        // Arrange & Act & Assert
+        let (should_report, next_state) = advance_discovery_stall_state(500, true);
+        assert!(!should_report, "恢复期不应上报");
+        assert!(!next_state, "恢复后必须重置去重状态");
+
+        // 之后再次卡死可再次上报。
+        let (should_report, next_state) =
+            advance_discovery_stall_state(DISCOVERY_STALL_THRESHOLD_MS + 1, next_state);
+        assert!(should_report, "恢复后再次卡死必须能再次上报");
+        assert!(next_state);
+    }
+
+    #[test]
+    fn discovery_heartbeat_gap_tracks_missed_ticks() {
+        // 心跳结构：及时 tick 时 gap 接近 0；停止 tick 后 gap 随单调时钟增长。
+        // Arrange
+        let heartbeat = DiscoveryHeartbeat::new();
+
+        // Act：立即 tick 后 gap 应几乎为零。
+        heartbeat.tick();
+        let initial_gap = heartbeat.stall_gap_ms();
+
+        // Assert
+        assert!(
+            initial_gap <= 5,
+            "刚 tick 完 gap 应接近零，实际 {initial_gap}ms"
+        );
+
+        // Arrange：模拟主循环卡住（不再 tick）。
+        thread::sleep(Duration::from_millis(60));
+
+        // Act & Assert：gap 随时间增长，但仍远小于看门狗阈值。
+        let grown_gap = heartbeat.stall_gap_ms();
+        assert!(
+            grown_gap > initial_gap,
+            "停止 tick 后 gap 必须增长：{grown_gap}ms 应大于 {initial_gap}ms"
+        );
+        assert!(grown_gap < DISCOVERY_STALL_THRESHOLD_MS);
     }
 
     #[test]

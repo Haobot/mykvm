@@ -13,7 +13,7 @@ use crate::{
     decode_discovery_packet, discovery_base_port, input, known_peer_discovery_targets,
     load_layout_from_disk, local_peer_from_layout, peer_from_discovery_packet, preferred_quic_port,
     quic_transport, send_discovery_packet, send_discovery_packet_with_pairing,
-    should_reply_to_discovery, DiscoveryPairingFields, LayoutState,
+    should_reply_to_discovery, DiscoveryPairingFields, LayoutState, DISCOVERY_WRITE_TIMEOUT_MS,
 };
 
 /// The receive-only network runtime used by the Windows service before the
@@ -61,6 +61,11 @@ pub fn start(config_path: PathBuf) -> Result<Option<HeadlessClientHandle>, Strin
     socket
         .set_read_timeout(Some(Duration::from_millis(250)))
         .map_err(|error| format!("failed to set headless discovery timeout: {error}"))?;
+    // 与主 socket 相同的写超时防护：headless 服务无人值守，macOS/网络层
+    // 的 sendto 挂起一旦发生无人重启，必须让它返回而不是卡死发现线程。
+    socket
+        .set_write_timeout(Some(Duration::from_millis(DISCOVERY_WRITE_TIMEOUT_MS)))
+        .map_err(|error| format!("failed to set headless discovery send timeout: {error}"))?;
 
     let layout_state = Arc::new(Mutex::new(layout.clone()));
     let native_layout = Arc::new(Mutex::new(layout.clone()));
