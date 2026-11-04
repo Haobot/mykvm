@@ -1060,6 +1060,8 @@ impl AppRuntime {
         let transport_packets = Arc::clone(&self.transport_packets);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let heartbeat = Arc::new(DiscoveryHeartbeat::new());
+        let loop_heartbeat = Arc::clone(&heartbeat);
         socket
             .set_broadcast(true)
             .map_err(|error| format!("failed to enable UDP broadcast: {error}"))?;
@@ -1105,6 +1107,7 @@ impl AppRuntime {
             let mut last_probe_by_peer: HashMap<String, u64> = HashMap::new();
 
             while !thread_stop.load(Ordering::Relaxed) {
+                loop_heartbeat.tick();
                 if last_local_identity_refresh.elapsed() >= LOCAL_IDENTITY_REFRESH_INTERVAL {
                     refresh_local_device_identity(&layout_state);
                     last_local_identity_refresh = Instant::now();
@@ -1320,6 +1323,33 @@ impl AppRuntime {
 
                 prune_stale_peers(&peers);
                 sync_layout_peer_presence(&layout_state, &peers);
+            }
+        });
+
+        // 看门狗：discovery 主循环一旦被意外的长时间阻塞卡死（写超时只是
+        // 把已知场景挡住，这里兜底报告未知卡死），心跳停止更新、gap 超过
+        // 阈值时报 error。同一卡死期只报一次，心跳恢复后重置。线程随 stop
+        // 标志退出，与 discovery 线程同生命周期；重启 discovery 会创建新的
+        // 心跳与看门狗，旧代自然作废。
+        let watchdog_stop = Arc::clone(&stop);
+        let watchdog_heartbeat = Arc::clone(&heartbeat);
+        thread::spawn(move || {
+            let mut already_reported = false;
+            while !watchdog_stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(DISCOVERY_STALL_CHECK_INTERVAL_MS));
+                if watchdog_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let gap_ms = watchdog_heartbeat.stall_gap_ms();
+                let (should_report, next_state) =
+                    advance_discovery_stall_state(gap_ms, already_reported);
+                already_reported = next_state;
+                if should_report {
+                    log::error!(
+                        "discovery loop stalled for {}s; announces/probes are blocked",
+                        gap_ms / 1000
+                    );
+                }
             }
         });
 
@@ -9345,6 +9375,55 @@ fn sanitize_peer_id_part(value: &str) -> String {
 /// 发现链路 UDP socket 的写超时（毫秒），与 start_discovery 主 socket 同参。
 const DISCOVERY_WRITE_TIMEOUT_MS: u64 = 500;
 
+/// 看门狗检查发现循环心跳的间隔（毫秒）。
+const DISCOVERY_STALL_CHECK_INTERVAL_MS: u64 = 10_000;
+/// 心跳 gap 超过该值（毫秒）即视为发现循环卡死。
+const DISCOVERY_STALL_THRESHOLD_MS: u64 = 30_000;
+
+/// 看门狗判定/去重纯函数：输入当前心跳 gap 与"本卡死期是否已上报"，
+/// 返回（是否上报，下一轮状态）。心跳恢复时重置去重状态，允许下一次
+/// 卡死再次上报；同一卡死期只报一次。
+fn advance_discovery_stall_state(gap_ms: u64, already_reported: bool) -> (bool, bool) {
+    if gap_ms <= DISCOVERY_STALL_THRESHOLD_MS {
+        (false, false)
+    } else if already_reported {
+        (false, true)
+    } else {
+        (true, true)
+    }
+}
+
+/// 发现循环心跳：主循环每轮迭代更新一次刻度（线程内单调时钟相对
+/// discovery 启动的毫秒数），看门狗线程据此判定循环是否卡死。
+/// 每代 discovery 线程独享一份：重启后旧看门狗随旧 stop 标志退出，
+/// 新看门狗看新心跳，不会跨代误报。
+struct DiscoveryHeartbeat {
+    start: Instant,
+    last_tick_ms: AtomicU64,
+}
+
+impl DiscoveryHeartbeat {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_tick_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// 发现主循环每轮迭代调用：记录当前单调时钟刻度。
+    fn tick(&self) {
+        let tick_ms = self.start.elapsed().as_millis() as u64;
+        self.last_tick_ms.store(tick_ms, Ordering::Relaxed);
+    }
+
+    /// 当前心跳 gap（毫秒）：启动以来单调时钟与最后刻度之差。
+    /// Instant 是单调时钟，系统睡眠/休眠不推进它，唤醒不会造成假 gap。
+    fn stall_gap_ms(&self) -> u64 {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        elapsed_ms.saturating_sub(self.last_tick_ms.load(Ordering::Relaxed))
+    }
+}
+
 /// 为发现协议的临时 UDP socket 统一设置读/写超时。
 /// 写超时缺省曾在 macOS 网络扰动（IP 漂移/隐私会话重启）时令 sendto
 /// 永久阻塞并卡死发现线程，防护参数与主 socket 一致（见 start_discovery）。
@@ -13596,6 +13675,80 @@ mod tests {
             socket.write_timeout().expect("应能读取写超时配置"),
             Some(Duration::from_millis(DISCOVERY_WRITE_TIMEOUT_MS))
         );
+    }
+
+    #[test]
+    fn discovery_stall_watchdog_stays_silent_while_heartbeat_is_healthy() {
+        // 正常心跳（gap 小于阈值）不应触发上报，且保持"未上报"状态。
+        // Arrange & Act & Assert
+        let (should_report, next_state) = advance_discovery_stall_state(0, false);
+        assert!(!should_report, "心跳正常时不应上报");
+        assert!(!next_state, "心跳正常时不应进入已上报状态");
+
+        // 恰好等于阈值不算卡死（判定要求严格大于），不误报。
+        let (should_report, next_state) =
+            advance_discovery_stall_state(DISCOVERY_STALL_THRESHOLD_MS, false);
+        assert!(!should_report, "恰好等于阈值不应上报");
+        assert!(!next_state, "恰好等于阈值不应进入已上报状态");
+    }
+
+    #[test]
+    fn discovery_stall_watchdog_reports_once_when_loop_stalls() {
+        // gap 超过阈值且尚未上报：报一次，并进入"已上报"状态。
+        // Arrange & Act & Assert
+        let (should_report, next_state) =
+            advance_discovery_stall_state(DISCOVERY_STALL_THRESHOLD_MS + 1, false);
+        assert!(should_report, "超阈值且未上报过必须上报");
+        assert!(next_state, "上报后必须记住已上报");
+
+        // 同一卡死期的后续检查不再重复上报。
+        let (should_report, next_state) =
+            advance_discovery_stall_state(DISCOVERY_STALL_THRESHOLD_MS + 1, true);
+        assert!(!should_report, "同一卡死期只报一次");
+        assert!(next_state, "同一卡死期内保持已上报状态");
+    }
+
+    #[test]
+    fn discovery_stall_watchdog_can_report_again_after_recovery() {
+        // 心跳恢复（gap 回到阈值内）时重置去重状态，为下一次卡死做准备。
+        // Arrange & Act & Assert
+        let (should_report, next_state) = advance_discovery_stall_state(500, true);
+        assert!(!should_report, "恢复期不应上报");
+        assert!(!next_state, "恢复后必须重置去重状态");
+
+        // 之后再次卡死可再次上报。
+        let (should_report, next_state) =
+            advance_discovery_stall_state(DISCOVERY_STALL_THRESHOLD_MS + 1, next_state);
+        assert!(should_report, "恢复后再次卡死必须能再次上报");
+        assert!(next_state);
+    }
+
+    #[test]
+    fn discovery_heartbeat_gap_tracks_missed_ticks() {
+        // 心跳结构：及时 tick 时 gap 接近 0；停止 tick 后 gap 随单调时钟增长。
+        // Arrange
+        let heartbeat = DiscoveryHeartbeat::new();
+
+        // Act：立即 tick 后 gap 应几乎为零。
+        heartbeat.tick();
+        let initial_gap = heartbeat.stall_gap_ms();
+
+        // Assert
+        assert!(
+            initial_gap <= 5,
+            "刚 tick 完 gap 应接近零，实际 {initial_gap}ms"
+        );
+
+        // Arrange：模拟主循环卡住（不再 tick）。
+        thread::sleep(Duration::from_millis(60));
+
+        // Act & Assert：gap 随时间增长，但仍远小于看门狗阈值。
+        let grown_gap = heartbeat.stall_gap_ms();
+        assert!(
+            grown_gap > initial_gap,
+            "停止 tick 后 gap 必须增长：{grown_gap}ms 应大于 {initial_gap}ms"
+        );
+        assert!(grown_gap < DISCOVERY_STALL_THRESHOLD_MS);
     }
 
     #[test]
