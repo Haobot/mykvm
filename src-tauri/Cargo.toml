@@ -63,6 +63,27 @@ image = { version = "0.25", default-features = false, features = ["bmp", "png", 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
+# FocusHalo macOS camera capture (AVFoundation). Versions are pinned to the
+# objc2 0.6.x / 0.3.x family already in the tree (tauri/tao/arboard depend on
+# objc2 0.6.4, objc2-foundation 0.3.2, dispatch2 0.3.1, objc2-quartz-core
+# 0.3.2), so no duplicate objc2 versions get compiled into the binary.
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString"] }
+dispatch2 = { version = "0.3", features = ["objc2"] }
+objc2-av-foundation = { version = "0.3", features = [
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureSessionPreset",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+    "objc2-core-media",
+    "objc2-core-video",
+] }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-quartz-core = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.8.1"

@@ -5,6 +5,9 @@
 //! thread calls `infer` from its own thread, so the sessions sit behind a
 //! mutex purely to keep the `&self` interface (inference itself stays serial).
 
+pub mod camera;
+#[cfg(target_os = "macos")]
+pub mod camera_macos;
 pub mod pose;
 
 use std::path::{Path, PathBuf};
