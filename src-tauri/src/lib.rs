@@ -4575,6 +4575,23 @@ pub fn run() {
                     });
                 }));
             }
+            // FocusHalo startup restore (P1 gap): a layout saved with
+            // focus_halo.enabled=true must come back up after an app restart,
+            // like the other eagerly started subsystems above. The layout was
+            // already loaded into AppRuntime by the constructor; a failed
+            // enable (camera permission not granted yet, missing model, no
+            // screen) must never break startup, so it only warns here and the
+            // reason surfaces through halo_get_status.
+            {
+                let state = app.state::<AppRuntime>();
+                let enabled = state.inner().layout_snapshot().focus_halo.enabled;
+                if enabled {
+                    if let Err(error) = apply_halo_enabled(state.inner(), true) {
+                        log::warn!("halo: startup restore failed: {error}");
+                    }
+                }
+            }
+
             if silent_launch {
                 hide_main_window_handle(app.handle())?;
             } else {

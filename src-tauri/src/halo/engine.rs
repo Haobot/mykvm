@@ -16,7 +16,9 @@ use crate::halo::input_probe::InputActivityProbe;
 use crate::halo::mapping::{map_pose, CalibrationProfile};
 use crate::halo::overlay::{HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
 use crate::halo::params::{CameraPosition, FocusHaloSettings};
+use crate::halo::state_machine::{advance, DwellConfig, DwellInput, DwellPhase, DwellState};
 use crate::halo::tracker::HeadSample;
+use crate::halo::windows_layer::WindowService;
 
 /// Suspend the halo after the face has been missing this long.
 const FACE_LOST_SUSPEND_MS: u64 = 4000;
@@ -60,14 +62,25 @@ pub struct DebugSnapshot {
     /// width units (y is scaled by the aspect ratio). Feeds enterSpeed (P2).
     pub speed_norm: f64,
     pub phase: EnginePhase,
+    /// Window currently being settled or dwelled on (P2 dwell machine);
+    /// `None` when idle/cooldown or when no window service is attached.
+    pub candidate: Option<u64>,
+    /// Dwell machine stage (`idle`/`settling`/`candidate`/`switched`/
+    /// `cooldown`) for the debug panel. `switched` appears only on the tick a
+    /// switch event fired.
+    pub phase_str: &'static str,
 }
 
-/// Engine wiring snapshot handed to [`spawn`].
-#[derive(Debug, Clone)]
+/// Engine wiring snapshot handed to [`spawn`]. Not `Clone`/`Debug` because it
+/// owns the platform window service (a `Box<dyn WindowService>`).
 pub struct EngineConfig {
     pub settings: FocusHaloSettings,
     pub calibration: CalibrationProfile,
     pub screen: OverlayScreenGeometry,
+    /// Window enumeration/hit-test layer (P2). `None` bypasses the dwell
+    /// machine entirely (pure-follow mode): used by halo_manual and by
+    /// platforms without a window layer, where the halo just follows.
+    pub window_service: Option<Box<dyn WindowService>>,
 }
 
 /// Commands the engine thread accepts while running.
@@ -108,12 +121,17 @@ pub(crate) struct EngineState {
     prev_norm_ts: Option<u64>,
     raw: (f64, f64),
     filtered: (f64, f64),
+    /// P2 dwell/switch machine; advanced only when a window service exists.
+    dwell: DwellState,
+    /// `None` (halo_manual, unsupported platforms) keeps the engine in
+    /// pure-follow mode: no hit-tests, dwell machine bypassed.
+    window_service: Option<Box<dyn WindowService>>,
 }
 
 impl EngineState {
-    pub(crate) fn new(config: &EngineConfig) -> Self {
+    pub(crate) fn new(config: EngineConfig) -> Self {
         EngineState {
-            settings: config.settings.clone(),
+            settings: config.settings,
             calibration: config.calibration,
             screen: config.screen,
             yaw_filter: OneEuroFilter::head_pose(),
@@ -129,6 +147,8 @@ impl EngineState {
             prev_norm_ts: None,
             raw: (0.0, 0.0),
             filtered: (0.0, 0.0),
+            dwell: DwellState::default(),
+            window_service: config.window_service,
         }
     }
 }
@@ -224,9 +244,55 @@ pub(crate) fn step(
         state.norm.0 * state.screen.width,
         state.norm.1 * state.screen.height,
     );
+
+    // P2 dwell machine: one hit-test per tick (the window service caches its
+    // enumeration for 300 ms) feeds the pure state machine. `None` service
+    // bypasses it entirely — pure-follow mode for halo_manual and platforms
+    // without a window layer.
+    let (dwell_phase, _switch_event) = match state.window_service.as_mut() {
+        None => (DwellPhase::Idle, None),
+        Some(service) => {
+            // WindowInfo frames and hit_test live in the layout board's
+            // logical space, so the halo center is converted from
+            // screen-local to board coordinates (identical when the tracked
+            // screen sits at the board origin).
+            let board = (state.screen.x + local.0, state.screen.y + local.1);
+            let hit = service.hit_test(board.0, board.1).ok().flatten();
+            let cfg = DwellConfig::from_settings(&state.settings);
+            let input = DwellInput {
+                now_ms,
+                halo_local: board,
+                speed_norm: state.speed_norm,
+                hit: hit.as_ref(),
+                foreground_id: None,
+                suspend: phase != EnginePhase::Idle,
+            };
+            let (phase_out, event) = advance(&mut state.dwell, &input, &cfg);
+            // P2 only observes the switch; a later phase consumes the event
+            // for real activation.
+            if let Some(event) = event {
+                log::info!("halo: dwell switch fired window={}", event.window_id);
+            }
+            (phase_out, event)
+        }
+    };
+
     let visual = match phase {
-        EnginePhase::Idle => HaloVisual::Idle,
         EnginePhase::SuspendedFace | EnginePhase::SuspendedInput => HaloVisual::Suspended,
+        EnginePhase::Idle => match dwell_phase {
+            DwellPhase::Candidate { progress, .. } => HaloVisual::Candidate {
+                // show_progress=false keeps the candidate ring but hides the
+                // arc (progress 0 renders no sweep).
+                progress: if state.settings.show_progress {
+                    progress
+                } else {
+                    0.0
+                },
+            },
+            // Transient: the tick a switch fired flashes the ring.
+            DwellPhase::Switched { .. } => HaloVisual::SwitchPulse,
+            DwellPhase::Idle | DwellPhase::Cooldown => HaloVisual::Idle,
+        },
     };
     let snapshot = DebugSnapshot {
         ts_ms: now_ms,
@@ -239,6 +305,18 @@ pub(crate) fn step(
         norm_y: state.norm.1,
         speed_norm: state.speed_norm,
         phase,
+        candidate: match dwell_phase {
+            DwellPhase::Candidate { window_id, .. } | DwellPhase::Switched { window_id } => {
+                Some(window_id)
+            }
+            // A settling window counts as the pending candidate for the
+            // debug panel ("why is nothing happening yet").
+            DwellPhase::Idle | DwellPhase::Cooldown => state.dwell.candidate_window(),
+        },
+        phase_str: match dwell_phase {
+            DwellPhase::Switched { .. } => "switched",
+            _ => state.dwell.debug_phase_str(),
+        },
     };
     (visual, local, snapshot)
 }
@@ -258,7 +336,7 @@ pub fn spawn(
 ) {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let (debug_tx, debug_rx) = std::sync::mpsc::sync_channel(64);
-    let state = EngineState::new(&config);
+    let state = EngineState::new(config);
     let handle = std::thread::Builder::new()
         .name("focus-halo-engine".into())
         .spawn(move || run_loop(state, sample_rx, cmd_rx, overlay, probe, debug_tx))
@@ -380,6 +458,7 @@ fn run_loop(
 mod tests {
     use super::*;
     use crate::halo::params::FocusHaloSettings;
+    use crate::halo::windows_layer::WindowInfo;
 
     fn test_screen() -> OverlayScreenGeometry {
         OverlayScreenGeometry {
@@ -394,10 +473,38 @@ mod tests {
     }
 
     fn test_state() -> EngineState {
-        EngineState::new(&EngineConfig {
+        EngineState::new(EngineConfig {
             settings: FocusHaloSettings::default(),
             calibration: CalibrationProfile::default(),
             screen: test_screen(),
+            window_service: None,
+        })
+    }
+
+    /// A window service that always "hits" the same window under any point,
+    /// so dwell integration can be exercised without a live window layer.
+    struct FixedWindowService {
+        window: Option<WindowInfo>,
+    }
+
+    impl WindowService for FixedWindowService {
+        fn enumerate(&mut self) -> Result<Vec<WindowInfo>, String> {
+            Ok(self.window.iter().cloned().collect())
+        }
+
+        fn hit_test(&mut self, _x: f64, _y: f64) -> Result<Option<WindowInfo>, String> {
+            Ok(self.window.clone())
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
+    fn test_state_with_window(window: Option<WindowInfo>) -> EngineState {
+        EngineState::new(EngineConfig {
+            settings: FocusHaloSettings::default(),
+            calibration: CalibrationProfile::default(),
+            screen: test_screen(),
+            window_service: Some(Box::new(FixedWindowService { window })),
         })
     }
 
@@ -525,5 +632,141 @@ mod tests {
         assert_eq!(FACE_LOST_SUSPEND_MS, 4000);
         assert_eq!(INPUT_QUIET_RESUME_MS, 1000);
         assert!((TICK_PERIOD.as_secs_f64() - 1.0 / 60.0).abs() < 1e-6);
+    }
+
+    fn dwell_window(id: u64) -> WindowInfo {
+        WindowInfo {
+            id,
+            title: format!("win{id}"),
+            process: "app".into(),
+            frame: (0.0, 0.0, 1000.0, 500.0),
+            is_foreground: false,
+        }
+    }
+
+    #[test]
+    fn dwell_reaches_visual_and_debug_snapshot() {
+        let mut s = test_state_with_window(Some(dwell_window(9)));
+        // First sample: speed stays 0 (no prior position), the halo is over
+        // the fake window, so settling starts at t=0.
+        let (_, _, snap) = step(&mut s, Some(sample(0, true, 0.0, 0.0)), 0, false);
+        assert_eq!(snap.candidate, Some(9), "settling counts as the candidate");
+        assert_eq!(snap.phase_str, "settling");
+
+        // Settle (150 ms) completes by t=200: candidate phase, progress 0.
+        let (visual, _, snap) = step(&mut s, None, 200, false);
+        assert_eq!(visual, HaloVisual::Candidate { progress: 0.0 });
+        assert_eq!(snap.candidate, Some(9));
+        assert_eq!(snap.phase_str, "candidate");
+
+        // Dwell progress feeds the visual arc.
+        let (visual, _, snap) = step(&mut s, None, 600, false);
+        let progress = match visual {
+            HaloVisual::Candidate { progress } => progress,
+            other => panic!("expected Candidate, got {other:?}"),
+        };
+        assert!((progress - 400.0 / 900.0).abs() < 1e-6);
+        assert_eq!(snap.phase_str, "candidate");
+
+        // Dwell completes at 200 + 900 = 1100: pulse on exactly this tick.
+        let (visual, _, snap) = step(&mut s, None, 1100, false);
+        assert_eq!(visual, HaloVisual::SwitchPulse);
+        assert_eq!(snap.candidate, Some(9));
+        assert_eq!(snap.phase_str, "switched");
+
+        // Cooldown ticks render idle again.
+        let (visual, _, snap) = step(&mut s, None, 1120, false);
+        assert_eq!(visual, HaloVisual::Idle);
+        assert_eq!(snap.candidate, None);
+        assert_eq!(snap.phase_str, "cooldown");
+    }
+
+    #[test]
+    fn no_window_service_bypasses_the_dwell_machine() {
+        let mut s = test_state();
+        // Same timing as the integration test above, but with no window
+        // service the engine must stay pure-follow: no candidate visuals, no
+        // dwell telemetry.
+        for (now, expect) in [
+            (0u64, HaloVisual::Idle),
+            (200, HaloVisual::Idle),
+            (1100, HaloVisual::Idle),
+        ] {
+            let sample = if now == 0 {
+                Some(sample(now, true, 0.0, 0.0))
+            } else {
+                None
+            };
+            let (visual, _, snap) = step(&mut s, sample, now, false);
+            assert_eq!(visual, expect, "tick {now}");
+            assert_eq!(snap.candidate, None);
+            assert_eq!(snap.phase_str, "idle");
+        }
+    }
+
+    #[test]
+    fn foreground_hits_and_suspension_hold_the_dwell_machine() {
+        let mut foreground = dwell_window(5);
+        foreground.is_foreground = true;
+        let mut s = test_state_with_window(Some(foreground));
+        step(&mut s, Some(sample(0, true, 0.0, 0.0)), 0, false);
+        // Foreground never becomes a candidate, even after settle time.
+        let (visual, _, snap) = step(&mut s, None, 200, false);
+        assert_eq!(visual, HaloVisual::Idle);
+        assert_eq!(snap.candidate, None);
+        assert_eq!(snap.phase_str, "idle");
+
+        // Non-foreground + physical input: the engine's suspension clears the
+        // dwell machine, so the visual is Suspended and timing restarts.
+        let mut s = test_state_with_window(Some(dwell_window(6)));
+        step(&mut s, Some(sample(0, true, 0.0, 0.0)), 0, false);
+        let (visual, _, _) = step(&mut s, None, 100, true);
+        assert_eq!(visual, HaloVisual::Suspended);
+        // After the 1 s quiet window, the machine is back to a fresh settle.
+        let (visual, _, snap) = step(&mut s, None, 1100, false);
+        assert_eq!(visual, HaloVisual::Idle, "settling restarted, not resumed");
+        assert_eq!(snap.phase_str, "settling");
+        let (visual, _, _) = step(&mut s, None, 1250, false);
+        assert_eq!(visual, HaloVisual::Candidate { progress: 0.0 });
+    }
+
+    #[test]
+    fn show_progress_off_keeps_the_ring_but_hides_the_arc() {
+        let mut s = test_state_with_window(Some(dwell_window(7)));
+        s.settings.show_progress = false;
+        step(&mut s, Some(sample(0, true, 0.0, 0.0)), 0, false);
+        let (visual, _, _) = step(&mut s, None, 200, false);
+        assert_eq!(
+            visual,
+            HaloVisual::Candidate { progress: 0.0 },
+            "candidate ring shows, arc stays empty"
+        );
+        // Mid-dwell the arc still reports 0 (progress suppressed).
+        let (visual, _, _) = step(&mut s, None, 600, false);
+        assert_eq!(visual, HaloVisual::Candidate { progress: 0.0 });
+    }
+
+    #[test]
+    fn hit_test_errors_are_tolerated_as_no_hit() {
+        struct ExplodingService;
+        impl WindowService for ExplodingService {
+            fn enumerate(&mut self) -> Result<Vec<WindowInfo>, String> {
+                Err("backend exploded".into())
+            }
+            fn hit_test(&mut self, _x: f64, _y: f64) -> Result<Option<WindowInfo>, String> {
+                Err("backend exploded".into())
+            }
+            fn invalidate(&mut self) {}
+        }
+        let mut s = EngineState::new(EngineConfig {
+            settings: FocusHaloSettings::default(),
+            calibration: CalibrationProfile::default(),
+            screen: test_screen(),
+            window_service: Some(Box::new(ExplodingService)),
+        });
+        let (visual, _, snap) = step(&mut s, Some(sample(0, true, 0.0, 0.0)), 0, false);
+        assert_eq!(visual, HaloVisual::Idle, "hit-test failure == blank area");
+        assert_eq!(snap.candidate, None);
+        assert_eq!(snap.phase_str, "idle");
     }
 }

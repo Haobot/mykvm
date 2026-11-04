@@ -17,6 +17,7 @@ pub mod input_probe;
 pub mod mapping;
 pub mod overlay;
 pub mod params;
+pub mod state_machine;
 pub mod tracker;
 pub mod windows_layer;
 
@@ -26,6 +27,9 @@ pub use input_probe::{InputActivityProbe, NullProbe, SystemInputProbe};
 pub use mapping::{map_pose, CalibrationProfile};
 pub use overlay::{HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
 pub use params::FocusHaloSettings;
+pub use state_machine::{
+    advance as advance_dwell, DwellConfig, DwellPhase, DwellState, SwitchEvent,
+};
 pub use tracker::{default_models_dir, Frame, HeadSample, PoseEngine};
 pub use windows_layer::{create_window_service, WindowInfo, WindowService};
 
@@ -261,6 +265,13 @@ impl HaloRuntime {
         let config = EngineConfig {
             settings: settings.clone(),
             calibration,
+            // P2 dwell: a single-screen window list over the tracked screen's
+            // board area is enough for now; multi-screen board layout stays a
+            // later-phase refinement. The service caches enumeration for
+            // 300 ms, so the engine can hit-test every tick cheaply. (This
+            // field borrows `screen`, so it is initialized before `screen`
+            // moves into the config.)
+            window_service: Some(create_window_service(std::slice::from_ref(&screen))),
             screen,
         };
         let (engine_handle, engine_cmd_tx, engine_debug_rx) = engine::spawn(
