@@ -49,10 +49,25 @@ const NEUTRAL_SUSPENDED: (f64, f64, f64, f64) = (0.62, 0.66, 0.72, 0.30);
 const PULSE: (f64, f64, f64, f64) = (0.20, 0.80, 0.95, 1.0);
 const ACCENT: (f64, f64, f64, f64) = (0.20, 0.80, 0.95, 0.95);
 
+// Candidate-window border: the window pads the board frame by this much on
+// every side so the 3pt stroke lands fully inside; the outline hugs the
+// original frame with rounded corners.
+const BORDER_PAD: f64 = 6.0;
+const BORDER_STROKE: f64 = 3.0;
+const BORDER_CORNER_RADIUS: f64 = 12.0;
+// Breathing opacity range and period (s); Core Animation modulates the
+// layer's presentation opacity, no per-frame driving from this process.
+const BORDER_OPACITY_MIN: f64 = 0.35;
+const BORDER_OPACITY_MAX: f64 = 0.9;
+const BORDER_BREATH_SECONDS: f64 = 1.2;
+
 // NSWindow / layer pointers (as usize), created lazily on the main thread.
 static WINDOW: AtomicUsize = AtomicUsize::new(0);
 static RING_LAYER: AtomicUsize = AtomicUsize::new(0);
 static ARC_LAYER: AtomicUsize = AtomicUsize::new(0);
+// Border window and its stroke layer (same lazy main-thread pattern).
+static BORDER_WINDOW: AtomicUsize = AtomicUsize::new(0);
+static BORDER_LAYER: AtomicUsize = AtomicUsize::new(0);
 // Diameter the existing window was built with (f64::to_bits; 0 = none yet).
 // When a later configure() changes halo_diameter the same window is resized
 // instead of rebuilt, so this is what makes hot diameter changes take effect.
@@ -85,6 +100,14 @@ extern "C" {
         rect: CGRect,
         transform: *const CGAffineTransform,
     ) -> *mut c_void;
+    fn CGPathCreateMutable() -> *mut c_void;
+    fn CGPathAddRoundedRect(
+        path: *mut c_void,
+        transform: *const CGAffineTransform,
+        rect: CGRect,
+        corner_width: f64,
+        corner_height: f64,
+    );
     fn CGColorCreateGenericRGB(red: f64, green: f64, blue: f64, alpha: f64) -> *mut c_void;
 }
 
@@ -109,6 +132,11 @@ unsafe fn send1(obj: *mut c_void, s: *mut c_void, a: *mut c_void) -> *mut c_void
     let f: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, s, a)
+}
+unsafe fn send2(obj: *mut c_void, s: *mut c_void, a: *mut c_void, b: *mut c_void) -> *mut c_void {
+    let f: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as *const ());
+    f(obj, s, a, b)
 }
 unsafe fn send_f64(obj: *mut c_void, selector: &[u8]) -> f64 {
     let f: extern "C" fn(*mut c_void, *mut c_void) -> f64 =
@@ -164,6 +192,28 @@ fn ns_window_origin(
     )
 }
 
+/// Board-space border frame → the border window's NS frame (bottom-left
+/// origin), padded `pad` points beyond the board rectangle on every side so
+/// the stroke lands inside the window. Pure so the flip math stays testable.
+fn border_ns_frame(
+    geometry: &OverlayScreenGeometry,
+    border: &crate::halo::overlay::BorderFrame,
+    pad: f64,
+    primary_height: f64,
+) -> NsRect {
+    // Board → screen-local → CG global (identity on single-board macs).
+    let cg_x = geometry.native_x + (border.x - geometry.x);
+    let cg_y = geometry.native_y + (border.y - geometry.y);
+    // The CG top-left of the padded window is (cg_x - pad, cg_y - pad) and
+    // its height is h + 2*pad; NS flips y around the primary display height.
+    NsRect {
+        x: cg_x - pad,
+        y: primary_height - cg_y - border.h - pad,
+        w: border.w + pad * 2.0,
+        h: border.h + pad * 2.0,
+    }
+}
+
 /// Ellipse path inset so the stroke never clips at the window edge. Returns a
 /// raw +1 CGPathRef; the caller releases it after handing it to a layer.
 unsafe fn ellipse_path(rect: CGRect) -> *mut c_void {
@@ -174,6 +224,8 @@ pub struct MacOSOverlay {
     diameter: f64,
     /// True once creation has been dispatched (window stays alive afterwards).
     active: bool,
+    /// Whether a border is currently wanted (mirrors the last set_border).
+    border_visible: bool,
     geometry: Option<OverlayScreenGeometry>,
     /// Cached `CGDisplay::main()` height for the y flip; refreshed on
     /// set_screen because the primary display can change.
@@ -187,6 +239,7 @@ impl MacOSOverlay {
         MacOSOverlay {
             diameter: settings.halo_diameter,
             active: false,
+            border_visible: false,
             geometry: None,
             primary_height: None,
         }
@@ -219,6 +272,10 @@ impl OverlayBackend for MacOSOverlay {
     }
 
     fn hide(&mut self) {
+        // The border window hides too: one overlay lifecycle owns both
+        // windows (each stays alive for process-wide reuse).
+        self.border_visible = false;
+        on_main(hide_border, std::ptr::null_mut());
         if !self.active {
             return;
         }
@@ -246,12 +303,33 @@ impl OverlayBackend for MacOSOverlay {
         );
         on_main(apply_frame, Box::into_raw(Box::new(*frame)) as *mut c_void);
     }
+
+    fn set_border(&mut self, border: Option<crate::halo::overlay::BorderFrame>) {
+        let Some(border) = border else {
+            self.border_visible = false;
+            on_main(hide_border, std::ptr::null_mut());
+            return;
+        };
+        let Some(geometry) = self.geometry else {
+            return;
+        };
+        self.border_visible = true;
+        let height = self.primary_height();
+        let rect = border_ns_frame(&geometry, &border, BORDER_PAD, height);
+        // Same lazy main-thread pattern as the halo window: creation and the
+        // frame application stay ordered on the main queue.
+        on_main(show_border, Box::into_raw(Box::new(rect)) as *mut c_void);
+    }
+
+    fn border_visible(&self) -> bool {
+        self.border_visible
+    }
 }
 
 impl Drop for MacOSOverlay {
     fn drop(&mut self) {
-        // The NSWindow object itself is kept (like the drag overlay) so a
-        // later show can reuse it; only visibility is dropped.
+        // The NSWindow objects themselves are kept (like the drag overlay) so
+        // a later show can reuse them; only visibility is dropped.
         self.hide();
     }
 }
@@ -376,13 +454,11 @@ extern "C" fn apply_frame(ctx: *mut c_void) {
     }
 }
 
-unsafe fn build_window(diameter: f64) -> *mut c_void {
-    let rect = NsRect {
-        x: 0.0,
-        y: 0.0,
-        w: diameter,
-        h: diameter,
-    };
+/// Shared NSWindow boilerplate for both overlay windows: borderless,
+/// transparent, shadowless, click-through, level-25, all-spaces window with a
+/// layer-backed content view. Returns (window, host layer); the host is null
+/// when the view could not be created (callers degrade to a plain window).
+unsafe fn make_click_through_window(rect: NsRect) -> (*mut c_void, *mut c_void) {
     let alloc = send(cls(b"NSWindow\0"), sel(b"alloc\0"));
     // initWithContentRect:styleMask:backing:defer: (borderless=0, buffered=2)
     let init: extern "C" fn(*mut c_void, *mut c_void, NsRect, u64, u64, bool) -> *mut c_void =
@@ -396,7 +472,7 @@ unsafe fn build_window(diameter: f64) -> *mut c_void {
         false,
     );
     if window.is_null() {
-        return std::ptr::null_mut();
+        return (std::ptr::null_mut(), std::ptr::null_mut());
     }
 
     // Transparent, shadowless, click-through, top-most, all-spaces.
@@ -413,17 +489,31 @@ unsafe fn build_window(diameter: f64) -> *mut c_void {
         std::mem::transmute(objc_msgSend as *const ());
     set_behavior(window, sel(b"setCollectionBehavior:\0"), 1 | 16);
 
-    // Layer-backed content view hosting the ring and progress-arc sublayers.
+    // Layer-backed content view.
     let view_alloc = send(cls(b"NSView\0"), sel(b"alloc\0"));
     let view_init: extern "C" fn(*mut c_void, *mut c_void, NsRect) -> *mut c_void =
         std::mem::transmute(objc_msgSend as *const ());
     let view = view_init(view_alloc, sel(b"initWithFrame:\0"), rect);
     if view.is_null() {
-        return window;
+        return (window, std::ptr::null_mut());
     }
     set_bool(view, b"setWantsLayer:\0", true);
     send1(window, sel(b"setContentView:\0"), view);
     let host = send(view, sel(b"layer\0"));
+    (window, host)
+}
+
+unsafe fn build_window(diameter: f64) -> *mut c_void {
+    let rect = NsRect {
+        x: 0.0,
+        y: 0.0,
+        w: diameter,
+        h: diameter,
+    };
+    let (window, host) = make_click_through_window(rect);
+    if window.is_null() {
+        return std::ptr::null_mut();
+    }
     if host.is_null() {
         return window;
     }
@@ -439,6 +529,173 @@ unsafe fn build_window(diameter: f64) -> *mut c_void {
         ARC_LAYER.store(arc as usize, Ordering::Relaxed);
     }
     window
+}
+
+// ---------------------------------------------------------------------------
+// Candidate-window border: a second click-through window hosting one
+// CAShapeLayer stroked rounded rect. The breathing (opacity 0.35↔0.9 over a
+// 1.2 s autoreverse loop) runs entirely in Core Animation on the GPU
+// compositor, so nothing here drives it per frame; set_border only
+// moves/resizes the window and refreshes the outline path.
+// ---------------------------------------------------------------------------
+
+/// Rounded-rect outline path for the border window: the board frame is inset
+/// `BORDER_PAD` points from the window edges so the centered stroke stays
+/// inside. Built with `CGPathAddRoundedRect` — `CGPathCreateWithRoundedCGRect`
+/// is no longer exported by the macOS 27 SDK. Returns a raw +1
+/// CGMutablePathRef (usable as a CGPathRef); the caller releases it after
+/// handing it to a layer.
+unsafe fn border_path(rect: NsRect) -> *mut c_void {
+    let mutable = CGPathCreateMutable();
+    if mutable.is_null() {
+        return std::ptr::null_mut();
+    }
+    let inner = CGRect {
+        origin: CGPoint {
+            x: BORDER_PAD,
+            y: BORDER_PAD,
+        },
+        size: CGSize {
+            width: rect.w - BORDER_PAD * 2.0,
+            height: rect.h - BORDER_PAD * 2.0,
+        },
+    };
+    CGPathAddRoundedRect(
+        mutable,
+        std::ptr::null(),
+        inner,
+        BORDER_CORNER_RADIUS,
+        BORDER_CORNER_RADIUS,
+    );
+    mutable
+}
+
+unsafe fn build_border_window(rect: NsRect) -> *mut c_void {
+    let (window, host) = make_click_through_window(rect);
+    if window.is_null() {
+        return std::ptr::null_mut();
+    }
+    if host.is_null() {
+        return window;
+    }
+    let layer = make_shape_layer(rect, send_f64(window, b"backingScaleFactor\0"));
+    if layer.is_null() {
+        return window;
+    }
+    // Swap the shape layer's default ellipse for the rounded outline, stroke
+    // it in the accent color and keep it visible while the window is.
+    let path = border_path(rect);
+    send1(layer, sel(b"setPath:\0"), path);
+    CFRelease(path);
+    send1(layer, sel(b"setStrokeColor:\0"), cg_color(ACCENT));
+    set_f64(layer, b"setLineWidth:\0", BORDER_STROKE);
+    set_bool(layer, b"setHidden:\0", false);
+    set_f64(layer, b"setOpacity:\0", BORDER_OPACITY_MAX);
+    send1(host, sel(b"addSublayer:\0"), layer);
+    BORDER_LAYER.store(layer as usize, Ordering::Relaxed);
+    window
+}
+
+/// Attach the breathing CABasicAnimation (opacity 0.35↔0.9, 1.2 s,
+/// autoreverse, repeat forever). Called once at window creation; later
+/// path/frame updates leave the animation untouched.
+unsafe fn start_border_breathing(layer: *mut c_void) {
+    let key_path = ns_string("opacity");
+    let alloc = send(cls(b"CABasicAnimation\0"), sel(b"alloc\0"));
+    let anim = send1(alloc, sel(b"initWithKeyPath:\0"), key_path);
+    send1(key_path, sel(b"release\0"), std::ptr::null_mut());
+    if anim.is_null() {
+        return;
+    }
+    let from = ns_number(BORDER_OPACITY_MIN);
+    let to = ns_number(BORDER_OPACITY_MAX);
+    send1(anim, sel(b"setFromValue:\0"), from);
+    send1(anim, sel(b"setToValue:\0"), to);
+    send1(from, sel(b"release\0"), std::ptr::null_mut());
+    send1(to, sel(b"release\0"), std::ptr::null_mut());
+    set_f64(anim, b"setDuration:\0", BORDER_BREATH_SECONDS);
+    set_bool(anim, b"setAutoreverses:\0", true);
+    // CAMediaTiming.repeatCount: HUGE_VAL-style "forever".
+    set_f64(anim, b"setRepeatCount:\0", 1e100);
+    set_bool(anim, b"setRemovedOnCompletion:\0", false);
+    send2(
+        layer,
+        sel(b"addAnimation:forKey:\0"),
+        anim,
+        std::ptr::null_mut(),
+    );
+    send1(anim, sel(b"release\0"), std::ptr::null_mut());
+}
+
+/// NSString for the few selector-key strings needed here. Uses alloc/initWith
+/// (not the autoreleased class factories) so the marshaled callback needs no
+/// autorelease pool: the caller owns the +1 object and releases it.
+unsafe fn ns_string(value: &str) -> *mut c_void {
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.push(0);
+    let alloc = send(cls(b"NSString\0"), sel(b"alloc\0"));
+    send1(
+        alloc,
+        sel(b"initWithUTF8String:\0"),
+        bytes.as_ptr() as *mut c_void,
+    )
+}
+
+/// Boxed CGFloat for CABasicAnimation's from/to values; +1 owned, caller
+/// releases.
+unsafe fn ns_number(value: f64) -> *mut c_void {
+    let alloc = send(cls(b"NSNumber\0"), sel(b"alloc\0"));
+    let f: extern "C" fn(*mut c_void, *mut c_void, f64) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as *const ());
+    f(alloc, sel(b"initWithDouble:\0"), value)
+}
+
+extern "C" fn show_border(ctx: *mut c_void) {
+    let rect = unsafe { Box::from_raw(ctx as *mut NsRect) };
+    let mut window = BORDER_WINDOW.load(Ordering::Relaxed) as *mut c_void;
+    unsafe {
+        if window.is_null() {
+            window = build_border_window(*rect);
+            if window.is_null() {
+                return;
+            }
+            BORDER_WINDOW.store(window as usize, Ordering::Relaxed);
+            let layer = BORDER_LAYER.load(Ordering::Relaxed) as *mut c_void;
+            if !layer.is_null() {
+                start_border_breathing(layer);
+            }
+        } else {
+            // Reuse: move/resize, then refresh the outline path (sublayers do
+            // not follow window resizes on their own).
+            set_frame_display(window, *rect, true);
+            let layer = BORDER_LAYER.load(Ordering::Relaxed) as *mut c_void;
+            if !layer.is_null() {
+                set_rect(
+                    layer,
+                    b"setFrame:\0",
+                    NsRect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: rect.w,
+                        h: rect.h,
+                    },
+                );
+                let path = border_path(*rect);
+                send1(layer, sel(b"setPath:\0"), path);
+                CFRelease(path);
+            }
+        }
+        send(window, sel(b"orderFrontRegardless\0"));
+    }
+}
+
+extern "C" fn hide_border(_ctx: *mut c_void) {
+    let window = BORDER_WINDOW.load(Ordering::Relaxed) as *mut c_void;
+    if !window.is_null() {
+        unsafe {
+            send1(window, sel(b"orderOut:\0"), std::ptr::null_mut());
+        }
+    }
 }
 
 unsafe fn make_shape_layer(rect: NsRect, scale: f64) -> *mut c_void {
@@ -500,5 +757,44 @@ mod tests {
         let (x, y) = ns_window_origin(&g, (60.0, 40.0), 160.0, 1000.0);
         assert_eq!(x, 100.0 + 60.0 - 80.0);
         assert_eq!(y, 1000.0 - (200.0 + 40.0) - 80.0);
+    }
+
+    #[test]
+    fn border_ns_frame_flips_y_and_pads_the_board_rect() {
+        let g = geometry(0.0, 0.0);
+        let border = crate::halo::overlay::BorderFrame {
+            x: 100.0,
+            y: 200.0,
+            w: 400.0,
+            h: 300.0,
+        };
+        let rect = border_ns_frame(&g, &border, 6.0, 1080.0);
+        // Window top-left in CG: (94, 194); NS y = 1080 - 194 - 312 = 574.
+        assert_eq!(
+            (rect.x, rect.y, rect.w, rect.h),
+            (94.0, 574.0, 412.0, 312.0)
+        );
+    }
+
+    #[test]
+    fn border_ns_frame_subtracts_the_screen_board_origin() {
+        // Screen sits at board (50, 25) with native origin (100, 200).
+        let g = OverlayScreenGeometry {
+            x: 50.0,
+            y: 25.0,
+            ..geometry(100.0, 200.0)
+        };
+        let border = crate::halo::overlay::BorderFrame {
+            x: 60.0,
+            y: 40.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let rect = border_ns_frame(&g, &border, 6.0, 1000.0);
+        // Board (60,40) → CG (100+10, 200+15) = (110, 215).
+        assert_eq!(
+            (rect.x, rect.y, rect.w, rect.h),
+            (104.0, 679.0, 212.0, 112.0)
+        );
     }
 }

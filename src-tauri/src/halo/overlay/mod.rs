@@ -31,6 +31,18 @@ pub struct HaloFrame {
     pub opacity: f64,
 }
 
+/// Candidate-window border in layout-board logical coordinates (the same
+/// space as [`crate::halo::windows_layer::WindowInfo::frame`]). The breathing
+/// phase itself is a per-backend concern: macOS runs a Core Animation
+/// autoreverse loop, Windows modulates alpha in its 60 Hz timer tick.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct BorderFrame {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 /// Screen geometry in the engine's layout-board space plus the platform's
 /// global native origin, so the backend never needs layout knowledge.
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +69,14 @@ pub trait OverlayBackend: Send {
     fn set_screen(&mut self, geometry: OverlayScreenGeometry);
     /// `local` is this screen's local logical coordinate (halo center point).
     fn update(&mut self, local: (f64, f64), frame: &HaloFrame);
+    /// Candidate-window border: `Some(frame)` draws the breathing outline
+    /// around that board-space rectangle, `None` hides it. Default no-op so
+    /// minimal backends (NoopBackend) stay unchanged.
+    fn set_border(&mut self, _border: Option<BorderFrame>) {}
+    /// Whether a border is currently wanted by the backend (test hook).
+    fn border_visible(&self) -> bool {
+        false
+    }
 }
 
 /// macOS and Windows both have the primitives P0 needs; Linux has no

@@ -25,7 +25,7 @@ pub use engine::{spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConf
 pub use filter::OneEuroFilter;
 pub use input_probe::{InputActivityProbe, NullProbe, SystemInputProbe};
 pub use mapping::{map_pose, CalibrationProfile};
-pub use overlay::{HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
+pub use overlay::{BorderFrame, HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
 pub use params::FocusHaloSettings;
 pub use state_machine::{
     advance as advance_dwell, DwellConfig, DwellPhase, DwellState, SwitchEvent,
@@ -449,6 +449,19 @@ impl HaloRuntime {
                 opacity: self.settings.halo_opacity,
             },
         );
+    }
+
+    /// P0 test hook: show or clear the candidate-window border (the breathing
+    /// animation lives inside the backend). `border` coordinates are board
+    /// logical, matching `WindowInfo::frame`. No-op while running.
+    pub fn show_test_border(&mut self, border: Option<BorderFrame>) {
+        if self.is_running() {
+            return;
+        }
+        self.ensure_overlay();
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.set_border(border);
+        }
     }
 
     /// Hide the overlay window. While running the engine owns the window (its

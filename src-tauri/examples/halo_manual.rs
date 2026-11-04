@@ -5,16 +5,21 @@
 //! Usage:
 //!   cargo run --example halo_manual -- [x y] [idle|candidate|pulse|suspended]
 //!        [diameter] [resize_to resize_after_ms]
+//!   cargo run --example halo_manual -- border x y w h [clear_after_ms]
+//!   cargo run --example halo_manual -- clear
 //!
 //! Examples:
 //!   halo_manual 756 491 idle 160            # static ring at screen center
 //!   halo_manual 756 491 idle 160 180 4000   # hot-resize to 180 after 4s
 //!   halo_manual 400 300 candidate 160       # dwell-progress arc
+//!   halo_manual border 200 150 800 500      # breathing border around a rect
+//!   halo_manual border 200 150 800 500 6000 # ...auto-clear after 6 s
 //!
 //! The process just pumps the main run loop; Ctrl-C exits.
 
 use mykvm_lib::halo::{
-    create_window_service, FocusHaloSettings, HaloRuntime, HaloVisual, OverlayScreenGeometry,
+    create_window_service, BorderFrame, FocusHaloSettings, HaloRuntime, HaloVisual,
+    OverlayScreenGeometry,
 };
 
 #[cfg(target_os = "macos")]
@@ -50,12 +55,24 @@ fn parse_visual(value: &str) -> HaloVisual {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // Appended subcommand: `halo_manual windows` exercises the P2 window
-    // layer (enumerate + hit-test cache) instead of drawing the halo. The
-    // positional overlay harness below is untouched.
-    if args.iter().nth(1).map(String::as_str) == Some("windows") {
-        run_windows_subcommand();
-        return;
+    // Appended subcommands: `halo_manual windows` exercises the P2 window
+    // layer (enumerate + hit-test cache); `border`/`clear` exercise the
+    // candidate-window border overlay. The positional overlay harness below
+    // is untouched.
+    match args.iter().nth(1).map(String::as_str) {
+        Some("windows") => {
+            run_windows_subcommand();
+            return;
+        }
+        Some("border") => {
+            run_border_subcommand(&args);
+            return;
+        }
+        Some("clear") => {
+            run_border_clear();
+            return;
+        }
+        _ => {}
     }
     let x: f64 = args
         .iter()
@@ -183,6 +200,95 @@ mod appkit_shim {
 
 #[cfg(target_os = "macos")]
 use appkit_shim::{init_nsapp, run_main_loop};
+
+// ---------------------------------------------------------------------------
+// `halo_manual border x y w h [clear_after_ms]` (appended): candidate-window
+// border verification. Draws the breathing accent border around the given
+// board-logical rectangle (screen/global coordinates on the single-board
+// manual rig) without the halo ring; the 1.2 s opacity breathing runs inside
+// the backend (Core Animation on macOS, the 60 Hz tick on Windows).
+// `clear` smoke-tests the set_border(None) path.
+// ---------------------------------------------------------------------------
+
+fn run_border_subcommand(args: &[String]) {
+    let parse = |index: usize| -> f64 {
+        args.get(index)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| {
+                eprintln!("usage: halo_manual border x y w h [clear_after_ms]");
+                std::process::exit(2);
+            })
+    };
+    let border = BorderFrame {
+        x: parse(2),
+        y: parse(3),
+        w: parse(4),
+        h: parse(5),
+    };
+    let clear_after_ms: Option<u64> = args.get(6).and_then(|value| value.parse().ok());
+
+    let Some(geometry) = main_display_geometry() else {
+        eprintln!("no main display geometry on this platform");
+        std::process::exit(2);
+    };
+    println!(
+        "halo_manual border: rect=({},{} {}x{}) clear_after={:?}",
+        border.x, border.y, border.w, border.h, clear_after_ms
+    );
+    #[cfg(target_os = "macos")]
+    unsafe {
+        init_nsapp();
+    }
+    let mut runtime = HaloRuntime::new();
+    runtime.set_screen(geometry);
+    runtime.show_test_border(Some(border));
+
+    if let Some(delay_ms) = clear_after_ms {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            // The clear path runs through a second runtime instance (the
+            // border window is a process-wide static, mirroring the app's
+            // single overlay), and the instance is kept alive so dropping it
+            // cannot race the hide with anything else.
+            let mut runtime = HaloRuntime::new();
+            runtime.set_screen(geometry);
+            runtime.show_test_border(None);
+            std::mem::forget(runtime);
+            println!("halo_manual border: cleared after {delay_ms} ms");
+        });
+    }
+
+    // Keep pumping so the border stays on screen until Ctrl-C (or until the
+    // optional clear fires).
+    #[cfg(target_os = "macos")]
+    unsafe {
+        run_main_loop();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// `halo_manual clear`: smoke-test the border-clear path. A fresh process has
+/// no border to hide, so this only verifies the None path is harmless; the
+/// in-process variant is `border ... <clear_after_ms>`.
+fn run_border_clear() {
+    let Some(geometry) = main_display_geometry() else {
+        eprintln!("no main display geometry on this platform");
+        std::process::exit(2);
+    };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        init_nsapp();
+    }
+    let mut runtime = HaloRuntime::new();
+    runtime.set_screen(geometry);
+    runtime.show_test_border(None);
+    println!("halo_manual clear: set_border(None) dispatched");
+}
 
 // ---------------------------------------------------------------------------
 // `halo_manual windows` (appended): P2 window-layer verification harness.

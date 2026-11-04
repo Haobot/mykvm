@@ -14,7 +14,9 @@ use serde::Serialize;
 use crate::halo::filter::OneEuroFilter;
 use crate::halo::input_probe::InputActivityProbe;
 use crate::halo::mapping::{map_pose, CalibrationProfile};
-use crate::halo::overlay::{HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
+use crate::halo::overlay::{
+    BorderFrame, HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry,
+};
 use crate::halo::params::{CameraPosition, FocusHaloSettings};
 use crate::halo::state_machine::{advance, DwellConfig, DwellInput, DwellPhase, DwellState};
 use crate::halo::tracker::HeadSample;
@@ -69,6 +71,9 @@ pub struct DebugSnapshot {
     /// `cooldown`) for the debug panel. `switched` appears only on the tick a
     /// switch event fired.
     pub phase_str: &'static str,
+    /// Border the overlay should show this tick (before deduplication);
+    /// `Some` exactly while a candidate is being dwelled on.
+    pub border: Option<BorderFrame>,
 }
 
 /// Engine wiring snapshot handed to [`spawn`]. Not `Clone`/`Debug` because it
@@ -123,6 +128,9 @@ pub(crate) struct EngineState {
     filtered: (f64, f64),
     /// P2 dwell/switch machine; advanced only when a window service exists.
     dwell: DwellState,
+    /// Border currently pushed to the overlay, for set_border deduplication
+    /// (unchanged states must not re-dispatch the call every tick).
+    current_border: Option<BorderFrame>,
     /// `None` (halo_manual, unsupported platforms) keeps the engine in
     /// pure-follow mode: no hit-tests, dwell machine bypassed.
     window_service: Option<Box<dyn WindowService>>,
@@ -148,6 +156,7 @@ impl EngineState {
             raw: (0.0, 0.0),
             filtered: (0.0, 0.0),
             dwell: DwellState::default(),
+            current_border: None,
             window_service: config.window_service,
         }
     }
@@ -249,7 +258,7 @@ pub(crate) fn step(
     // enumeration for 300 ms) feeds the pure state machine. `None` service
     // bypasses it entirely — pure-follow mode for halo_manual and platforms
     // without a window layer.
-    let (dwell_phase, _switch_event) = match state.window_service.as_mut() {
+    let (dwell_phase, hit_frame) = match state.window_service.as_mut() {
         None => (DwellPhase::Idle, None),
         Some(service) => {
             // WindowInfo frames and hit_test live in the layout board's
@@ -258,6 +267,7 @@ pub(crate) fn step(
             // screen sits at the board origin).
             let board = (state.screen.x + local.0, state.screen.y + local.1);
             let hit = service.hit_test(board.0, board.1).ok().flatten();
+            let hit_frame = hit.as_ref().map(|window| window.frame);
             let cfg = DwellConfig::from_settings(&state.settings);
             let input = DwellInput {
                 now_ms,
@@ -273,9 +283,15 @@ pub(crate) fn step(
             if let Some(event) = event {
                 log::info!("halo: dwell switch fired window={}", event.window_id);
             }
-            (phase_out, event)
+            (phase_out, hit_frame)
         }
     };
+
+    // Candidate-window border: wanted exactly while dwelling on a candidate,
+    // following the hit window's frame each tick (a moving/resized window
+    // keeps the outline glued to it). run_loop deduplicates the set_border
+    // calls via `border_command`.
+    let wanted_border = border_for_phase(dwell_phase, hit_frame);
 
     let visual = match phase {
         EnginePhase::SuspendedFace | EnginePhase::SuspendedInput => HaloVisual::Suspended,
@@ -317,8 +333,38 @@ pub(crate) fn step(
             DwellPhase::Switched { .. } => "switched",
             _ => state.dwell.debug_phase_str(),
         },
+        border: wanted_border,
     };
     (visual, local, snapshot)
+}
+
+/// Border decision: a border is wanted exactly while a candidate is being
+/// dwelled on, wrapping the hit window's board frame (re-checked every tick
+/// so a moving/resized candidate keeps the outline glued to it). Settling
+/// does not draw anything yet; `Switched`/`Cooldown`/`Idle` clear it.
+pub(crate) fn border_for_phase(
+    phase: DwellPhase,
+    hit_frame: Option<(f64, f64, f64, f64)>,
+) -> Option<BorderFrame> {
+    match phase {
+        DwellPhase::Candidate { .. } => hit_frame.map(|(x, y, w, h)| BorderFrame { x, y, w, h }),
+        DwellPhase::Idle | DwellPhase::Switched { .. } | DwellPhase::Cooldown => None,
+    }
+}
+
+/// Deduplicated overlay border command for one tick: `None` when the wanted
+/// border is unchanged from `current` (no set_border call), otherwise the
+/// value to hand to `OverlayBackend::set_border` — `Some(None)` inside clears
+/// it. `current` is updated in place.
+fn border_command(
+    current: &mut Option<BorderFrame>,
+    wanted: Option<BorderFrame>,
+) -> Option<Option<BorderFrame>> {
+    if *current == wanted {
+        return None;
+    }
+    *current = wanted;
+    Some(wanted)
 }
 
 /// Spawn the engine thread. Returns its handle, the command sender, and the
@@ -431,6 +477,11 @@ fn run_loop(
             overlay_visible = true;
         }
         overlay.update(local, &frame);
+        // Border calls are deduplicated: only real state changes reach the
+        // overlay (entering Candidate, frame change, leaving).
+        if let Some(border) = border_command(&mut state.current_border, snapshot.border) {
+            overlay.set_border(border);
+        }
 
         // 5. Telemetry: drop on lag, stop entirely when the consumer is gone.
         if debug_connected {
@@ -451,6 +502,9 @@ fn run_loop(
         }
     }
 
+    // Clear the border unconditionally: shutdown can happen mid-candidate,
+    // and the border window must not outlive the pipeline.
+    overlay.set_border(None);
     overlay.hide();
 }
 
@@ -679,6 +733,96 @@ mod tests {
         assert_eq!(visual, HaloVisual::Idle);
         assert_eq!(snap.candidate, None);
         assert_eq!(snap.phase_str, "cooldown");
+    }
+
+    #[test]
+    fn border_for_phase_only_fires_on_candidate() {
+        let frame = (10.0, 20.0, 300.0, 200.0);
+        let want = |phase| border_for_phase(phase, Some(frame));
+        assert_eq!(
+            want(DwellPhase::Candidate {
+                window_id: 1,
+                progress: 0.5
+            }),
+            Some(BorderFrame {
+                x: 10.0,
+                y: 20.0,
+                w: 300.0,
+                h: 200.0
+            })
+        );
+        // Settling has no phase of its own; leaving the candidate clears.
+        assert_eq!(want(DwellPhase::Idle), None);
+        assert_eq!(want(DwellPhase::Switched { window_id: 1 }), None);
+        assert_eq!(want(DwellPhase::Cooldown), None);
+        // Candidate without a usable frame (defensive) draws nothing.
+        assert_eq!(
+            border_for_phase(
+                DwellPhase::Candidate {
+                    window_id: 1,
+                    progress: 0.0
+                },
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn border_command_dedups_the_set_border_sequence() {
+        let frame = |x: f64| BorderFrame {
+            x,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        };
+        let mut current: Option<BorderFrame> = None;
+        let mut calls: Vec<Option<BorderFrame>> = Vec::new();
+        let mut push = |current: &mut Option<BorderFrame>, wanted| {
+            if let Some(command) = border_command(current, wanted) {
+                calls.push(command);
+            }
+        };
+
+        // Enter Candidate: one call with the frame.
+        push(&mut current, Some(frame(1.0)));
+        // Identical frame next tick: no call.
+        push(&mut current, Some(frame(1.0)));
+        // Frame changed (window moved): one call with the new frame.
+        push(&mut current, Some(frame(2.0)));
+        // Leave Candidate: one clearing call; staying out: no more calls.
+        push(&mut current, None);
+        push(&mut current, None);
+
+        assert_eq!(
+            calls,
+            vec![Some(frame(1.0)), Some(frame(2.0)), None],
+            "only real state changes dispatch set_border"
+        );
+    }
+
+    #[test]
+    fn border_appears_with_candidate_and_clears_on_switch() {
+        let mut s = test_state_with_window(Some(dwell_window(9)));
+        // Settling: no border yet.
+        let (_, _, snap) = step(&mut s, Some(sample(0, true, 0.0, 0.0)), 0, false);
+        assert_eq!(snap.border, None);
+        // Candidate: the border follows the hit window's frame.
+        let (_, _, snap) = step(&mut s, None, 200, false);
+        assert_eq!(
+            snap.border,
+            Some(BorderFrame {
+                x: 0.0,
+                y: 0.0,
+                w: 1000.0,
+                h: 500.0
+            })
+        );
+        // Switch tick and cooldown clear it.
+        let (_, _, snap) = step(&mut s, None, 1100, false);
+        assert_eq!(snap.border, None, "switch clears the border");
+        let (_, _, snap) = step(&mut s, None, 1120, false);
+        assert_eq!(snap.border, None, "cooldown keeps it cleared");
     }
 
     #[test]
