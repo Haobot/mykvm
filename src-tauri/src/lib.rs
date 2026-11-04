@@ -9372,8 +9372,9 @@ fn sanitize_peer_id_part(value: &str) -> String {
         .to_string()
 }
 
-/// 发现链路 UDP socket 的写超时（毫秒），与 start_discovery 主 socket 同参。
-const DISCOVERY_WRITE_TIMEOUT_MS: u64 = 500;
+/// 发现链路 UDP socket 的写超时（毫秒），与 start_discovery 主 socket 同参；
+/// headless_client.rs 的主 discovery socket 复用同一参数。
+pub(crate) const DISCOVERY_WRITE_TIMEOUT_MS: u64 = 500;
 
 /// 看门狗检查发现循环心跳的间隔（毫秒）。
 const DISCOVERY_STALL_CHECK_INTERVAL_MS: u64 = 10_000;
