@@ -49,6 +49,16 @@ socket2 = "0.6"
 if-addrs = "0.13"
 tokio = { version = "1.52", features = ["rt-multi-thread", "io-util", "sync", "time"] }
 tauri-plugin-global-shortcut = "2"
+# FocusHalo P1 head-pose pipeline. ort statically links onnxruntime from the
+# pyke.io download cache (~/Library/Caches/ort.pyke.io); ndarray stays on
+# 0.17.x, the version ort 2.0.0-rc.15's public tensor API is built against.
+ort = "2.0.0-rc.15"
+ndarray = "0.17.2"
+# Used by the halo tracker's crop/resize preprocessing and test-asset decoding.
+# `bmp` was previously a windows-only dependency (clipboard DIB decoder); the
+# halo tracker needs it on every platform, so it became a normal dependency
+# (png/jpeg only feed the tracker's integration test asset).
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "jpeg"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
@@ -65,4 +75,3 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gd
 # The #[implement] macro expands to `windows_core::` paths, so the crate must be
 # a direct dependency (matches the version `windows` 0.61 already pulls in).
 windows-core = "0.61"
-image = { version = "0.25", default-features = false, features = ["bmp"] }

@@ -1,5 +1,7 @@
-//! FocusHalo P0: settings plus the native overlay shell. The dwell/switch
-//! engine arrives in a later phase and will drive `HaloRuntime` at 60 fps;
+//! FocusHalo: settings, the native overlay shell (P0), and the core tracking
+//! pipeline (P1): head-pose inference -> One Euro smoothing -> pose-to-screen
+//! mapping -> engine thread driving the overlay. The dwell/switch logic and
+//! the calibration flow arrive in a later phase and will drive `HaloRuntime`;
 //! today the runtime only exposes enough surface for manual testing of the
 //! overlay backends.
 
@@ -7,11 +9,21 @@
 // on every item until the P1 engine wires it up.
 #![allow(dead_code)]
 
+pub mod engine;
+pub mod filter;
+pub mod input_probe;
+pub mod mapping;
 pub mod overlay;
 pub mod params;
+pub mod tracker;
 
+pub use engine::{spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase};
+pub use filter::OneEuroFilter;
+pub use input_probe::{InputActivityProbe, NullProbe, SystemInputProbe};
+pub use mapping::{map_pose, CalibrationProfile};
 pub use overlay::{HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
 pub use params::FocusHaloSettings;
+pub use tracker::{default_models_dir, Frame, HeadSample, PoseEngine};
 
 /// Owns the one halo overlay window for the process. P0 is deliberately
 /// thread-free: every call just forwards to the platform backend, which
