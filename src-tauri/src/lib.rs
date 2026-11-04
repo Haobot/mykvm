@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
@@ -1072,7 +1072,9 @@ impl AppRuntime {
         // recv_from, discovery silently dies and the other machine cannot scan this
         // one until the app is relaunched. A send timeout makes such a call return
         // instead of wedging the whole loop.
-        if let Err(error) = socket.set_write_timeout(Some(Duration::from_millis(500))) {
+        if let Err(error) =
+            socket.set_write_timeout(Some(Duration::from_millis(DISCOVERY_WRITE_TIMEOUT_MS)))
+        {
             log::warn!("failed to set discovery send timeout: {error}");
         }
         // Aim announces at the configured base port and the span above it, not
@@ -9340,15 +9342,25 @@ fn sanitize_peer_id_part(value: &str) -> String {
         .to_string()
 }
 
+/// 发现链路 UDP socket 的写超时（毫秒），与 start_discovery 主 socket 同参。
+const DISCOVERY_WRITE_TIMEOUT_MS: u64 = 500;
+
+/// 为发现协议的临时 UDP socket 统一设置读/写超时。
+/// 写超时缺省曾在 macOS 网络扰动（IP 漂移/隐私会话重启）时令 sendto
+/// 永久阻塞并卡死发现线程，防护参数与主 socket 一致（见 start_discovery）。
+fn bind_timed_udp_socket(read_timeout: Duration) -> io::Result<UdpSocket> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(read_timeout))?;
+    socket.set_write_timeout(Some(Duration::from_millis(DISCOVERY_WRITE_TIMEOUT_MS)))?;
+    Ok(socket)
+}
+
 fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, String> {
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let socket = bind_timed_udp_socket(Duration::from_millis(250))
         .map_err(|error| format!("failed to open UDP scan socket: {error}"))?;
     socket
         .set_broadcast(true)
         .map_err(|error| format!("failed to enable UDP broadcast: {error}"))?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .map_err(|error| format!("failed to set UDP scan timeout: {error}"))?;
 
     for target in broadcast_addrs(base_port) {
         let _ = send_discovery_packet(&socket, "announce", local_peer, target);
@@ -9394,10 +9406,9 @@ fn probe_known_peer_targets_within(
         return Vec::new();
     }
 
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+    let Ok(socket) = bind_timed_udp_socket(Duration::from_millis(120)) else {
         return Vec::new();
     };
-    let _ = socket.set_read_timeout(Some(Duration::from_millis(120)));
     for target in targets {
         let _ = send_discovery_packet(&socket, "probe", local_peer, target.as_str());
     }
@@ -9426,11 +9437,8 @@ fn probe_known_peer_targets_within(
 
 fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<LanPeer, String> {
     let (host, explicit_port) = split_host_port(host.trim());
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let socket = bind_timed_udp_socket(Duration::from_millis(250))
         .map_err(|error| format!("failed to open UDP probe socket: {error}"))?;
-    socket
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .map_err(|error| format!("failed to set UDP probe timeout: {error}"))?;
 
     // With an explicit `host:port` probe exactly that port (e.g. a forwarded
     // public endpoint reached across NAT); otherwise the peer may have drifted
@@ -9499,11 +9507,8 @@ fn request_pairing_from_host(
     wait: Duration,
 ) -> Result<PairingRequestOutcome, String> {
     let (host, ports) = pairing_probe_targets(host, base_port);
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let socket = bind_timed_udp_socket(PAIRING_PROBE_READ_TIMEOUT)
         .map_err(|error| format!("failed to open UDP pairing socket: {error}"))?;
-    socket
-        .set_read_timeout(Some(PAIRING_PROBE_READ_TIMEOUT))
-        .map_err(|error| format!("failed to set UDP pairing timeout: {error}"))?;
 
     for port in &ports {
         let target = format!("{host}:{port}");
@@ -13571,6 +13576,26 @@ mod tests {
     fn discovery_target_ports_clamp_near_max() {
         let ports = discovery_target_ports(TRANSPORT_PORT_MAX - 1);
         assert_eq!(ports, vec![TRANSPORT_PORT_MAX - 1, TRANSPORT_PORT_MAX]);
+    }
+
+    #[test]
+    fn bind_timed_udp_socket_sets_both_read_and_write_timeouts() {
+        // 复盘：临时探测 socket 过去只设读超时，macOS 网络扰动（IP 漂移/
+        // 隐私会话重启）会让 sendto 无限期挂起并卡死整个发现线程；
+        // helper 必须同时给出读、写超时，写超时与主 socket 同参。
+        // Arrange & Act
+        let socket =
+            bind_timed_udp_socket(Duration::from_millis(120)).expect("临时 UDP socket 应能绑定");
+
+        // Assert：读超时透传调用方给定值，写超时固定为发现链路统一值。
+        assert_eq!(
+            socket.read_timeout().expect("应能读取读超时配置"),
+            Some(Duration::from_millis(120))
+        );
+        assert_eq!(
+            socket.write_timeout().expect("应能读取写超时配置"),
+            Some(Duration::from_millis(DISCOVERY_WRITE_TIMEOUT_MS))
+        );
     }
 
     #[test]
