@@ -371,6 +371,11 @@ struct LanPeer {
     pairing_required: bool,
     host: String,
     ip: String,
+    /// 对端自报的全部 LAN 地址（RFC §3-B）。运行时信息，不落 layout：
+    /// 随 announce 覆盖更新，旧版对端的包没有该字段，serde(default)
+    /// 落空 Vec（跨版本兼容见 RFC §6，已用字节层探测测试锁定）。
+    #[serde(default)]
+    pub ips: Vec<String>,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
     #[serde(default)]
@@ -1083,7 +1088,9 @@ impl AppRuntime {
         // our own (possibly drifted) `actual_port`, so a peer that landed on a
         // neighbouring port still receives them.
         let broadcast_targets = broadcast_addrs(desired_port);
-        let direct_targets = known_peer_discovery_targets(&layout, desired_port);
+        let known_peers_snapshot = peers.lock().map(|peers| peers.clone()).unwrap_or_default();
+        let direct_targets =
+            known_peer_discovery_targets(&layout, desired_port, &known_peers_snapshot);
         log::info!(
             "discovery started desired_port={} actual_port={} quic_port={} broadcast_targets={} directed_targets={}",
             desired_port,
@@ -1129,8 +1136,10 @@ impl AppRuntime {
                             apply_transport_to_peer(&mut peer, &quic_transport);
                             peer.input_ready = advertised_input_ready(&layout, current_input_ready);
                             peer.upgrading = upgrading.load(Ordering::Relaxed);
+                            let known_peers =
+                                peers.lock().map(|peers| peers.clone()).unwrap_or_default();
                             let direct_targets =
-                                known_peer_discovery_targets(&layout, desired_port);
+                                known_peer_discovery_targets(&layout, desired_port, &known_peers);
                             Some((peer, direct_targets))
                         })
                         .unwrap_or_else(|_| Some((local_peer.clone(), Vec::new())));
@@ -5500,6 +5509,49 @@ fn ranked_local_ipv4_for_discovery() -> Vec<Ipv4Addr> {
         .collect()
 }
 
+/// RFC §3-B：announce 的 ips 列表 = §3-A 排序结果转 String（≤4 个）。
+/// peer_hints 取 layout 中已配对对端地址，让"对端可达的网段"排最前。
+fn local_ips_for_announcement(
+    layout: &LayoutState,
+    enumerated: &[IpCandidate],
+    preferred_hint: Option<IpAddr>,
+) -> Vec<String> {
+    rank_local_ip_candidates(enumerated, preferred_hint, &paired_peer_ip_hints(layout))
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect()
+}
+
+/// layout 中已配对对端的所有可达地址：devices（非 local）与
+/// paired_controllers 的 host/ip 字段解析出的 IP，去重。仅作 /24
+/// 排序提示，host 字段支持 "名称 / ip" 多段形式。
+fn paired_peer_ip_hints(layout: &LayoutState) -> Vec<IpAddr> {
+    let mut hints: Vec<IpAddr> = Vec::new();
+    let mut push_host_field = |value: &str| {
+        for candidate in host_candidates(value) {
+            let (host, _) = split_host_port(&candidate);
+            let Ok(ip) = host.trim().parse::<IpAddr>() else {
+                continue;
+            };
+            if !hints.contains(&ip) {
+                hints.push(ip);
+            }
+        }
+    };
+    for device in layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+    {
+        push_host_field(&device.host);
+    }
+    for controller in &layout.paired_controllers {
+        push_host_field(&controller.ip);
+        push_host_field(&controller.host);
+    }
+    hints
+}
+
 fn default_route_ipv4_address() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -9388,6 +9440,10 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
     let fallback_name = local_device_name();
     let host = hostname().unwrap_or_else(|| "localhost".into());
     let ip = local_ip_address().unwrap_or_else(|| "127.0.0.1".into());
+    // RFC §3-B：announce 携带 §3-A 的有序多地址候选（含 peer 同段优先）。
+    let enumerated = filter_ip_candidates(&collect_local_ip_candidates());
+    let announcement_ips =
+        local_ips_for_announcement(layout, &enumerated, ip.parse::<IpAddr>().ok());
 
     LanPeer {
         id: local_peer_id(&host, &ip),
@@ -9401,6 +9457,7 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         pairing_required: pairing_required(layout),
         host,
         ip,
+        ips: announcement_ips,
         transport_port: layout.transport_port,
         quic_port: normalize_quic_port(layout.transport_port, layout.quic_port),
         transport_public_key: local_device
@@ -10671,13 +10728,25 @@ fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String
     addresses
 }
 
+/// RFC §3-B：单 peer 的 directed 目标总数上限。地址上限 N≤4 × 端口 span
+/// 8 = 32；防对端 announce 大地址列表（或异常包）时 probe fan-out 放大。
+const MAX_DIRECTED_TARGETS_PER_PEER: usize = 32;
+
 /// Directed discovery destinations for peers we already know about. Pairing and
 /// manual probing use unicast, but the long-running discovery loop used to rely
 /// only on broadcast after that. On LANs where broadcast is flaky or filtered,
 /// the peer would age out after `PEER_TTL_MS` even though direct UDP still
 /// worked. Keep paired/configured machines warm with a small directed announce
 /// fan-out.
-fn known_peer_discovery_targets(layout: &LayoutState, base_port: u16) -> Vec<String> {
+///
+/// RFC §3-B：运行时 `peers` 里对端 announce 学到的 `ips` 会扩展各自的
+/// directed 目标（每地址 × 端口 span 的并集），让 WiFi+网线双接口对端有
+/// 多条保活路径；`ips` 为空（旧版对端）时保持既有 host/ip 逻辑。
+fn known_peer_discovery_targets(
+    layout: &LayoutState,
+    base_port: u16,
+    peers: &[LanPeer],
+) -> Vec<String> {
     let base_ports = discovery_target_ports(base_port);
     let mut targets = Vec::new();
 
@@ -10687,17 +10756,49 @@ fn known_peer_discovery_targets(layout: &LayoutState, base_port: u16) -> Vec<Str
         .filter(|device| device.role != "local")
     {
         let ports = known_peer_ports(base_port, device.transport_port);
-        push_host_discovery_targets(&mut targets, &device.host, &ports);
+        let mut peer_targets = Vec::new();
+        push_host_discovery_targets(&mut peer_targets, &device.host, &ports);
+        let advertised_ips: Vec<String> = peers
+            .iter()
+            .filter(|peer| device_matches_peer(device, peer, &layout.cluster_id))
+            .flat_map(|peer| peer.ips.iter().cloned())
+            .collect();
+        push_directed_targets(&mut peer_targets, &advertised_ips, &ports);
+        peer_targets.truncate(MAX_DIRECTED_TARGETS_PER_PEER);
+        targets.extend(peer_targets);
     }
 
     for controller in &layout.paired_controllers {
-        push_host_discovery_targets(&mut targets, &controller.ip, &base_ports);
-        push_host_discovery_targets(&mut targets, &controller.host, &base_ports);
+        let mut peer_targets = Vec::new();
+        push_host_discovery_targets(&mut peer_targets, &controller.ip, &base_ports);
+        push_host_discovery_targets(&mut peer_targets, &controller.host, &base_ports);
+        let advertised_ips: Vec<String> = peers
+            .iter()
+            .filter(|peer| paired_controller_identity_matches_peer(controller, peer))
+            .flat_map(|peer| peer.ips.iter().cloned())
+            .collect();
+        push_directed_targets(&mut peer_targets, &advertised_ips, &base_ports);
+        peer_targets.truncate(MAX_DIRECTED_TARGETS_PER_PEER);
+        targets.extend(peer_targets);
     }
 
     targets.sort();
     targets.dedup();
     targets
+}
+
+/// 把对端 announce 学到的 ips 扩展成 directed 目标（每地址 × 端口 span）。
+/// 跳过空串/非地址串由调用方的 truncate 兜底总量。
+fn push_directed_targets(targets: &mut Vec<String>, addresses: &[String], ports: &[u16]) {
+    for address in addresses {
+        let address = address.trim();
+        if address.is_empty() {
+            continue;
+        }
+        for port in ports {
+            targets.push(format!("{address}:{port}"));
+        }
+    }
 }
 
 fn known_peer_ports(base_port: u16, stored_port: u16) -> Vec<u16> {
@@ -11327,6 +11428,7 @@ mod tests {
             pairing_required: false,
             host: "client".into(),
             ip: "10.0.0.2".into(),
+            ips: Vec::new(),
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "peer-public-key".into(),
@@ -13580,6 +13682,7 @@ mod tests {
             pairing_required: false,
             host: "server.local".into(),
             ip: "10.0.0.1".into(),
+            ips: Vec::new(),
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "server-public-key".into(),
@@ -14206,7 +14309,7 @@ mod tests {
         layout.devices[1].host = "Client / 10.0.0.2".into();
         layout.devices[1].transport_port = DISCOVERY_PORT + DISCOVERY_PORT_SPAN + 2;
 
-        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT);
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &[]);
 
         assert!(targets.contains(&format!("10.0.0.2:{DISCOVERY_PORT}")));
         assert!(targets.contains(&format!("10.0.0.2:{}", DISCOVERY_PORT + 1)));
@@ -14232,7 +14335,7 @@ mod tests {
             paired_at_ms: now_ms(),
         }];
 
-        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT);
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &[]);
 
         assert!(targets.contains(&format!("10.0.0.1:{DISCOVERY_PORT}")));
         assert!(targets.contains(&format!("server-host:{DISCOVERY_PORT}")));
@@ -14518,6 +14621,341 @@ mod tests {
                 Ipv4Addr::new(10, 0, 2, 1),
                 Ipv4Addr::new(10, 0, 3, 1),
             ]
+        );
+    }
+
+    // ---- 网络抗干扰 P0 §3-B：ips 字段跨版本兼容探测（先于实现执行） ----
+
+    /// 在 named-map msgpack 载荷的字节层追加一个字符串键值对，并把 map
+    /// 计数加一。用于模拟"未来版本在 DiscoveryPacket/LanPeer 上新增了
+    /// 字段"：旧版（本 crate 现有结构）必须容忍未知字段继续解码。
+    fn append_msgpack_named_field(
+        payload: &[u8],
+        key: &str,
+        value_bytes: &[u8],
+    ) -> Option<Vec<u8>> {
+        let mut forged = payload.to_vec();
+        let header = *forged.first()?;
+        match header {
+            0x80..=0x8f => {
+                let count = header & 0x0f;
+                if count == 0x0f {
+                    // fixmap 满 15 需要升级为 map16，不在本测试的构造范围。
+                    return None;
+                }
+                forged[0] = 0x80 | (count + 1);
+            }
+            0xde => {
+                let count = u16::from_be_bytes([forged[1], forged[2]]);
+                forged[1..3].copy_from_slice(&count.checked_add(1)?.to_be_bytes());
+            }
+            0xdf => {
+                let count = u32::from_be_bytes([forged[1], forged[2], forged[3], forged[4]]);
+                forged[1..5].copy_from_slice(&count.checked_add(1)?.to_be_bytes());
+            }
+            _ => return None,
+        }
+        forged.extend_from_slice(&rmp_serde::to_vec_named(key).ok()?);
+        forged.extend_from_slice(value_bytes);
+        Some(forged)
+    }
+
+    #[test]
+    fn legacy_decoding_tolerates_unknown_ips_field_in_named_msgpack() {
+        // 兼容性硬性检查点（RFC §6）：提交计划要给 LanPeer 新增 ips 字段。
+        // 在该字段存在之前，先在字节层验证旧解码路径的容忍性——构造方式：
+        // ① 用当前（旧版形状）LanPeer 编码一条 announce 包；
+        // ② 在 msgpack 字节层追加未知键 "ips"（List[String]，即未来字段的
+        //    线上形状）并同步把顶层 map 计数 +1；
+        // ③ 用现有 decode_discovery_packet 解码。
+        // 若解码失败，需要 bump PROTOCOL_VERSION（影响双端旧版互通），
+        // 必须停下等待决策，不得继续实施。
+        let peer = test_peer();
+        let packet = DiscoveryPacket {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer,
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let bytes = encode_wire_packet(&packet).expect("旧版 announce 包编码成功");
+        let ips = vec!["192.168.1.5".to_string(), "10.8.0.2".to_string()];
+        let ips_bytes = rmp_serde::to_vec_named(&ips).expect("编码 ips 列表");
+        let forged = append_msgpack_named_field(&bytes, "ips", &ips_bytes)
+            .expect("DiscoveryPacket 编码为 named map，可追加字段");
+
+        let decoded = decode_discovery_packet(&forged)
+            .expect("旧版解码含未知 ips 字段的包必须成功；失败即协议不兼容，需停下决策");
+        assert_eq!(decoded.kind, "announce");
+        assert_eq!(decoded.peer.id, "peer-client-10-0-0-2");
+        assert_eq!(decoded.peer.ip, "10.0.0.2");
+    }
+
+    /// 与旧版（无 ips 字段）LanPeer 逐字段一致的镜像结构：跨版本编解码
+    /// 双向测试的"另一端"。新增 ips 后此镜像就代表已部署的旧版客户端。
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyLanPeerMirror {
+        id: String,
+        name: String,
+        platform: String,
+        #[serde(default)]
+        machine_role: String,
+        #[serde(default)]
+        cluster_id: String,
+        #[serde(default)]
+        pairing_required: bool,
+        host: String,
+        ip: String,
+        #[serde(default = "default_transport_port")]
+        transport_port: u16,
+        #[serde(default)]
+        quic_port: u16,
+        #[serde(default)]
+        transport_public_key: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u16,
+        screen_count: usize,
+        #[serde(default)]
+        input_ready: bool,
+        #[serde(default)]
+        upgrading: bool,
+        #[serde(default)]
+        screens: Vec<LanPeerScreen>,
+        app_version: String,
+        last_seen_ms: u64,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyDiscoveryPacketMirror {
+        protocol: String,
+        kind: String,
+        peer: LegacyLanPeerMirror,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pairing_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pair_cluster_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pair_secret: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pairing_error: Option<String>,
+    }
+
+    fn legacy_mirror_peer(peer: &LanPeer) -> LegacyLanPeerMirror {
+        LegacyLanPeerMirror {
+            id: peer.id.clone(),
+            name: peer.name.clone(),
+            platform: peer.platform.clone(),
+            machine_role: peer.machine_role.clone(),
+            cluster_id: peer.cluster_id.clone(),
+            pairing_required: peer.pairing_required,
+            host: peer.host.clone(),
+            ip: peer.ip.clone(),
+            transport_port: peer.transport_port,
+            quic_port: peer.quic_port,
+            transport_public_key: peer.transport_public_key.clone(),
+            protocol_version: peer.protocol_version,
+            screen_count: peer.screen_count,
+            input_ready: peer.input_ready,
+            upgrading: peer.upgrading,
+            screens: peer.screens.clone(),
+            app_version: peer.app_version.clone(),
+            last_seen_ms: peer.last_seen_ms,
+        }
+    }
+
+    #[test]
+    fn legacy_packets_decode_with_empty_ips_and_new_packets_drop_ips_for_legacy() {
+        // RFC §5 跨版本编解码双向验证：
+        // ① 旧包（无 ips 键）→ 新版解码：ips 落 default 空 Vec；
+        // ② 新包（ips 非空）→ 旧版镜像解码：未知字段被忽略不报错。
+        let old_packet = LegacyDiscoveryPacketMirror {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer: legacy_mirror_peer(&test_peer()),
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let old_bytes = rmp_serde::to_vec_named(&old_packet).expect("旧版包编码成功");
+
+        let decoded = decode_discovery_packet(&old_bytes).expect("新版解码旧包（无 ips）必须成功");
+        assert!(decoded.peer.ips.is_empty(), "旧包解码后 ips 必须是空 Vec");
+
+        let mut new_peer = test_peer();
+        new_peer.ips = vec!["192.168.1.5".into(), "10.8.0.2".into()];
+        let new_packet = DiscoveryPacket {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer: new_peer,
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let new_bytes = rmp_serde::to_vec_named(&new_packet).expect("新版包编码成功");
+
+        let legacy_decoded = decode_wire_packet::<LegacyDiscoveryPacketMirror>(&new_bytes)
+            .expect("旧版镜像解码新包（含 ips）必须成功");
+        assert_eq!(legacy_decoded.peer.ip, "10.0.0.2");
+    }
+
+    #[test]
+    fn announcement_ips_follow_the_ranked_candidate_order() {
+        // RFC §3-B：announce 的 ips = §3-A 排序结果（对端同 /24 优先）转
+        // String，且不超过 4 个。
+        let mut layout = test_layout();
+        layout.paired_controllers.push(PairedController {
+            id: "peer-controller-1".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.8.0.7".into(),
+            transport_public_key: "controller-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: now_ms(),
+        });
+
+        let entries = [
+            candidate([192, 168, 1, 42], "en0"),
+            candidate([10, 8, 0, 2], "en5"), // 与对端 10.8.0.7 同 /24
+        ];
+        let ips = local_ips_for_announcement(&layout, &entries, None);
+        assert_eq!(
+            ips,
+            vec!["10.8.0.2".to_string(), "192.168.1.42".to_string()],
+            "与已配对对端同段的地址必须排在 announce ips 首位"
+        );
+
+        // 超过 4 个候选时截断（对端同段 3 个 + 其他 3 个 → 只发 4 个）。
+        let mut many = vec![candidate([192, 168, 9, 1], "en7")];
+        for octet in 1..=5_u8 {
+            many.push(candidate([10, 8, 0, octet], "en5"));
+        }
+        let ips = local_ips_for_announcement(&layout, &many, None);
+        assert_eq!(ips.len(), MAX_LOCAL_IP_CANDIDATES);
+        assert_eq!(&ips[..3], &["10.8.0.1", "10.8.0.2", "10.8.0.3"]);
+    }
+
+    #[test]
+    fn paired_peer_ip_hints_collect_paired_addresses_from_layout() {
+        // /24 排序提示来自 layout 的对端字段：devices（非 local）与
+        // paired_controllers 的 host/ip，host 支持 "名称 / ip" 多段形式。
+        let mut layout = test_layout();
+        layout.devices[1].host = "Client / 10.0.0.2".into();
+        layout.paired_controllers.push(PairedController {
+            id: "peer-controller-1".into(),
+            name: "Server".into(),
+            host: "server / 192.168.66.9".into(),
+            ip: "192.168.66.9".into(),
+            transport_public_key: "controller-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: now_ms(),
+        });
+
+        let hints = paired_peer_ip_hints(&layout);
+
+        assert!(hints.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+        assert!(hints.contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 66, 9))));
+        assert_eq!(hints.len(), 2, "重复地址（ip 与 host 重复出现）只算一次");
+    }
+
+    #[test]
+    fn merge_peer_entry_replaces_stale_ips_with_latest_announcement() {
+        // ips 是运行时信息：对端 announce 学到的新列表必须整体覆盖旧列表，
+        // 不残留已失效地址。
+        let mut stale = test_peer();
+        stale.ips = vec!["10.0.0.2".into()];
+        let mut peers = vec![stale];
+
+        let mut latest = test_peer();
+        latest.ips = vec!["10.0.0.9".into(), "192.168.1.5".into()];
+        merge_peer_entry(&mut peers, latest);
+
+        assert_eq!(
+            peers[0].ips,
+            vec!["10.0.0.9".to_string(), "192.168.1.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn device_targets_expand_over_peer_advertised_ips() {
+        // RFC §3-B：运行时 peer 的 ips 非空时，该对端的 directed 目标扩展为
+        // ips × 端口 span 的并集（多条保活路径）。
+        let layout = test_layout(); // devices[1] 与 test_peer() 同 key 同 id
+        let mut peer = test_peer();
+        peer.ips = vec!["10.0.0.9".into(), "192.168.1.5".into()];
+        let peers = vec![peer];
+
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &peers);
+
+        for ip in ["10.0.0.9", "192.168.1.5"] {
+            assert!(
+                targets.contains(&format!("{ip}:{DISCOVERY_PORT}")),
+                "ips 地址 {ip} 必须出现在 directed 目标里"
+            );
+        }
+        // 既有 host/ip 目标保持不变。
+        assert!(targets.contains(&format!("10.0.0.2:{DISCOVERY_PORT}")));
+    }
+
+    #[test]
+    fn controller_targets_expand_over_peer_advertised_ips() {
+        let mut layout = test_layout();
+        layout.paired_controllers.push(PairedController {
+            id: "peer-controller-1".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "192.168.66.9".into(),
+            transport_public_key: "peer-public-key".into(), // 与 test_peer() 同 key
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: now_ms(),
+        });
+        let mut peer = test_peer();
+        peer.ips = vec!["10.0.0.9".into()];
+        let peers = vec![peer];
+
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &peers);
+
+        assert!(targets.contains(&format!("10.0.0.9:{DISCOVERY_PORT}")));
+        assert!(targets.contains(&format!("192.168.66.9:{DISCOVERY_PORT}")));
+    }
+
+    #[test]
+    fn targets_without_peer_ips_keep_the_host_only_logic() {
+        // 兼容旧版对端：ips 为空时不新增目标，保持现有 host/ip 逻辑。
+        let layout = test_layout();
+        let peers = vec![test_peer()]; // ips 为空
+
+        let with_peers = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &peers);
+        let without_peers = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &[]);
+
+        assert_eq!(with_peers, without_peers);
+    }
+
+    #[test]
+    fn directed_targets_cap_at_32_per_peer() {
+        // 地址风暴防护：单 peer 总目标数 ≤32（RFC N≤4 地址 × span 8 端口）。
+        let mut layout = test_layout();
+        layout.devices[1].host = "Client / 10.0.0.2".into();
+        let mut peer = test_peer();
+        peer.ips = (1..=6_u8)
+            .map(|octet| format!("10.0.0.{octet}"))
+            .collect::<Vec<_>>();
+        let peers = vec![peer];
+
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &peers);
+
+        assert!(
+            targets.len() <= MAX_DIRECTED_TARGETS_PER_PEER,
+            "单 peer 目标数 {} 超过上限 {MAX_DIRECTED_TARGETS_PER_PEER}",
+            targets.len()
         );
     }
 }

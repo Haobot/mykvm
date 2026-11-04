@@ -134,7 +134,9 @@ pub fn start(config_path: PathBuf) -> Result<Option<HeadlessClientHandle>, Strin
 
                     for target in broadcast_addrs(desired_port)
                         .into_iter()
-                        .chain(known_peer_discovery_targets(&current, desired_port))
+                        // headless 实例不维护运行时 peers 列表：ips 为空，
+                        // 目标保持既有 host/ip 逻辑（RFC §3-B 的兼容分支）。
+                        .chain(known_peer_discovery_targets(&current, desired_port, &[]))
                     {
                         let _ = send_discovery_packet(&socket, "announce", &peer, target.as_str());
                     }
