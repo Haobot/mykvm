@@ -1109,6 +1109,9 @@ impl AppRuntime {
             // could block indefinitely (see the send timeout above).
             let mut last_announce = Instant::now();
             let mut last_local_identity_refresh = Instant::now() - LOCAL_IDENTITY_REFRESH_INTERVAL;
+            // RFC §3-C：上一轮地址刷新时的有序地址集合；None 表示尚未建基线
+            //（启动首轮只记录不触发，避免开机即双重 announce）。
+            let mut last_local_addresses: Option<Vec<IpAddr>> = None;
             let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
             let mut last_upgrading = upgrading.load(Ordering::Relaxed);
             let mut last_probe_by_peer: HashMap<String, u64> = HashMap::new();
@@ -1117,15 +1120,36 @@ impl AppRuntime {
                 loop_heartbeat.tick();
                 if last_local_identity_refresh.elapsed() >= LOCAL_IDENTITY_REFRESH_INTERVAL {
                     refresh_local_device_identity(&layout_state);
+                    // RFC §3-C：地址集合 diff。DHCP 换 IP / 接口增删后，
+                    // 集合变化即触发"立即 announce + 全部已配对对端 directed
+                    // probe"——实现上拨回 last_announce 让本轮循环随后的
+                    // announce 分支立即发送（该分支同时重建 direct_targets
+                    // 并对全部对端 probe，路径唯一，不复制发送代码）。
+                    let current_addresses = collect_local_ip_addresses();
+                    match &last_local_addresses {
+                        None => last_local_addresses = Some(current_addresses),
+                        Some(old) if ip_sets_differ(old, &current_addresses) => {
+                            log::info!("local addresses changed: {old:?} -> {current_addresses:?}");
+                            request_immediate_reannounce(
+                                &mut last_announce,
+                                Instant::now(),
+                                ANNOUNCE_PERIOD,
+                            );
+                            last_local_addresses = Some(current_addresses);
+                        }
+                        Some(_) => {}
+                    }
                     last_local_identity_refresh = Instant::now();
                 }
 
                 let current_input_ready = input_receive_enabled.load(Ordering::Relaxed);
                 let current_upgrading = upgrading.load(Ordering::Relaxed);
-                if last_announce.elapsed() >= Duration::from_secs(3)
-                    || current_input_ready != last_input_ready
-                    || current_upgrading != last_upgrading
-                {
+                if announce_due(
+                    last_announce,
+                    ANNOUNCE_PERIOD,
+                    current_input_ready != last_input_ready,
+                    current_upgrading != last_upgrading,
+                ) {
                     let announcement = layout_state
                         .lock()
                         .map(|layout| {
@@ -1330,7 +1354,16 @@ impl AppRuntime {
                     }
                 }
 
-                prune_stale_peers(&peers);
+                // RFC §3-C：prune 间隔超过触发阈值意味着进程曾被挂起（合盖
+                // 睡眠）或时钟跳变——唤醒后链路重建要加速，立即重播 announce
+                // 并对全部已配对对端 directed probe（同 announce 分支路径）。
+                if prune_stale_peers(&peers) {
+                    request_immediate_reannounce(
+                        &mut last_announce,
+                        Instant::now(),
+                        ANNOUNCE_PERIOD,
+                    );
+                }
                 sync_layout_peer_presence(&layout_state, &peers);
             }
         });
@@ -5210,6 +5243,40 @@ fn local_host_label() -> String {
 /// bridges change the address set rarely; 10 s keeps it current without doing
 /// `getifaddrs` on the 500 ms discovery tick.
 const LOCAL_IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Discovery announce 的正常周期。地址集合变化与唤醒路径的"立即重播"
+/// 都以拨回 `last_announce` 一个周期的方式触发（见 request_immediate_reannounce）。
+const ANNOUNCE_PERIOD: Duration = Duration::from_secs(3);
+
+/// announce 分支的触发条件：周期到点，或 input_ready / upgrading 状态
+/// 变化需要立刻让对端知道。提取为纯函数以便测试触发逻辑。
+fn announce_due(
+    last_announce: Instant,
+    period: Duration,
+    input_ready_changed: bool,
+    upgrading_changed: bool,
+) -> bool {
+    last_announce.elapsed() >= period || input_ready_changed || upgrading_changed
+}
+
+/// 请求下一拍立即重播 announce + 全部已配对对端 directed probe（RFC §3-C）。
+///
+/// 实现是把 `last_announce` 拨回一个 announce 周期之前，让 discovery 循环
+/// 随后的 announce 分支条件立即成立——该分支会重建 local_peer 与
+/// direct_targets、发广播、并对全部对端 probe + merge，路径唯一，复制一份
+/// 发送代码反而引入漂移风险。拨回后同轮循环体即到达该分支（socket 读
+/// 超时 500ms 内），延迟可接受。地址集合变化与 prune gap guard（唤醒/
+/// 时钟跳变）两条路径都收敛到这里。
+fn request_immediate_reannounce(last_announce: &mut Instant, now: Instant, period: Duration) {
+    // 正常路径：拨回一个周期。系统时钟早于 epoch+period 的极端情况下
+    // checked_sub 会失败，逐级缩短步长兜底（最差退化为不拨回——时钟本身
+    // 异常时不制造额外行为，等待下一轮周期触发）。
+    let past = now
+        .checked_sub(period)
+        .or_else(|| now.checked_sub(Duration::from_secs(1)))
+        .unwrap_or(now);
+    *last_announce = past;
+}
 
 /// Refresh the local device's displayed host label in the live layout.
 fn refresh_local_device_identity(layout_state: &Arc<Mutex<LayoutState>>) -> bool {
@@ -10556,10 +10623,14 @@ fn complete_pairing_from_confirm(
     write_layout_to_disk(config_path, &snapshot)
 }
 
-fn prune_stale_peers(peers: &Arc<Mutex<Vec<LanPeer>>>) {
-    if let Ok(mut peers) = peers.lock() {
-        prune_stale_peer_entries(&mut peers, now_ms());
-    }
+/// 返回值：本次 prune 是否命中 gap guard（进程曾被挂起/时钟跳变）。
+/// discovery 循环据此触发"立即 announce + paired probe"（RFC §3-C 唤醒
+/// 路径）；其他调用点（merge/快照）忽略返回值即可。
+fn prune_stale_peers(peers: &Arc<Mutex<Vec<LanPeer>>>) -> bool {
+    peers
+        .lock()
+        .map(|mut peers| prune_stale_peer_entries(&mut peers, now_ms()))
+        .unwrap_or(false)
 }
 
 /// A prune-call gap larger than this can only mean the process was suspended
@@ -10585,12 +10656,14 @@ const CLOCK_JUMP_GRACE_MS: u64 = 5_000;
 
 static PRUNE_GRACE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
-fn prune_stale_peer_entries(peers: &mut Vec<LanPeer>, now: u64) {
+fn prune_stale_peer_entries(peers: &mut Vec<LanPeer>, now: u64) -> bool {
     let mut baseline = LAST_PRUNE_BASELINE_MS.load(Ordering::Relaxed);
     let mut grace_until = PRUNE_GRACE_UNTIL_MS.load(Ordering::Relaxed);
-    prune_stale_peer_entries_with_baseline(peers, now, &mut baseline, &mut grace_until);
+    let guard_skipped =
+        prune_stale_peer_entries_with_baseline(peers, now, &mut baseline, &mut grace_until);
     LAST_PRUNE_BASELINE_MS.store(baseline, Ordering::Relaxed);
     PRUNE_GRACE_UNTIL_MS.store(grace_until, Ordering::Relaxed);
+    guard_skipped
 }
 
 fn prune_stale_peer_entries_with_baseline(
@@ -10598,7 +10671,7 @@ fn prune_stale_peer_entries_with_baseline(
     now: u64,
     baseline: &mut u64,
     grace_until: &mut u64,
-) {
+) -> bool {
     if prune_gap_guard_skips_prune(*baseline, now) {
         // Repeated jumps (or another jump inside the grace window) extend the
         // deadline; the assignment is idempotent for same-moment jumps.
@@ -10610,10 +10683,11 @@ fn prune_stale_peer_entries_with_baseline(
             grace_until
         );
         *baseline = now;
-        return;
+        return true;
     }
     *baseline = now;
     prune_stale_peer_entries_at(peers, now, *grace_until);
+    false
 }
 
 /// True when the gap between two prune rounds exceeds the trigger — the
@@ -10621,6 +10695,13 @@ fn prune_stale_peer_entries_with_baseline(
 /// not delete peers and the grace window is (re)armed instead.
 fn prune_gap_guard_skips_prune(baseline: u64, now: u64) -> bool {
     baseline != 0 && now.saturating_sub(baseline) > PRUNE_GAP_GRACE_TRIGGER_MS
+}
+
+/// RFC §3-C：两轮有序地址集合是否有差异。入参是排序后的候选序列，
+/// 逐位比较——同集合不同序说明首选地址（announce 首位）变了，同样
+/// 视为变化并触发重播。
+fn ip_sets_differ(old: &[IpAddr], new: &[IpAddr]) -> bool {
+    old.len() != new.len() || old.iter().zip(new.iter()).any(|(a, b)| a != b)
 }
 
 /// The single stale predicate every TTL-based expiry check must use. A peer is
@@ -14957,5 +15038,84 @@ mod tests {
             "单 peer 目标数 {} 超过上限 {MAX_DIRECTED_TARGETS_PER_PEER}",
             targets.len()
         );
+    }
+
+    // ---- 网络抗干扰 P0 §3-C：地址集合 diff 与即时重播触发 ----
+
+    #[test]
+    fn ip_sets_differ_detects_add_remove_reorder_and_empty() {
+        // RFC §3-C：集合变化（增/删/换首选）都要触发重播；diff 基于
+        // 排序后的序列——同集合不同序说明首选地址变了，必须触发。
+        let v =
+            |octets: [u8; 4]| IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
+        let a = v([192, 168, 1, 42]);
+        let b = v([10, 0, 0, 4]);
+
+        assert!(ip_sets_differ(&[], &[a]), "空 → 有地址（新增）必须触发");
+        assert!(ip_sets_differ(&[a], &[]), "有地址 → 空（删除）必须触发");
+        assert!(ip_sets_differ(&[a, b], &[a]), "地址减少必须触发");
+        assert!(ip_sets_differ(&[a], &[a, b]), "地址增加必须触发");
+        assert!(
+            ip_sets_differ(&[a, b], &[b, a]),
+            "同集合不同序=首选变化，必须触发"
+        );
+        assert!(!ip_sets_differ(&[a, b], &[a, b]), "完全相同不触发");
+        assert!(!ip_sets_differ(&[], &[]), "双方为空不触发");
+    }
+
+    #[test]
+    fn request_immediate_reannounce_makes_the_announce_branch_due() {
+        // 触发机制：把 last_announce 拨回一个 announce 周期之前，使既有
+        // announce 分支条件立即成立（复用发送路径，不复制发送代码）。
+        let period = Duration::from_secs(3);
+        let now = Instant::now();
+        let mut last_announce = now; // 刚发过一轮 → 不 due
+        assert!(!announce_due(last_announce, period, false, false));
+
+        request_immediate_reannounce(&mut last_announce, now, period);
+
+        assert!(
+            announce_due(last_announce, period, false, false),
+            "拨回后 announce 分支必须立即 due"
+        );
+    }
+
+    #[test]
+    fn announce_due_keeps_the_input_and_upgrading_triggers() {
+        // 既有行为守护：input_ready / upgrading 状态变化独立于周期触发。
+        let period = Duration::from_secs(3);
+        let now = Instant::now();
+        assert!(announce_due(now, period, true, false));
+        assert!(announce_due(now, period, false, true));
+        assert!(!announce_due(now, period, false, false));
+    }
+
+    #[test]
+    fn prune_stale_peer_entries_signals_gap_guard_skips() {
+        // RFC §3-C 唤醒路径：guard 命中（进程曾被挂起/时钟跳变）的那轮
+        // prune 必须把信号返回给 discovery 循环，触发重播 + paired probe。
+        let mut peers = vec![test_peer()];
+        let mut baseline = now_ms() - 1000;
+        let now = baseline + PRUNE_GAP_GRACE_TRIGGER_MS + 1;
+        let mut grace_until = 0_u64;
+
+        let skipped = prune_stale_peer_entries_with_baseline(
+            &mut peers,
+            now,
+            &mut baseline,
+            &mut grace_until,
+        );
+        assert!(skipped, "prune 间隔超过触发阈值必须报 guard 命中");
+        assert_eq!(peers.len(), 1, "guard 命中时不得删除 peer");
+
+        // 正常间隔的一轮 prune：guard 未命中，返回 false。
+        let baseline_after_guard = baseline; // with_baseline 内部已把 baseline 更新为 now
+        let skipped = prune_stale_peer_entries_with_baseline(
+            &mut peers,
+            baseline_after_guard + 1000,
+            &mut baseline,
+            &mut grace_until,
+        );
+        assert!(!skipped, "正常间隔不应触发 guard 信号");
     }
 }
