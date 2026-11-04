@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -371,6 +371,11 @@ struct LanPeer {
     pairing_required: bool,
     host: String,
     ip: String,
+    /// 对端自报的全部 LAN 地址（RFC §3-B）。运行时信息，不落 layout：
+    /// 随 announce 覆盖更新，旧版对端的包没有该字段，serde(default)
+    /// 落空 Vec（跨版本兼容见 RFC §6，已用字节层探测测试锁定）。
+    #[serde(default)]
+    pub ips: Vec<String>,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
     #[serde(default)]
@@ -1083,7 +1088,9 @@ impl AppRuntime {
         // our own (possibly drifted) `actual_port`, so a peer that landed on a
         // neighbouring port still receives them.
         let broadcast_targets = broadcast_addrs(desired_port);
-        let direct_targets = known_peer_discovery_targets(&layout, desired_port);
+        let known_peers_snapshot = peers.lock().map(|peers| peers.clone()).unwrap_or_default();
+        let direct_targets =
+            known_peer_discovery_targets(&layout, desired_port, &known_peers_snapshot);
         log::info!(
             "discovery started desired_port={} actual_port={} quic_port={} broadcast_targets={} directed_targets={}",
             desired_port,
@@ -1102,6 +1109,9 @@ impl AppRuntime {
             // could block indefinitely (see the send timeout above).
             let mut last_announce = Instant::now();
             let mut last_local_identity_refresh = Instant::now() - LOCAL_IDENTITY_REFRESH_INTERVAL;
+            // RFC §3-C：上一轮地址刷新时的有序地址集合；None 表示尚未建基线
+            //（启动首轮只记录不触发，避免开机即双重 announce）。
+            let mut last_local_addresses: Option<Vec<IpAddr>> = None;
             let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
             let mut last_upgrading = upgrading.load(Ordering::Relaxed);
             let mut last_probe_by_peer: HashMap<String, u64> = HashMap::new();
@@ -1110,15 +1120,36 @@ impl AppRuntime {
                 loop_heartbeat.tick();
                 if last_local_identity_refresh.elapsed() >= LOCAL_IDENTITY_REFRESH_INTERVAL {
                     refresh_local_device_identity(&layout_state);
+                    // RFC §3-C：地址集合 diff。DHCP 换 IP / 接口增删后，
+                    // 集合变化即触发"立即 announce + 全部已配对对端 directed
+                    // probe"——实现上拨回 last_announce 让本轮循环随后的
+                    // announce 分支立即发送（该分支同时重建 direct_targets
+                    // 并对全部对端 probe，路径唯一，不复制发送代码）。
+                    let current_addresses = collect_local_ip_addresses();
+                    match &last_local_addresses {
+                        None => last_local_addresses = Some(current_addresses),
+                        Some(old) if ip_sets_differ(old, &current_addresses) => {
+                            log::info!("local addresses changed: {old:?} -> {current_addresses:?}");
+                            request_immediate_reannounce(
+                                &mut last_announce,
+                                Instant::now(),
+                                ANNOUNCE_PERIOD,
+                            );
+                            last_local_addresses = Some(current_addresses);
+                        }
+                        Some(_) => {}
+                    }
                     last_local_identity_refresh = Instant::now();
                 }
 
                 let current_input_ready = input_receive_enabled.load(Ordering::Relaxed);
                 let current_upgrading = upgrading.load(Ordering::Relaxed);
-                if last_announce.elapsed() >= Duration::from_secs(3)
-                    || current_input_ready != last_input_ready
-                    || current_upgrading != last_upgrading
-                {
+                if announce_due(
+                    last_announce,
+                    ANNOUNCE_PERIOD,
+                    current_input_ready != last_input_ready,
+                    current_upgrading != last_upgrading,
+                ) {
                     let announcement = layout_state
                         .lock()
                         .map(|layout| {
@@ -1129,8 +1160,10 @@ impl AppRuntime {
                             apply_transport_to_peer(&mut peer, &quic_transport);
                             peer.input_ready = advertised_input_ready(&layout, current_input_ready);
                             peer.upgrading = upgrading.load(Ordering::Relaxed);
+                            let known_peers =
+                                peers.lock().map(|peers| peers.clone()).unwrap_or_default();
                             let direct_targets =
-                                known_peer_discovery_targets(&layout, desired_port);
+                                known_peer_discovery_targets(&layout, desired_port, &known_peers);
                             Some((peer, direct_targets))
                         })
                         .unwrap_or_else(|_| Some((local_peer.clone(), Vec::new())));
@@ -1321,7 +1354,16 @@ impl AppRuntime {
                     }
                 }
 
-                prune_stale_peers(&peers);
+                // RFC §3-C：prune 间隔超过触发阈值意味着进程曾被挂起（合盖
+                // 睡眠）或时钟跳变——唤醒后链路重建要加速，立即重播 announce
+                // 并对全部已配对对端 directed probe（同 announce 分支路径）。
+                if prune_stale_peers(&peers) {
+                    request_immediate_reannounce(
+                        &mut last_announce,
+                        Instant::now(),
+                        ANNOUNCE_PERIOD,
+                    );
+                }
                 sync_layout_peer_presence(&layout_state, &peers);
             }
         });
@@ -5202,6 +5244,40 @@ fn local_host_label() -> String {
 /// `getifaddrs` on the 500 ms discovery tick.
 const LOCAL_IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Discovery announce 的正常周期。地址集合变化与唤醒路径的"立即重播"
+/// 都以拨回 `last_announce` 一个周期的方式触发（见 request_immediate_reannounce）。
+const ANNOUNCE_PERIOD: Duration = Duration::from_secs(3);
+
+/// announce 分支的触发条件：周期到点，或 input_ready / upgrading 状态
+/// 变化需要立刻让对端知道。提取为纯函数以便测试触发逻辑。
+fn announce_due(
+    last_announce: Instant,
+    period: Duration,
+    input_ready_changed: bool,
+    upgrading_changed: bool,
+) -> bool {
+    last_announce.elapsed() >= period || input_ready_changed || upgrading_changed
+}
+
+/// 请求下一拍立即重播 announce + 全部已配对对端 directed probe（RFC §3-C）。
+///
+/// 实现是把 `last_announce` 拨回一个 announce 周期之前，让 discovery 循环
+/// 随后的 announce 分支条件立即成立——该分支会重建 local_peer 与
+/// direct_targets、发广播、并对全部对端 probe + merge，路径唯一，复制一份
+/// 发送代码反而引入漂移风险。拨回后同轮循环体即到达该分支（socket 读
+/// 超时 500ms 内），延迟可接受。地址集合变化与 prune gap guard（唤醒/
+/// 时钟跳变）两条路径都收敛到这里。
+fn request_immediate_reannounce(last_announce: &mut Instant, now: Instant, period: Duration) {
+    // 正常路径：拨回一个周期。系统时钟早于 epoch+period 的极端情况下
+    // checked_sub 会失败，逐级缩短步长兜底（最差退化为不拨回——时钟本身
+    // 异常时不制造额外行为，等待下一轮周期触发）。
+    let past = now
+        .checked_sub(period)
+        .or_else(|| now.checked_sub(Duration::from_secs(1)))
+        .unwrap_or(now);
+    *last_announce = past;
+}
+
 /// Refresh the local device's displayed host label in the live layout.
 fn refresh_local_device_identity(layout_state: &Arc<Mutex<LayoutState>>) -> bool {
     let host_label = local_host_label();
@@ -5351,6 +5427,196 @@ fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
     addresses.sort_by_key(|address| address.octets());
     addresses.dedup();
     addresses
+}
+
+// ---- 网络抗干扰 P0 §3-A：本机地址多候选枚举与排序 ----
+
+/// announce 携带的本机地址候选上限（RFC N≤4）：再多就是地址风暴，
+/// probe fan-out 会被放大到不可控。
+const MAX_LOCAL_IP_CANDIDATES: usize = 4;
+
+/// 单个本机地址候选：地址 + 所属接口名（过滤与排序的依据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IpCandidate {
+    ip: IpAddr,
+    interface: String,
+}
+
+/// 接口名黑名单（小写子串匹配）：TUN/TAP 代理、AWDL、桥接、以及
+/// Hyper-V/WSL/VirtualBox 式虚拟交换机。172.16/12 私有段本身是企业内网
+/// 合法段，不在地址侧排除，只按接口名排虚拟交换机。if-addrs 在 Windows
+/// 返回 FriendlyName（"vEthernet (WSL)"）、macOS 返回 ifa_name（"utun3"），
+/// 两侧都能按名字命中。
+const EXCLUDED_INTERFACE_PATTERNS: [&str; 10] = [
+    "utun",
+    "tun",
+    "tap",
+    "awdl",
+    "bridge",
+    "vethernet",
+    "wsl",
+    "hyper-v",
+    "loopback",
+    "tailscale",
+];
+
+fn is_excluded_interface_name(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    EXCLUDED_INTERFACE_PATTERNS
+        .iter()
+        .any(|pattern| lowered.contains(pattern))
+}
+
+/// 地址特征过滤：复用既有 `usable_discovery_ipv4`（已排除 loopback、
+/// link-local 169.254/9、组播/广播、198.18/15 TUN 段）；发现协议是 IPv4
+/// LAN 协议，IPv6 候选一律丢弃。
+fn filter_ip_candidates(entries: &[IpCandidate]) -> Vec<IpCandidate> {
+    entries
+        .iter()
+        .filter(|entry| match entry.ip {
+            IpAddr::V4(ip) => usable_discovery_ipv4(ip),
+            IpAddr::V6(_) => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// 枚举本机全部 IPv4 地址候选（含接口名），按接口名启发式过滤，不排序。
+fn collect_local_ip_candidates() -> Vec<IpCandidate> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .iter()
+        .filter(|interface| !is_excluded_interface_name(&interface.name))
+        .filter_map(|interface| match &interface.addr {
+            if_addrs::IfAddr::V4(address) => Some(IpCandidate {
+                ip: IpAddr::V4(address.ip),
+                interface: interface.name.clone(),
+            }),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// RFC §3-A 排序（稳定，同输入必须同输出，防首选地址摇摆）：
+/// ① 与任一已配对对端同 /24 的地址（对端大概率可达的网段）；
+/// ② `preferred_hint`（现有 `local_ip_address()` 的"可用主地址"）；
+/// ③ 其余按接口名序 + 地址序。输出去重并截断至 `MAX_LOCAL_IP_CANDIDATES`。
+fn rank_local_ip_candidates(
+    entries: &[IpCandidate],
+    preferred_hint: Option<IpAddr>,
+    peer_hints: &[IpAddr],
+) -> Vec<IpAddr> {
+    let candidate_tier = |entry: &IpCandidate| -> u8 {
+        if peer_hints
+            .iter()
+            .any(|hint| shares_ipv4_subnet24(hint, &entry.ip))
+        {
+            0
+        } else if Some(entry.ip) == preferred_hint {
+            1
+        } else {
+            2
+        }
+    };
+
+    // 排序键：tier → 接口名 → 地址字节。sort_by 是稳定排序，完整键保证
+    // 同输入同输出；V6（理论上不会出现，防御性处理）排在所有 V4 之后。
+    let address_key = |ip: &IpAddr| -> (u8, [u8; 4]) {
+        match ip {
+            IpAddr::V4(ip) => (0, ip.octets()),
+            IpAddr::V6(_) => (1, [0_u8; 4]),
+        }
+    };
+
+    let mut ranked: Vec<&IpCandidate> = entries.iter().collect();
+    ranked.sort_by(|a, b| {
+        let key_a = (candidate_tier(a), a.interface.as_str(), address_key(&a.ip));
+        let key_b = (candidate_tier(b), b.interface.as_str(), address_key(&b.ip));
+        key_a.cmp(&key_b)
+    });
+
+    let mut result: Vec<IpAddr> = Vec::new();
+    for entry in ranked {
+        if !result.contains(&entry.ip) {
+            result.push(entry.ip);
+        }
+    }
+    result.truncate(MAX_LOCAL_IP_CANDIDATES);
+    result
+}
+
+/// 两个地址是否同 IPv4 /24 网段（peer_hints 匹配用）；非 V4 一律不同段。
+fn shares_ipv4_subnet24(a: &IpAddr, b: &IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => a.octets()[..3] == b.octets()[..3],
+        _ => false,
+    }
+}
+
+/// RFC §3-A 对外入口：枚举 + 过滤 + 排序。无 peer 提示的通用版本，
+/// `preferred_hint` 取现有 `local_ip_address()` 的结果（它代表"可用主地址"，
+/// 5s 缓存内零开销）。
+fn collect_local_ip_addresses() -> Vec<IpAddr> {
+    let entries = filter_ip_candidates(&collect_local_ip_candidates());
+    let preferred_hint = local_ip_address().and_then(|ip| ip.parse::<IpAddr>().ok());
+    rank_local_ip_candidates(&entries, preferred_hint, &[])
+}
+
+/// announce 广播面用 RFC §3-A 的过滤+排序列表（替代裸枚举，排掉
+/// TUN/虚拟交换机地址，广播不再打进 NAT 内网段）。
+fn ranked_local_ipv4_for_discovery() -> Vec<Ipv4Addr> {
+    collect_local_ip_addresses()
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// RFC §3-B：announce 的 ips 列表 = §3-A 排序结果转 String（≤4 个）。
+/// peer_hints 取 layout 中已配对对端地址，让"对端可达的网段"排最前。
+fn local_ips_for_announcement(
+    layout: &LayoutState,
+    enumerated: &[IpCandidate],
+    preferred_hint: Option<IpAddr>,
+) -> Vec<String> {
+    rank_local_ip_candidates(enumerated, preferred_hint, &paired_peer_ip_hints(layout))
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect()
+}
+
+/// layout 中已配对对端的所有可达地址：devices（非 local）与
+/// paired_controllers 的 host/ip 字段解析出的 IP，去重。仅作 /24
+/// 排序提示，host 字段支持 "名称 / ip" 多段形式。
+fn paired_peer_ip_hints(layout: &LayoutState) -> Vec<IpAddr> {
+    let mut hints: Vec<IpAddr> = Vec::new();
+    let mut push_host_field = |value: &str| {
+        for candidate in host_candidates(value) {
+            let (host, _) = split_host_port(&candidate);
+            let Ok(ip) = host.trim().parse::<IpAddr>() else {
+                continue;
+            };
+            if !hints.contains(&ip) {
+                hints.push(ip);
+            }
+        }
+    };
+    for device in layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+    {
+        push_host_field(&device.host);
+    }
+    for controller in &layout.paired_controllers {
+        push_host_field(&controller.ip);
+        push_host_field(&controller.host);
+    }
+    hints
 }
 
 fn default_route_ipv4_address() -> Option<Ipv4Addr> {
@@ -9241,6 +9507,10 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
     let fallback_name = local_device_name();
     let host = hostname().unwrap_or_else(|| "localhost".into());
     let ip = local_ip_address().unwrap_or_else(|| "127.0.0.1".into());
+    // RFC §3-B：announce 携带 §3-A 的有序多地址候选（含 peer 同段优先）。
+    let enumerated = filter_ip_candidates(&collect_local_ip_candidates());
+    let announcement_ips =
+        local_ips_for_announcement(layout, &enumerated, ip.parse::<IpAddr>().ok());
 
     LanPeer {
         id: local_peer_id(&host, &ip),
@@ -9254,6 +9524,7 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         pairing_required: pairing_required(layout),
         host,
         ip,
+        ips: announcement_ips,
         transport_port: layout.transport_port,
         quic_port: normalize_quic_port(layout.transport_port, layout.quic_port),
         transport_public_key: local_device
@@ -10352,10 +10623,14 @@ fn complete_pairing_from_confirm(
     write_layout_to_disk(config_path, &snapshot)
 }
 
-fn prune_stale_peers(peers: &Arc<Mutex<Vec<LanPeer>>>) {
-    if let Ok(mut peers) = peers.lock() {
-        prune_stale_peer_entries(&mut peers, now_ms());
-    }
+/// 返回值：本次 prune 是否命中 gap guard（进程曾被挂起/时钟跳变）。
+/// discovery 循环据此触发"立即 announce + paired probe"（RFC §3-C 唤醒
+/// 路径）；其他调用点（merge/快照）忽略返回值即可。
+fn prune_stale_peers(peers: &Arc<Mutex<Vec<LanPeer>>>) -> bool {
+    peers
+        .lock()
+        .map(|mut peers| prune_stale_peer_entries(&mut peers, now_ms()))
+        .unwrap_or(false)
 }
 
 /// A prune-call gap larger than this can only mean the process was suspended
@@ -10381,12 +10656,14 @@ const CLOCK_JUMP_GRACE_MS: u64 = 5_000;
 
 static PRUNE_GRACE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
-fn prune_stale_peer_entries(peers: &mut Vec<LanPeer>, now: u64) {
+fn prune_stale_peer_entries(peers: &mut Vec<LanPeer>, now: u64) -> bool {
     let mut baseline = LAST_PRUNE_BASELINE_MS.load(Ordering::Relaxed);
     let mut grace_until = PRUNE_GRACE_UNTIL_MS.load(Ordering::Relaxed);
-    prune_stale_peer_entries_with_baseline(peers, now, &mut baseline, &mut grace_until);
+    let guard_skipped =
+        prune_stale_peer_entries_with_baseline(peers, now, &mut baseline, &mut grace_until);
     LAST_PRUNE_BASELINE_MS.store(baseline, Ordering::Relaxed);
     PRUNE_GRACE_UNTIL_MS.store(grace_until, Ordering::Relaxed);
+    guard_skipped
 }
 
 fn prune_stale_peer_entries_with_baseline(
@@ -10394,7 +10671,7 @@ fn prune_stale_peer_entries_with_baseline(
     now: u64,
     baseline: &mut u64,
     grace_until: &mut u64,
-) {
+) -> bool {
     if prune_gap_guard_skips_prune(*baseline, now) {
         // Repeated jumps (or another jump inside the grace window) extend the
         // deadline; the assignment is idempotent for same-moment jumps.
@@ -10406,10 +10683,11 @@ fn prune_stale_peer_entries_with_baseline(
             grace_until
         );
         *baseline = now;
-        return;
+        return true;
     }
     *baseline = now;
     prune_stale_peer_entries_at(peers, now, *grace_until);
+    false
 }
 
 /// True when the gap between two prune rounds exceeds the trigger — the
@@ -10417,6 +10695,13 @@ fn prune_stale_peer_entries_with_baseline(
 /// not delete peers and the grace window is (re)armed instead.
 fn prune_gap_guard_skips_prune(baseline: u64, now: u64) -> bool {
     baseline != 0 && now.saturating_sub(baseline) > PRUNE_GAP_GRACE_TRIGGER_MS
+}
+
+/// RFC §3-C：两轮有序地址集合是否有差异。入参是排序后的候选序列，
+/// 逐位比较——同集合不同序说明首选地址（announce 首位）变了，同样
+/// 视为变化并触发重播。
+fn ip_sets_differ(old: &[IpAddr], new: &[IpAddr]) -> bool {
+    old.len() != new.len() || old.iter().zip(new.iter()).any(|(a, b)| a != b)
 }
 
 /// The single stale predicate every TTL-based expiry check must use. A peer is
@@ -10506,7 +10791,7 @@ fn discovery_detail(peer_count: usize, listening: bool, port: u16) -> String {
 /// whole span — rather than a single port — lets us reach peers that drifted
 /// onto a neighbouring port when their preferred port was momentarily taken.
 pub(crate) fn broadcast_addrs(base_port: u16) -> Vec<String> {
-    broadcast_addrs_for_ips(base_port, &local_ipv4_addresses())
+    broadcast_addrs_for_ips(base_port, &ranked_local_ipv4_for_discovery())
 }
 
 fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
@@ -10524,13 +10809,25 @@ fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String
     addresses
 }
 
+/// RFC §3-B：单 peer 的 directed 目标总数上限。地址上限 N≤4 × 端口 span
+/// 8 = 32；防对端 announce 大地址列表（或异常包）时 probe fan-out 放大。
+const MAX_DIRECTED_TARGETS_PER_PEER: usize = 32;
+
 /// Directed discovery destinations for peers we already know about. Pairing and
 /// manual probing use unicast, but the long-running discovery loop used to rely
 /// only on broadcast after that. On LANs where broadcast is flaky or filtered,
 /// the peer would age out after `PEER_TTL_MS` even though direct UDP still
 /// worked. Keep paired/configured machines warm with a small directed announce
 /// fan-out.
-fn known_peer_discovery_targets(layout: &LayoutState, base_port: u16) -> Vec<String> {
+///
+/// RFC §3-B：运行时 `peers` 里对端 announce 学到的 `ips` 会扩展各自的
+/// directed 目标（每地址 × 端口 span 的并集），让 WiFi+网线双接口对端有
+/// 多条保活路径；`ips` 为空（旧版对端）时保持既有 host/ip 逻辑。
+fn known_peer_discovery_targets(
+    layout: &LayoutState,
+    base_port: u16,
+    peers: &[LanPeer],
+) -> Vec<String> {
     let base_ports = discovery_target_ports(base_port);
     let mut targets = Vec::new();
 
@@ -10540,17 +10837,49 @@ fn known_peer_discovery_targets(layout: &LayoutState, base_port: u16) -> Vec<Str
         .filter(|device| device.role != "local")
     {
         let ports = known_peer_ports(base_port, device.transport_port);
-        push_host_discovery_targets(&mut targets, &device.host, &ports);
+        let mut peer_targets = Vec::new();
+        push_host_discovery_targets(&mut peer_targets, &device.host, &ports);
+        let advertised_ips: Vec<String> = peers
+            .iter()
+            .filter(|peer| device_matches_peer(device, peer, &layout.cluster_id))
+            .flat_map(|peer| peer.ips.iter().cloned())
+            .collect();
+        push_directed_targets(&mut peer_targets, &advertised_ips, &ports);
+        peer_targets.truncate(MAX_DIRECTED_TARGETS_PER_PEER);
+        targets.extend(peer_targets);
     }
 
     for controller in &layout.paired_controllers {
-        push_host_discovery_targets(&mut targets, &controller.ip, &base_ports);
-        push_host_discovery_targets(&mut targets, &controller.host, &base_ports);
+        let mut peer_targets = Vec::new();
+        push_host_discovery_targets(&mut peer_targets, &controller.ip, &base_ports);
+        push_host_discovery_targets(&mut peer_targets, &controller.host, &base_ports);
+        let advertised_ips: Vec<String> = peers
+            .iter()
+            .filter(|peer| paired_controller_identity_matches_peer(controller, peer))
+            .flat_map(|peer| peer.ips.iter().cloned())
+            .collect();
+        push_directed_targets(&mut peer_targets, &advertised_ips, &base_ports);
+        peer_targets.truncate(MAX_DIRECTED_TARGETS_PER_PEER);
+        targets.extend(peer_targets);
     }
 
     targets.sort();
     targets.dedup();
     targets
+}
+
+/// 把对端 announce 学到的 ips 扩展成 directed 目标（每地址 × 端口 span）。
+/// 跳过空串/非地址串由调用方的 truncate 兜底总量。
+fn push_directed_targets(targets: &mut Vec<String>, addresses: &[String], ports: &[u16]) {
+    for address in addresses {
+        let address = address.trim();
+        if address.is_empty() {
+            continue;
+        }
+        for port in ports {
+            targets.push(format!("{address}:{port}"));
+        }
+    }
 }
 
 fn known_peer_ports(base_port: u16, stored_port: u16) -> Vec<u16> {
@@ -11180,6 +11509,7 @@ mod tests {
             pairing_required: false,
             host: "client".into(),
             ip: "10.0.0.2".into(),
+            ips: Vec::new(),
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "peer-public-key".into(),
@@ -13433,6 +13763,7 @@ mod tests {
             pairing_required: false,
             host: "server.local".into(),
             ip: "10.0.0.1".into(),
+            ips: Vec::new(),
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "server-public-key".into(),
@@ -14059,7 +14390,7 @@ mod tests {
         layout.devices[1].host = "Client / 10.0.0.2".into();
         layout.devices[1].transport_port = DISCOVERY_PORT + DISCOVERY_PORT_SPAN + 2;
 
-        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT);
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &[]);
 
         assert!(targets.contains(&format!("10.0.0.2:{DISCOVERY_PORT}")));
         assert!(targets.contains(&format!("10.0.0.2:{}", DISCOVERY_PORT + 1)));
@@ -14085,7 +14416,7 @@ mod tests {
             paired_at_ms: now_ms(),
         }];
 
-        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT);
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &[]);
 
         assert!(targets.contains(&format!("10.0.0.1:{DISCOVERY_PORT}")));
         assert!(targets.contains(&format!("server-host:{DISCOVERY_PORT}")));
@@ -14174,5 +14505,617 @@ mod tests {
         assert_eq!((local.x, local.y), (0, 0));
         assert_eq!(screen_overlap_area(local, peer), 0);
         assert_eq!(peer.y + peer.height, local.y);
+    }
+
+    // ---- 网络抗干扰 P0 §3-A：本机地址枚举与排序 ----
+
+    /// 测试辅助：按地址+接口名构造候选。
+    fn candidate(octets: [u8; 4], interface: &str) -> IpCandidate {
+        IpCandidate {
+            ip: IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
+            interface: interface.to_string(),
+        }
+    }
+
+    #[test]
+    fn interface_filter_excludes_virtual_tunnel_and_awdl_adapters() {
+        // RFC §3-A：TUN/TAP、AWDL、虚拟交换机按接口名排除（忽略大小写）。
+        // 命中名单：utun/tun/tap/awdl/bridge/vEthernet/WSL/Hyper-V/Loopback/tailscale。
+        let excluded = [
+            ("utun3", "macOS TUN 代理"),
+            ("TUN Proxy Adapter", "显式 tun 命名"),
+            ("TAP-Win32 Adapter", "Windows TAP"),
+            ("awdl0", "macOS AWDL（AirDrop 链路）"),
+            ("bridge0", "macOS 桥接"),
+            ("vEthernet (WSL)", "Hyper-V WSL 虚拟交换机"),
+            ("vEthernet (Default Switch)", "Hyper-V 默认交换机"),
+            ("WSL", "WSL 适配器"),
+            ("Hyper-V Virtual Ethernet Adapter", "Hyper-V 命名"),
+            ("Tailscale", "Tailscale 隧道"),
+            ("tailscale0", "Tailscale 小写"),
+            ("Loopback Pseudo-Interface 1", "回环命名接口"),
+        ];
+        for (name, why) in excluded {
+            assert!(
+                is_excluded_interface_name(name),
+                "接口 {name:?}（{why}）必须被排除"
+            );
+        }
+
+        let kept = [
+            ("en0", "macOS Wi-Fi"),
+            ("en5", "macOS USB 网卡"),
+            ("eth0", "Linux 网卡"),
+            ("WLAN", "Windows Wi-Fi"),
+            ("以太网", "Windows 有线"),
+            ("Ethernet 2", "Windows 网卡"),
+            ("USB 10/100/1000 LAN", "USB 网卡（含 lan 字样但非黑名单）"),
+        ];
+        for (name, why) in kept {
+            assert!(
+                !is_excluded_interface_name(name),
+                "物理接口 {name:?}（{why}）不允许被误杀"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_collection_drops_loopback_and_link_local_but_keeps_enterprise_range() {
+        // RFC §3-A：127/8、169.254/9 排除；172.16/12 私有段是企业内网合法段，
+        // 接口名正常时必须保留。
+        let entries = [
+            candidate([127, 0, 0, 1], "lo0"),
+            candidate([169, 254, 12, 9], "en0"),
+            candidate([172, 16, 8, 20], "Ethernet 2"),
+            candidate([172, 31, 1, 5], "WLAN"),
+            candidate([192, 168, 1, 42], "en0"),
+        ];
+
+        let kept: Vec<Ipv4Addr> = filter_ip_candidates(&entries)
+            .into_iter()
+            .filter_map(|entry| match entry.ip {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+
+        assert_eq!(
+            kept,
+            vec![
+                Ipv4Addr::new(172, 16, 8, 20),
+                Ipv4Addr::new(172, 31, 1, 5),
+                Ipv4Addr::new(192, 168, 1, 42),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranking_prefers_candidates_sharing_a_subnet_with_paired_peers() {
+        // 第一档：与已配对对端同 /24 的地址最优先（对端大概率可达的网段）。
+        let entries = [
+            candidate([10, 0, 0, 4], "en5"),
+            candidate([192, 168, 1, 42], "en0"),
+            candidate([192, 168, 1, 7], "WLAN"),
+        ];
+        let peer_hints = [IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))];
+
+        let ranked = rank_local_ip_candidates(&entries, None, &peer_hints);
+
+        assert_eq!(
+            ranked,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 7),
+                Ipv4Addr::new(192, 168, 1, 42),
+                Ipv4Addr::new(10, 0, 0, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranking_falls_back_to_the_hinted_primary_address() {
+        // 第二档：preferred_hint（现有 local_ip_address() 的"可用主地址"），
+        // 在没有对端同段候选时压轴到最前。
+        let entries = [
+            candidate([10, 0, 0, 4], "en5"),
+            candidate([192, 168, 1, 42], "en0"),
+        ];
+        let hint = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)));
+
+        let ranked = rank_local_ip_candidates(&entries, hint, &[]);
+
+        assert_eq!(
+            ranked,
+            vec![Ipv4Addr::new(192, 168, 1, 42), Ipv4Addr::new(10, 0, 0, 4)]
+        );
+    }
+
+    #[test]
+    fn ranking_orders_remaining_candidates_stably_by_interface_then_address() {
+        // 第三档：接口名序 + 地址序；同输入必须同输出（防摇摆是硬要求）。
+        let entries = [
+            candidate([10, 0, 0, 9], "WLAN"),
+            candidate([10, 0, 0, 2], "en0"),
+            candidate([172, 16, 3, 4], "Ethernet 2"),
+            candidate([10, 0, 0, 5], "en5"),
+        ];
+
+        let first = rank_local_ip_candidates(&entries, None, &[]);
+        let second = rank_local_ip_candidates(&entries, None, &[]);
+
+        // 接口名是第一排序键：Ethernet 2 < WLAN < en0 < en5（ASCII 序），
+        // 同接口内再按地址序。不同接口的地址不按地址大小混排。
+        assert_eq!(
+            first,
+            vec![
+                Ipv4Addr::new(172, 16, 3, 4), // "Ethernet 2" 最小
+                Ipv4Addr::new(10, 0, 0, 9),   // "WLAN"
+                Ipv4Addr::new(10, 0, 0, 2),   // "en0"
+                Ipv4Addr::new(10, 0, 0, 5),   // "en5"
+            ]
+        );
+        assert_eq!(first, second, "同输入必须得到同输出");
+    }
+
+    #[test]
+    fn ranking_tiers_keep_peer_subnet_above_the_primary_hint() {
+        // 三档并存时严格按 tier 顺序：对端同段 > preferred_hint > 其余。
+        let entries = [
+            candidate([10, 0, 0, 4], "en5"),
+            candidate([192, 168, 1, 42], "en0"),
+            candidate([192, 168, 1, 7], "WLAN"),
+        ];
+        let hint = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)));
+        let peer_hints = [IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))];
+
+        let ranked = rank_local_ip_candidates(&entries, hint, &peer_hints);
+
+        assert_eq!(
+            ranked,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 7),
+                Ipv4Addr::new(192, 168, 1, 42),
+                Ipv4Addr::new(10, 0, 0, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn ranking_caps_the_candidate_list_at_four_addresses() {
+        // RFC 上限 N≤4：候选再多也截断，防 announce/probe 地址风暴。
+        let entries = [
+            candidate([10, 0, 0, 1], "eth0"),
+            candidate([10, 0, 1, 1], "eth1"),
+            candidate([10, 0, 2, 1], "eth2"),
+            candidate([10, 0, 3, 1], "eth3"),
+            candidate([10, 0, 4, 1], "eth4"),
+            candidate([10, 0, 5, 1], "eth5"),
+        ];
+
+        let ranked = rank_local_ip_candidates(&entries, None, &[]);
+
+        assert_eq!(ranked.len(), MAX_LOCAL_IP_CANDIDATES);
+        assert_eq!(
+            ranked,
+            vec![
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 0, 1, 1),
+                Ipv4Addr::new(10, 0, 2, 1),
+                Ipv4Addr::new(10, 0, 3, 1),
+            ]
+        );
+    }
+
+    // ---- 网络抗干扰 P0 §3-B：ips 字段跨版本兼容探测（先于实现执行） ----
+
+    /// 在 named-map msgpack 载荷的字节层追加一个字符串键值对，并把 map
+    /// 计数加一。用于模拟"未来版本在 DiscoveryPacket/LanPeer 上新增了
+    /// 字段"：旧版（本 crate 现有结构）必须容忍未知字段继续解码。
+    fn append_msgpack_named_field(
+        payload: &[u8],
+        key: &str,
+        value_bytes: &[u8],
+    ) -> Option<Vec<u8>> {
+        let mut forged = payload.to_vec();
+        let header = *forged.first()?;
+        match header {
+            0x80..=0x8f => {
+                let count = header & 0x0f;
+                if count == 0x0f {
+                    // fixmap 满 15 需要升级为 map16，不在本测试的构造范围。
+                    return None;
+                }
+                forged[0] = 0x80 | (count + 1);
+            }
+            0xde => {
+                let count = u16::from_be_bytes([forged[1], forged[2]]);
+                forged[1..3].copy_from_slice(&count.checked_add(1)?.to_be_bytes());
+            }
+            0xdf => {
+                let count = u32::from_be_bytes([forged[1], forged[2], forged[3], forged[4]]);
+                forged[1..5].copy_from_slice(&count.checked_add(1)?.to_be_bytes());
+            }
+            _ => return None,
+        }
+        forged.extend_from_slice(&rmp_serde::to_vec_named(key).ok()?);
+        forged.extend_from_slice(value_bytes);
+        Some(forged)
+    }
+
+    #[test]
+    fn legacy_decoding_tolerates_unknown_ips_field_in_named_msgpack() {
+        // 兼容性硬性检查点（RFC §6）：提交计划要给 LanPeer 新增 ips 字段。
+        // 在该字段存在之前，先在字节层验证旧解码路径的容忍性——构造方式：
+        // ① 用当前（旧版形状）LanPeer 编码一条 announce 包；
+        // ② 在 msgpack 字节层追加未知键 "ips"（List[String]，即未来字段的
+        //    线上形状）并同步把顶层 map 计数 +1；
+        // ③ 用现有 decode_discovery_packet 解码。
+        // 若解码失败，需要 bump PROTOCOL_VERSION（影响双端旧版互通），
+        // 必须停下等待决策，不得继续实施。
+        let peer = test_peer();
+        let packet = DiscoveryPacket {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer,
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let bytes = encode_wire_packet(&packet).expect("旧版 announce 包编码成功");
+        let ips = vec!["192.168.1.5".to_string(), "10.8.0.2".to_string()];
+        let ips_bytes = rmp_serde::to_vec_named(&ips).expect("编码 ips 列表");
+        let forged = append_msgpack_named_field(&bytes, "ips", &ips_bytes)
+            .expect("DiscoveryPacket 编码为 named map，可追加字段");
+
+        let decoded = decode_discovery_packet(&forged)
+            .expect("旧版解码含未知 ips 字段的包必须成功；失败即协议不兼容，需停下决策");
+        assert_eq!(decoded.kind, "announce");
+        assert_eq!(decoded.peer.id, "peer-client-10-0-0-2");
+        assert_eq!(decoded.peer.ip, "10.0.0.2");
+    }
+
+    /// 与旧版（无 ips 字段）LanPeer 逐字段一致的镜像结构：跨版本编解码
+    /// 双向测试的"另一端"。新增 ips 后此镜像就代表已部署的旧版客户端。
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyLanPeerMirror {
+        id: String,
+        name: String,
+        platform: String,
+        #[serde(default)]
+        machine_role: String,
+        #[serde(default)]
+        cluster_id: String,
+        #[serde(default)]
+        pairing_required: bool,
+        host: String,
+        ip: String,
+        #[serde(default = "default_transport_port")]
+        transport_port: u16,
+        #[serde(default)]
+        quic_port: u16,
+        #[serde(default)]
+        transport_public_key: String,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u16,
+        screen_count: usize,
+        #[serde(default)]
+        input_ready: bool,
+        #[serde(default)]
+        upgrading: bool,
+        #[serde(default)]
+        screens: Vec<LanPeerScreen>,
+        app_version: String,
+        last_seen_ms: u64,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyDiscoveryPacketMirror {
+        protocol: String,
+        kind: String,
+        peer: LegacyLanPeerMirror,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pairing_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pair_cluster_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pair_secret: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pairing_error: Option<String>,
+    }
+
+    fn legacy_mirror_peer(peer: &LanPeer) -> LegacyLanPeerMirror {
+        LegacyLanPeerMirror {
+            id: peer.id.clone(),
+            name: peer.name.clone(),
+            platform: peer.platform.clone(),
+            machine_role: peer.machine_role.clone(),
+            cluster_id: peer.cluster_id.clone(),
+            pairing_required: peer.pairing_required,
+            host: peer.host.clone(),
+            ip: peer.ip.clone(),
+            transport_port: peer.transport_port,
+            quic_port: peer.quic_port,
+            transport_public_key: peer.transport_public_key.clone(),
+            protocol_version: peer.protocol_version,
+            screen_count: peer.screen_count,
+            input_ready: peer.input_ready,
+            upgrading: peer.upgrading,
+            screens: peer.screens.clone(),
+            app_version: peer.app_version.clone(),
+            last_seen_ms: peer.last_seen_ms,
+        }
+    }
+
+    #[test]
+    fn legacy_packets_decode_with_empty_ips_and_new_packets_drop_ips_for_legacy() {
+        // RFC §5 跨版本编解码双向验证：
+        // ① 旧包（无 ips 键）→ 新版解码：ips 落 default 空 Vec；
+        // ② 新包（ips 非空）→ 旧版镜像解码：未知字段被忽略不报错。
+        let old_packet = LegacyDiscoveryPacketMirror {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer: legacy_mirror_peer(&test_peer()),
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let old_bytes = rmp_serde::to_vec_named(&old_packet).expect("旧版包编码成功");
+
+        let decoded = decode_discovery_packet(&old_bytes).expect("新版解码旧包（无 ips）必须成功");
+        assert!(decoded.peer.ips.is_empty(), "旧包解码后 ips 必须是空 Vec");
+
+        let mut new_peer = test_peer();
+        new_peer.ips = vec!["192.168.1.5".into(), "10.8.0.2".into()];
+        let new_packet = DiscoveryPacket {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer: new_peer,
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let new_bytes = rmp_serde::to_vec_named(&new_packet).expect("新版包编码成功");
+
+        let legacy_decoded = decode_wire_packet::<LegacyDiscoveryPacketMirror>(&new_bytes)
+            .expect("旧版镜像解码新包（含 ips）必须成功");
+        assert_eq!(legacy_decoded.peer.ip, "10.0.0.2");
+    }
+
+    #[test]
+    fn announcement_ips_follow_the_ranked_candidate_order() {
+        // RFC §3-B：announce 的 ips = §3-A 排序结果（对端同 /24 优先）转
+        // String，且不超过 4 个。
+        let mut layout = test_layout();
+        layout.paired_controllers.push(PairedController {
+            id: "peer-controller-1".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.8.0.7".into(),
+            transport_public_key: "controller-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: now_ms(),
+        });
+
+        let entries = [
+            candidate([192, 168, 1, 42], "en0"),
+            candidate([10, 8, 0, 2], "en5"), // 与对端 10.8.0.7 同 /24
+        ];
+        let ips = local_ips_for_announcement(&layout, &entries, None);
+        assert_eq!(
+            ips,
+            vec!["10.8.0.2".to_string(), "192.168.1.42".to_string()],
+            "与已配对对端同段的地址必须排在 announce ips 首位"
+        );
+
+        // 超过 4 个候选时截断（对端同段 3 个 + 其他 3 个 → 只发 4 个）。
+        let mut many = vec![candidate([192, 168, 9, 1], "en7")];
+        for octet in 1..=5_u8 {
+            many.push(candidate([10, 8, 0, octet], "en5"));
+        }
+        let ips = local_ips_for_announcement(&layout, &many, None);
+        assert_eq!(ips.len(), MAX_LOCAL_IP_CANDIDATES);
+        assert_eq!(&ips[..3], &["10.8.0.1", "10.8.0.2", "10.8.0.3"]);
+    }
+
+    #[test]
+    fn paired_peer_ip_hints_collect_paired_addresses_from_layout() {
+        // /24 排序提示来自 layout 的对端字段：devices（非 local）与
+        // paired_controllers 的 host/ip，host 支持 "名称 / ip" 多段形式。
+        let mut layout = test_layout();
+        layout.devices[1].host = "Client / 10.0.0.2".into();
+        layout.paired_controllers.push(PairedController {
+            id: "peer-controller-1".into(),
+            name: "Server".into(),
+            host: "server / 192.168.66.9".into(),
+            ip: "192.168.66.9".into(),
+            transport_public_key: "controller-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: now_ms(),
+        });
+
+        let hints = paired_peer_ip_hints(&layout);
+
+        assert!(hints.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+        assert!(hints.contains(&IpAddr::V4(Ipv4Addr::new(192, 168, 66, 9))));
+        assert_eq!(hints.len(), 2, "重复地址（ip 与 host 重复出现）只算一次");
+    }
+
+    #[test]
+    fn merge_peer_entry_replaces_stale_ips_with_latest_announcement() {
+        // ips 是运行时信息：对端 announce 学到的新列表必须整体覆盖旧列表，
+        // 不残留已失效地址。
+        let mut stale = test_peer();
+        stale.ips = vec!["10.0.0.2".into()];
+        let mut peers = vec![stale];
+
+        let mut latest = test_peer();
+        latest.ips = vec!["10.0.0.9".into(), "192.168.1.5".into()];
+        merge_peer_entry(&mut peers, latest);
+
+        assert_eq!(
+            peers[0].ips,
+            vec!["10.0.0.9".to_string(), "192.168.1.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn device_targets_expand_over_peer_advertised_ips() {
+        // RFC §3-B：运行时 peer 的 ips 非空时，该对端的 directed 目标扩展为
+        // ips × 端口 span 的并集（多条保活路径）。
+        let layout = test_layout(); // devices[1] 与 test_peer() 同 key 同 id
+        let mut peer = test_peer();
+        peer.ips = vec!["10.0.0.9".into(), "192.168.1.5".into()];
+        let peers = vec![peer];
+
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &peers);
+
+        for ip in ["10.0.0.9", "192.168.1.5"] {
+            assert!(
+                targets.contains(&format!("{ip}:{DISCOVERY_PORT}")),
+                "ips 地址 {ip} 必须出现在 directed 目标里"
+            );
+        }
+        // 既有 host/ip 目标保持不变。
+        assert!(targets.contains(&format!("10.0.0.2:{DISCOVERY_PORT}")));
+    }
+
+    #[test]
+    fn controller_targets_expand_over_peer_advertised_ips() {
+        let mut layout = test_layout();
+        layout.paired_controllers.push(PairedController {
+            id: "peer-controller-1".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "192.168.66.9".into(),
+            transport_public_key: "peer-public-key".into(), // 与 test_peer() 同 key
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: now_ms(),
+        });
+        let mut peer = test_peer();
+        peer.ips = vec!["10.0.0.9".into()];
+        let peers = vec![peer];
+
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &peers);
+
+        assert!(targets.contains(&format!("10.0.0.9:{DISCOVERY_PORT}")));
+        assert!(targets.contains(&format!("192.168.66.9:{DISCOVERY_PORT}")));
+    }
+
+    #[test]
+    fn targets_without_peer_ips_keep_the_host_only_logic() {
+        // 兼容旧版对端：ips 为空时不新增目标，保持现有 host/ip 逻辑。
+        let layout = test_layout();
+        let peers = vec![test_peer()]; // ips 为空
+
+        let with_peers = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &peers);
+        let without_peers = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &[]);
+
+        assert_eq!(with_peers, without_peers);
+    }
+
+    #[test]
+    fn directed_targets_cap_at_32_per_peer() {
+        // 地址风暴防护：单 peer 总目标数 ≤32（RFC N≤4 地址 × span 8 端口）。
+        let mut layout = test_layout();
+        layout.devices[1].host = "Client / 10.0.0.2".into();
+        let mut peer = test_peer();
+        peer.ips = (1..=6_u8)
+            .map(|octet| format!("10.0.0.{octet}"))
+            .collect::<Vec<_>>();
+        let peers = vec![peer];
+
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &peers);
+
+        assert!(
+            targets.len() <= MAX_DIRECTED_TARGETS_PER_PEER,
+            "单 peer 目标数 {} 超过上限 {MAX_DIRECTED_TARGETS_PER_PEER}",
+            targets.len()
+        );
+    }
+
+    // ---- 网络抗干扰 P0 §3-C：地址集合 diff 与即时重播触发 ----
+
+    #[test]
+    fn ip_sets_differ_detects_add_remove_reorder_and_empty() {
+        // RFC §3-C：集合变化（增/删/换首选）都要触发重播；diff 基于
+        // 排序后的序列——同集合不同序说明首选地址变了，必须触发。
+        let v =
+            |octets: [u8; 4]| IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
+        let a = v([192, 168, 1, 42]);
+        let b = v([10, 0, 0, 4]);
+
+        assert!(ip_sets_differ(&[], &[a]), "空 → 有地址（新增）必须触发");
+        assert!(ip_sets_differ(&[a], &[]), "有地址 → 空（删除）必须触发");
+        assert!(ip_sets_differ(&[a, b], &[a]), "地址减少必须触发");
+        assert!(ip_sets_differ(&[a], &[a, b]), "地址增加必须触发");
+        assert!(
+            ip_sets_differ(&[a, b], &[b, a]),
+            "同集合不同序=首选变化，必须触发"
+        );
+        assert!(!ip_sets_differ(&[a, b], &[a, b]), "完全相同不触发");
+        assert!(!ip_sets_differ(&[], &[]), "双方为空不触发");
+    }
+
+    #[test]
+    fn request_immediate_reannounce_makes_the_announce_branch_due() {
+        // 触发机制：把 last_announce 拨回一个 announce 周期之前，使既有
+        // announce 分支条件立即成立（复用发送路径，不复制发送代码）。
+        let period = Duration::from_secs(3);
+        let now = Instant::now();
+        let mut last_announce = now; // 刚发过一轮 → 不 due
+        assert!(!announce_due(last_announce, period, false, false));
+
+        request_immediate_reannounce(&mut last_announce, now, period);
+
+        assert!(
+            announce_due(last_announce, period, false, false),
+            "拨回后 announce 分支必须立即 due"
+        );
+    }
+
+    #[test]
+    fn announce_due_keeps_the_input_and_upgrading_triggers() {
+        // 既有行为守护：input_ready / upgrading 状态变化独立于周期触发。
+        let period = Duration::from_secs(3);
+        let now = Instant::now();
+        assert!(announce_due(now, period, true, false));
+        assert!(announce_due(now, period, false, true));
+        assert!(!announce_due(now, period, false, false));
+    }
+
+    #[test]
+    fn prune_stale_peer_entries_signals_gap_guard_skips() {
+        // RFC §3-C 唤醒路径：guard 命中（进程曾被挂起/时钟跳变）的那轮
+        // prune 必须把信号返回给 discovery 循环，触发重播 + paired probe。
+        let mut peers = vec![test_peer()];
+        let mut baseline = now_ms() - 1000;
+        let now = baseline + PRUNE_GAP_GRACE_TRIGGER_MS + 1;
+        let mut grace_until = 0_u64;
+
+        let skipped = prune_stale_peer_entries_with_baseline(
+            &mut peers,
+            now,
+            &mut baseline,
+            &mut grace_until,
+        );
+        assert!(skipped, "prune 间隔超过触发阈值必须报 guard 命中");
+        assert_eq!(peers.len(), 1, "guard 命中时不得删除 peer");
+
+        // 正常间隔的一轮 prune：guard 未命中，返回 false。
+        let baseline_after_guard = baseline; // with_baseline 内部已把 baseline 更新为 now
+        let skipped = prune_stale_peer_entries_with_baseline(
+            &mut peers,
+            baseline_after_guard + 1000,
+            &mut baseline,
+            &mut grace_until,
+        );
+        assert!(!skipped, "正常间隔不应触发 guard 信号");
     }
 }
