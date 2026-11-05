@@ -132,6 +132,10 @@ export interface HaloDebugSnapshot {
   normY: number
   speedNorm: number
   phase: 'idle' | 'suspended_face' | 'suspended_input'
+  /** 转头切屏：当前生效区域对应的屏幕 id（单屏模式为 null）。 */
+  activeScreenId?: string | null
+  /** 转头切屏：本快照窗口内发生了区域切换（引擎仅在提交 tick 置位）。 */
+  screenSwitched?: boolean
 }
 
 export interface PairedController {

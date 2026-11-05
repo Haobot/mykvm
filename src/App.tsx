@@ -99,6 +99,12 @@ import {
   type HaloScreenCalSummary,
   type ScreenCalCorner,
 } from "./screenCalWizard";
+import {
+  SCREEN_WARP_RANGES,
+  clampToRange,
+  screenWarpNeedsCalibration,
+  sharedTransAlpha,
+} from "./screenWarp";
 import { compareVersions } from "./versions";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
@@ -4086,6 +4092,46 @@ function App() {
                 {haloError ? (
                   <p className="muted-copy diagnostic-message">{haloError}</p>
                 ) : null}
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.haloScreenWarp}
+                    <InfoTip
+                      label={ui.settings.haloScreenWarp}
+                      text={ui.settings.haloScreenCalCopy}
+                    />
+                  </span>
+                  <div
+                    className="segmented-control"
+                    role="group"
+                    aria-label={ui.settings.haloScreenWarp}
+                  >
+                    <button
+                      type="button"
+                      className={haloSettings.screenWarpEnabled ? "active" : ""}
+                      aria-pressed={haloSettings.screenWarpEnabled ?? false}
+                      onClick={() =>
+                        setFocusHaloSetting("screenWarpEnabled", true)
+                      }
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!haloSettings.screenWarpEnabled ? "active" : ""}
+                      aria-pressed={!(haloSettings.screenWarpEnabled ?? false)}
+                      onClick={() =>
+                        setFocusHaloSetting("screenWarpEnabled", false)
+                      }
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                {screenWarpNeedsCalibration(haloSettings) ? (
+                  <p className="muted-copy diagnostic-message">
+                    {ui.settings.haloScreenWarpHint}
+                  </p>
+                ) : null}
                 <p className="muted-copy">{ui.settings.haloCalibrationHint}</p>
                 <div className="inline-actions">
                   <button
@@ -4424,6 +4470,57 @@ function App() {
                       step={0.1}
                       onCommit={(value) => setFocusHaloSetting("gain", value)}
                     />
+                    {/* 转头切屏（S3）滑杆：范围与后端 sanitize 一致
+                        （screenWarp.ts 的 SCREEN_WARP_RANGES）。 */}
+                    <HaloSliderField
+                      label={ui.settings.haloRegionSettle}
+                      help={ui.settings.haloRegionSettleHelp}
+                      value={
+                        haloSettings.regionSettleMs ??
+                        SCREEN_WARP_RANGES.regionSettleMs.default
+                      }
+                      min={SCREEN_WARP_RANGES.regionSettleMs.min}
+                      max={SCREEN_WARP_RANGES.regionSettleMs.max}
+                      step={SCREEN_WARP_RANGES.regionSettleMs.step}
+                      format={(value) => `${value} ms`}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("regionSettleMs", value)
+                      }
+                    />
+                    <HaloSliderField
+                      label={ui.settings.haloRegionMargin}
+                      help={ui.settings.haloRegionMarginHelp}
+                      value={
+                        haloSettings.regionMargin ??
+                        SCREEN_WARP_RANGES.regionMargin.default
+                      }
+                      min={SCREEN_WARP_RANGES.regionMargin.min}
+                      max={SCREEN_WARP_RANGES.regionMargin.max}
+                      step={SCREEN_WARP_RANGES.regionMargin.step}
+                      format={(value) => value.toFixed(2)}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("regionMargin", value)
+                      }
+                    />
+                    {/* 一个「平移补偿系数」滑杆同时写水平/垂直两个字段，
+                        见 screenWarp.ts sharedTransAlpha。 */}
+                    <HaloSliderField
+                      label={ui.settings.haloTransAlpha}
+                      help={ui.settings.haloTransAlphaHelp}
+                      value={
+                        haloSettings.transAlphaYaw ??
+                        SCREEN_WARP_RANGES.transAlpha.default
+                      }
+                      min={SCREEN_WARP_RANGES.transAlpha.min}
+                      max={SCREEN_WARP_RANGES.transAlpha.max}
+                      step={SCREEN_WARP_RANGES.transAlpha.step}
+                      onCommit={(value) => {
+                        const { transAlphaYaw, transAlphaPitch } =
+                          sharedTransAlpha(value);
+                        setFocusHaloSetting("transAlphaYaw", transAlphaYaw);
+                        setFocusHaloSetting("transAlphaPitch", transAlphaPitch);
+                      }}
+                    />
                     <div className="settings-control-row">
                       <span>{ui.settings.haloShowProgress}</span>
                       <div className="segmented-control">
@@ -4703,6 +4800,20 @@ function App() {
                               ? ui.settings.haloPhaseSuspendedInput
                               : ui.settings.haloPhaseIdle
                           : "--"}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveActiveScreen}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {haloDebug?.activeScreenId ?? ui.common.none}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveScreenSwitched}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {haloDebug?.screenSwitched
+                          ? ui.settings.haloScreenSwitchedNow
+                          : ui.settings.haloScreenSwitchedNone}
                       </span>
                     </div>
                     <div className="settings-control-row">
@@ -5281,6 +5392,50 @@ function HaloNumberField(props: {
           }
         }}
       />
+    </div>
+  );
+}
+
+/// One halo range-slider settings row (转头切屏 advanced controls). Commits
+/// on every change (sliders are inherently valid within min/max) and shows
+/// the live value next to the track. The track min/max/step come from the
+/// caller and mirror the backend sanitize bounds.
+function HaloSliderField(props: {
+  label: string;
+  help: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  format?: (value: number) => string;
+  onCommit: (value: number) => void;
+}) {
+  const display = props.format ?? ((value: number) => String(value));
+  return (
+    <div className="settings-control-row">
+      <span>
+        {props.label}
+        <InfoTip label={props.label} text={props.help} />
+      </span>
+      <span
+        style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+      >
+        <input
+          type="range"
+          min={props.min}
+          max={props.max}
+          step={props.step}
+          value={clampToRange({ min: props.min, max: props.max }, props.value)}
+          aria-label={props.label}
+          onChange={(event) => props.onCommit(Number(event.target.value))}
+        />
+        <span
+          className="settings-number-input"
+          style={{ minWidth: 56, textAlign: "right" }}
+        >
+          {display(props.value)}
+        </span>
+      </span>
     </div>
   );
 }

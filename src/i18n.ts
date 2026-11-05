@@ -301,6 +301,21 @@ export const TEXT = {
       haloScreenCalSummaryPrefix: "已校准",
       haloScreenCalSummarySuffix: "块屏幕",
       haloScreenCalCapturedAt: "采集时间",
+      haloScreenWarp: "转头切屏",
+      haloScreenWarpHint: "需先完成多屏区域校准，当前不会生效。",
+      haloRegionSettle: "转头判定时长",
+      haloRegionSettleHelp:
+        "新的屏幕区域需持续注视多久才切换（毫秒）。范围 150–800，默认 300。",
+      haloRegionMargin: "区域容差",
+      haloRegionMarginHelp:
+        "姿态落在区域外时的扩容系数。范围 1.0–1.5，默认 1.15。",
+      haloTransAlpha: "平移补偿系数",
+      haloTransAlphaHelp:
+        "修正身体前后左右平移造成的角度偏移（度/单位）。范围 0–120，默认 60；同时作用于水平与垂直。",
+      haloLiveActiveScreen: "当前屏幕",
+      haloLiveScreenSwitched: "切屏事件",
+      haloScreenSwitchedNow: "刚切换",
+      haloScreenSwitchedNone: "无",
     },
     layout: {
       eyebrow: "Device layout",
@@ -685,6 +700,21 @@ export const TEXT = {
       haloScreenCalSummaryPrefix: "Calibrated",
       haloScreenCalSummarySuffix: "screens",
       haloScreenCalCapturedAt: "captured",
+      haloScreenWarp: "Head screen switch",
+      haloScreenWarpHint: "Finish the multi-screen calibration first; it has no effect yet.",
+      haloRegionSettle: "Switch settle time",
+      haloRegionSettleHelp:
+        "How long a new screen region must be looked at before switching (ms). Range 150–800, default 300.",
+      haloRegionMargin: "Region margin",
+      haloRegionMarginHelp:
+        "Tolerance growth when the pose misses every region. Range 1.0–1.5, default 1.15.",
+      haloTransAlpha: "Seat-shift compensation",
+      haloTransAlphaHelp:
+        "Corrects angular drift from leaning (deg per normalized unit). Range 0–120, default 60; applies to both axes.",
+      haloLiveActiveScreen: "Active screen",
+      haloLiveScreenSwitched: "Screen switch",
+      haloScreenSwitchedNow: "just switched",
+      haloScreenSwitchedNone: "none",
     },
     layout: {
       eyebrow: "Device layout",

@@ -1846,6 +1846,11 @@ fn save_layout(
             );
         }
     } else if let Ok(mut halo) = state.halo.lock() {
+        // S3: the saved layout can also change this machine's screen list,
+        // so the engine's region-switch targets follow the saved topology
+        // in both branches (the multi-screen calibration itself rides
+        // inside SetSettings).
+        halo.set_screens(halo_screen_entries(&saved_layout));
         if halo.is_running() {
             // Parameters take effect immediately on save while tracking runs.
             halo.set_settings(saved_layout.focus_halo.clone());
@@ -2013,6 +2018,18 @@ fn halo_focus_screens(layout: &LayoutState) -> Vec<halo::FocusScreen> {
         .collect()
 }
 
+/// All of this machine's screens as engine `ScreenEntry`s (S3): the same
+/// enumeration as [`halo_focus_screens`], minus the P4 `FocusScreen` wrapper.
+fn halo_screen_entries(layout: &LayoutState) -> Vec<halo::ScreenEntry> {
+    halo_focus_screens(layout)
+        .into_iter()
+        .map(|screen| halo::ScreenEntry {
+            screen_id: screen.id,
+            geometry: screen.geometry,
+        })
+        .collect()
+}
+
 /// P4 receive hook (installed at transport startup): apply one authorized
 /// remote halo focus event to this machine's passive display. Lock order
 /// follows the repo contract: the layout lock is taken alone for the screen
@@ -2095,10 +2112,20 @@ fn apply_halo_enabled(state: &AppRuntime, enabled: bool) -> Result<String, Strin
     }
     let settings = halo_settings_snapshot(state);
     let geometry = halo_tracking_geometry(state)?;
+    // S3: the engine's screen list follows the live topology (layout lock
+    // released before the halo lock is taken, per the lock-order contract).
+    let screen_entries = {
+        let layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        halo_screen_entries(&layout)
+    };
     let mut runtime = state
         .halo
         .lock()
         .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    runtime.set_screens(screen_entries);
     if enabled {
         let calibration = settings.effective_calibration();
         runtime.enable(settings, calibration, geometry)?;
@@ -2325,11 +2352,26 @@ fn halo_recenter(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
 /// recenter global hotkey. Never hold other locks across this call: it takes
 /// the layout lock (`update_layout_focus_halo`), sleeps in
 /// `sample_latest_pose`, and finally takes the halo lock.
+///
+/// With a multi-screen calibration present, the recenter also shifts every
+/// region quad so the current (seat-compensated) pose maps to the active
+/// screen's center; the single-screen profile recenter still applies on top
+/// as before, keeping both paths calibrated from one hotkey press.
 fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
-    let (yaw, pitch, _u, _v) = sample_latest_pose(state, true)?;
+    let (yaw, pitch, u, v) = sample_latest_pose(state, true)?;
     let pose = (yaw, pitch);
     let mut calibration = None;
+    let mut screen_calibration = None;
     update_layout_focus_halo(state, |focus_halo| {
+        // S3: shift the region quads first so the pose lands on the active
+        // region's centroid (a first-order (0.5, 0.5) alignment; see
+        // `recenter_screen_calibration`).
+        if let Some(cal) = focus_halo.screen_calibration.clone() {
+            let compensated = halo::screen_map::compensate(pose, (u, v), &cal);
+            let shifted = halo::screen_map::recenter_screen_calibration(&cal, compensated);
+            focus_halo.screen_calibration = Some(shifted.clone());
+            screen_calibration = Some(shifted);
+        }
         let shifted = halo::mapping::recenter_calibration(
             &focus_halo.calibration.clone().unwrap_or_default(),
             pose,
@@ -2345,6 +2387,11 @@ fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
         .map_err(|_| "halo runtime lock poisoned".to_string())?;
     if runtime.is_running() {
         runtime.set_calibration(calibration);
+        // Forward the shifted multi-screen calibration too; a running engine
+        // picks it up next tick (no-op when there is none).
+        if let Some(screen_cal) = screen_calibration {
+            runtime.set_screen_calibration(Some(screen_cal));
+        }
     }
     Ok(())
 }
@@ -3122,7 +3169,18 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
                     if !runtime.is_running() {
                         break;
                     }
-                    runtime.drain_debug().pop()
+                    // The engine flags `screen_switched` on exactly one tick
+                    // (60 Hz), but this pump wakes at 5 Hz and keeps only
+                    // the newest snapshot — a raw `.pop()` would usually
+                    // miss the commit. Latch it from the whole drained
+                    // window so the debug stream always shows the switch.
+                    let drained = runtime.drain_debug();
+                    let screen_switched = drained.iter().any(|snapshot| snapshot.screen_switched);
+                    let mut newest = drained.into_iter().last();
+                    if let Some(snapshot) = newest.as_mut() {
+                        snapshot.screen_switched = screen_switched;
+                    }
+                    newest
                 };
                 if let Some(snapshot) = snapshot {
                     halo_focus_pump_tick(
@@ -3153,6 +3211,26 @@ fn halo_focus_event_kind(event: &halo::HaloFocusEvent) -> &'static str {
     }
 }
 
+/// Which local screen's board rect the engine's norm coordinates are
+/// relative to: the active region's screen when the S3 snapshot carries one
+/// (matched by id), falling back to the primary screen (then the first) for
+/// the single-screen path and stale ids. Pure so the pump resolution is
+/// testable without a live runtime.
+fn pump_local_screen<'a>(
+    screens: &'a [Screen],
+    active_screen_id: Option<&str>,
+) -> Option<&'a Screen> {
+    if let Some(id) = active_screen_id {
+        if let Some(screen) = screens.iter().find(|screen| screen.id == id) {
+            return Some(screen);
+        }
+    }
+    screens
+        .iter()
+        .find(|screen| screen.is_primary)
+        .or_else(|| screens.first())
+}
+
 /// P4 send side, driven from the debug pump (5 Hz): route one engine
 /// snapshot through the focus router + throttle and, when a state change
 /// survives, emit the halo focus packet to the aimed peer over the QUIC
@@ -3172,13 +3250,13 @@ fn halo_focus_pump_tick(
     let Some(local) = layout.devices.iter().find(|device| device.role == "local") else {
         return;
     };
-    // The engine tracks the local primary screen (halo_tracking_geometry);
-    // its board rect is what the norm coordinates are relative to.
-    let Some(local_screen) = local
-        .screens
-        .iter()
-        .find(|screen| screen.is_primary)
-        .or_else(|| local.screens.first())
+    // Coordinate semantics: `snapshot.norm` is relative to the engine's
+    // tracked screen. In S3 region mode that is the committed region's
+    // screen (`active_screen_id`); in single-screen mode (and whenever the
+    // id no longer resolves — e.g. right after a topology change) it is the
+    // local primary screen, exactly what `halo_tracking_geometry` picks.
+    let Some(local_screen) =
+        pump_local_screen(&local.screens, snapshot.active_screen_id.as_deref())
     else {
         return;
     };
@@ -6647,6 +6725,12 @@ fn refresh_local_screens(app: &AppHandle) {
                 local.screens.len(),
                 desc.join(", ")
             );
+        }
+        // S3: push the fresh screen list to a running halo engine so region
+        // switching and cursor warping follow the new topology (a no-op when
+        // tracking is disabled — the list is stored for the next enable).
+        if let Ok(mut halo) = state.halo.lock() {
+            halo.set_screens(halo_screen_entries(&snapshot));
         }
         // Capture also caches native cursor geometry. Rebuild it on a real
         // display change; the live QUIC receiver reads the same native layout.
@@ -16938,6 +17022,72 @@ mod tests {
             scale: 1.0,
             is_primary: x == 0 && y == 0,
         }
+    }
+
+    // ---- S3: pump active-screen resolution + engine screen entries ----
+
+    #[test]
+    fn pump_local_screen_prefers_the_active_id_then_primary_then_first() {
+        let screens = vec![wizard_screen("left", 0, 0), wizard_screen("right", 1920, 0)];
+        // S3 region mode: the snapshot's active screen wins.
+        assert_eq!(
+            pump_local_screen(&screens, Some("right")).map(|s| s.id.as_str()),
+            Some("right")
+        );
+        // Single-screen mode (None): the primary screen.
+        assert_eq!(
+            pump_local_screen(&screens, None).map(|s| s.id.as_str()),
+            Some("left")
+        );
+        // Stale id (topology changed between commit and pump): the primary
+        // fallback keeps the pre-S3 semantics.
+        assert_eq!(
+            pump_local_screen(&screens, Some("gone")).map(|s| s.id.as_str()),
+            Some("left")
+        );
+        // No primary marking and no id: first screen.
+        let mut screens = screens;
+        for screen in screens.iter_mut() {
+            screen.is_primary = false;
+        }
+        assert_eq!(
+            pump_local_screen(&screens, None).map(|s| s.id.as_str()),
+            Some("left")
+        );
+        assert_eq!(pump_local_screen(&[], None), None);
+    }
+
+    #[test]
+    fn halo_screen_entries_mirror_the_layout_screen_list() {
+        let mut layout = test_layout();
+        layout.devices = vec![Device {
+            id: "local-device".into(),
+            name: "local".into(),
+            platform: "macos".into(),
+            host: String::new(),
+            transport_port: 0,
+            quic_port: 0,
+            transport_public_key: String::new(),
+            protocol_version: 0,
+            color: "#000".into(),
+            online: false,
+            input_ready: false,
+            upgrading: false,
+            upgrading_until_ms: 0,
+            role: "local".into(),
+            source: "detected".into(),
+            screens: vec![wizard_screen("left", 0, 0), wizard_screen("right", 1920, 0)],
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
+        }];
+        let entries = halo_screen_entries(&layout);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].screen_id, "left");
+        assert_eq!(entries[0].geometry.x, 0.0);
+        assert_eq!(entries[1].screen_id, "right");
+        assert_eq!(entries[1].geometry.x, 1920.0);
+        // Native origins are the identity on non-Windows (macOS points).
+        assert_eq!(entries[1].geometry.native_x, 1920.0);
     }
 
     fn pose(yaw: f64, pitch: f64) -> halo::screen_map::PosePoint {
