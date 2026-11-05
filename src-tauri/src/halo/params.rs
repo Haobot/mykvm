@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::halo::mapping::CalibrationProfile;
+use crate::halo::screen_map;
 
 const DWELL_MS: (u32, u32) = (600, 2000);
 const SETTLE_MS: (u32, u32) = (80, 400);
@@ -16,6 +17,15 @@ const GAIN: (f64, f64) = (0.5, 2.0);
 const HALO_DIAMETER: (f64, f64) = (140.0, 180.0);
 const HALO_OPACITY: (f64, f64) = (0.35, 0.9);
 const SMOOTH_MS: (u32, u32) = (80, 400);
+/// Hysteresis window for the turn-head region switch: too small chatters on
+/// borderline poses, too large feels laggy.
+const REGION_SETTLE_MS: (u32, u32) = (150, 800);
+/// Dilatation factor applied around a region's centroid when the pose misses
+/// every region exactly (1.0 = no tolerance growth).
+const REGION_MARGIN: (f64, f64) = (1.0, 1.5);
+/// Seat-translation compensation, deg per normalized unit of face-center
+/// shift; 0 disables, ~120 is already an extreme wide FOV.
+const TRANS_ALPHA: (f64, f64) = (0.0, 120.0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -98,6 +108,30 @@ pub struct FocusHaloSettings {
     /// does not track the user's personal ranges).
     #[serde(default)]
     pub calibration: Option<CalibrationProfile>,
+    /// Turn-head-to-switch-screen master switch ("转头切屏"). Stored from S1
+    /// on so the settings schema is stable; the engine consumes it in S2.
+    #[serde(default)]
+    pub screen_warp_enabled: bool,
+    /// How long a new region attribution must persist before it commits
+    /// (hysteresis against borderline poses), in ms.
+    #[serde(default = "d_region_settle_ms")]
+    pub region_settle_ms: u32,
+    /// Dilatation factor applied around a region's centroid when the pose
+    /// misses every region exactly (1.0 = no tolerance growth).
+    #[serde(default = "d_region_margin")]
+    pub region_margin: f64,
+    /// Seat-translation compensation coefficients (deg per normalized unit of
+    /// face-center shift). Fitted by the optional lean-capture step; the
+    /// default is the geometric prior for a typical webcam FOV.
+    #[serde(default = "d_trans_alpha_yaw")]
+    pub trans_alpha_yaw: f64,
+    #[serde(default = "d_trans_alpha_pitch")]
+    pub trans_alpha_pitch: f64,
+    /// Per-screen pose quads captured by the settings UI; `None` until the
+    /// first multi-screen calibration completes. Passed through sanitization
+    /// untouched (same reasoning as `calibration`).
+    #[serde(default)]
+    pub screen_calibration: Option<screen_map::ScreenCalibration>,
 }
 
 fn d_enabled() -> bool {
@@ -148,6 +182,18 @@ fn d_undo_hotkey() -> String {
 fn d_recenter_hotkey() -> String {
     "disabled".into()
 }
+fn d_region_settle_ms() -> u32 {
+    300
+}
+fn d_region_margin() -> f64 {
+    1.15
+}
+fn d_trans_alpha_yaw() -> f64 {
+    60.0
+}
+fn d_trans_alpha_pitch() -> f64 {
+    60.0
+}
 
 impl Default for FocusHaloSettings {
     fn default() -> Self {
@@ -174,6 +220,12 @@ impl Default for FocusHaloSettings {
             undo_hotkey: d_undo_hotkey(),
             recenter_hotkey: d_recenter_hotkey(),
             calibration: None,
+            screen_warp_enabled: false,
+            region_settle_ms: d_region_settle_ms(),
+            region_margin: d_region_margin(),
+            trans_alpha_yaw: d_trans_alpha_yaw(),
+            trans_alpha_pitch: d_trans_alpha_pitch(),
+            screen_calibration: None,
         }
     }
 }
@@ -211,6 +263,16 @@ impl FocusHaloSettings {
             // capture flow, which validates monotonicity on finish; there is
             // nothing sane to clamp them against here, so pass through.
             calibration: self.calibration,
+            screen_warp_enabled: self.screen_warp_enabled,
+            region_settle_ms: self
+                .region_settle_ms
+                .clamp(REGION_SETTLE_MS.0, REGION_SETTLE_MS.1),
+            region_margin: self.region_margin.clamp(REGION_MARGIN.0, REGION_MARGIN.1),
+            trans_alpha_yaw: self.trans_alpha_yaw.clamp(TRANS_ALPHA.0, TRANS_ALPHA.1),
+            trans_alpha_pitch: self.trans_alpha_pitch.clamp(TRANS_ALPHA.0, TRANS_ALPHA.1),
+            // Same reasoning as `calibration`: captured pose quads are
+            // validated at capture time and have no sane clamp here.
+            screen_calibration: self.screen_calibration.clone(),
         }
     }
 
@@ -248,6 +310,12 @@ mod tests {
         assert_eq!(s.undo_hotkey, "disabled");
         assert_eq!(s.recenter_hotkey, "disabled");
         assert_eq!(s.calibration, None);
+        assert!(!s.screen_warp_enabled);
+        assert_eq!(s.region_settle_ms, 300);
+        assert_eq!(s.region_margin, 1.15);
+        assert_eq!(s.trans_alpha_yaw, 60.0);
+        assert_eq!(s.trans_alpha_pitch, 60.0);
+        assert_eq!(s.screen_calibration, None);
         assert_eq!(
             s.effective_calibration(),
             CalibrationProfile::default(),
@@ -267,6 +335,10 @@ mod tests {
             gain: 10.0,
             halo_diameter: 500.0,
             halo_opacity: 2.0,
+            region_settle_ms: 0,
+            region_margin: 9.9,
+            trans_alpha_yaw: -5.0,
+            trans_alpha_pitch: 999.0,
             ..FocusHaloSettings::default()
         };
         let s = s.sanitized();
@@ -279,6 +351,10 @@ mod tests {
         assert_eq!(s.gain, 2.0);
         assert_eq!(s.halo_diameter, 180.0);
         assert_eq!(s.halo_opacity, 0.9);
+        assert_eq!(s.region_settle_ms, 150);
+        assert_eq!(s.region_margin, 1.5);
+        assert_eq!(s.trans_alpha_yaw, 0.0);
+        assert_eq!(s.trans_alpha_pitch, 120.0);
     }
 
     #[test]
@@ -330,6 +406,12 @@ mod tests {
             "undoHotkey",
             "recenterHotkey",
             "calibration",
+            "screenWarpEnabled",
+            "regionSettleMs",
+            "regionMargin",
+            "transAlphaYaw",
+            "transAlphaPitch",
+            "screenCalibration",
         ] {
             assert!(
                 json.contains(&format!("\"{key}\"")),
@@ -373,5 +455,71 @@ mod tests {
         // through unchanged.
         assert_eq!(s.sanitized().calibration, Some(cal));
         assert_eq!(s.effective_calibration(), cal);
+    }
+
+    #[test]
+    fn screen_calibration_field_round_trips_and_survives_sanitize() {
+        use crate::halo::screen_map::{BoardRect, PosePoint, ScreenRegion};
+
+        let cal = screen_map::ScreenCalibration {
+            captured_at_ms: 1_700_000_000_000,
+            regions: vec![ScreenRegion {
+                screen_id: "hdmi-1".into(),
+                board: BoardRect {
+                    screen_id: "hdmi-1".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                tl: PosePoint {
+                    yaw: -12.0,
+                    pitch: 9.0,
+                    u: 0.3,
+                    v: 0.2,
+                },
+                tr: PosePoint {
+                    yaw: 13.0,
+                    pitch: 8.0,
+                    u: 0.7,
+                    v: 0.2,
+                },
+                br: PosePoint {
+                    yaw: 11.0,
+                    pitch: -7.0,
+                    u: 0.7,
+                    v: 0.8,
+                },
+                bl: PosePoint {
+                    yaw: -10.0,
+                    pitch: -6.0,
+                    u: 0.3,
+                    v: 0.8,
+                },
+            }],
+            ref_u: 0.5,
+            ref_v: 0.5,
+            trans_alpha_yaw: 88.0,
+            trans_alpha_pitch: 72.0,
+            ..screen_map::ScreenCalibration::default()
+        };
+        let s = FocusHaloSettings {
+            screen_calibration: Some(cal.clone()),
+            ..FocusHaloSettings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains("\"screenCalibration\""),
+            "settings must serialize the calibration payload: {json}"
+        );
+        assert!(
+            json.contains("\"transAlphaYaw\":88.0"),
+            "nested calibration must serialize camelCase: {json}"
+        );
+        let back: FocusHaloSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.screen_calibration, Some(cal.clone()));
+        // sanitize() is applied on every save_layout; the payload passes
+        // through unchanged (validated at capture time, nothing to clamp).
+        assert_eq!(s.sanitized().screen_calibration, Some(cal));
     }
 }
