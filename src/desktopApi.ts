@@ -525,6 +525,10 @@ export interface HaloScreenCalPlanItem {
   y: number
   width: number
   height: number
+  /** S4: the screen lives on an online peer device (no local badge). */
+  remote: boolean
+  /** S4: owning device's display name ("Mac mini"), empty for local. */
+  deviceName: string
 }
 
 /** Mirrors the Rust `HaloScreenCalProgress` (serde camelCase). */
@@ -609,6 +613,25 @@ export async function haloScreenCalCancel(): Promise<void> {
   }
 
   await invoke('halo_screen_cal_cancel')
+}
+
+/** Mirrors the Rust `HaloLeanStatus` (serde camelCase, internally tagged). */
+export type HaloLeanStatus =
+  | { stage: 'reference'; refU: number; refV: number }
+  | { stage: 'fitted'; transAlphaYaw: number; transAlphaPitch: number }
+
+/**
+ * S4 lean capture (two-step protocol): the first call records the reference
+ * pose, the second call (after the user physically shifts seat) fits the
+ * translation-compensation coefficients, persists them and pushes them to a
+ * running engine.
+ */
+export async function haloScreenCalLean(): Promise<HaloLeanStatus> {
+  if (!isTauri()) {
+    throw new Error('Available only in the Tauri desktop runtime.')
+  }
+
+  return invoke<HaloLeanStatus>('halo_screen_cal_lean')
 }
 
 /**

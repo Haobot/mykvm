@@ -44,6 +44,7 @@ import {
   haloScreenCalCancel,
   haloScreenCalCapture,
   haloScreenCalFinish,
+  haloScreenCalLean,
   haloScreenCalSetStep,
   haloSetEnabled,
   haloTestOverlay,
@@ -418,6 +419,13 @@ function App() {
   const [screenCalBusy, setScreenCalBusy] = useState(false);
   const [screenCalError, setScreenCalError] = useState<string | null>(null);
   const [screenCalDone, setScreenCalDone] = useState<HaloScreenCalSummary | null>(null);
+  const [leanStage, setLeanStage] = useState<"idle" | "reference">("idle");
+  const [leanBusy, setLeanBusy] = useState(false);
+  const [leanError, setLeanError] = useState<string | null>(null);
+  const [leanFitted, setLeanFitted] = useState<{
+    yaw: number;
+    pitch: number;
+  } | null>(null);
   // FocusHalo P3: which halo hotkey recorder is capturing a combo (same
   // recorder protocol as the edge-switch/screen-switch buttons).
   const [capturingHaloHotkey, setCapturingHaloHotkey] = useState<
@@ -2900,6 +2908,49 @@ function App() {
     setScreenCalProgress({ acceptedScreens: 0, totalScreens: 0, cornersDone: 0 });
   }
 
+  /** S4: the wizard reset also drops the backend lean state; mirror it. */
+  function resetLeanCapture() {
+    setLeanStage("idle");
+    setLeanError(null);
+  }
+
+  /**
+   * S4 lean capture: one button per protocol step. The backend owns the
+   * two-step state (and its 30 s window); this only mirrors the stage for
+   * the button labels and hint text.
+   */
+  async function runLeanCapture(step: "reference" | "fit") {
+    if (leanBusy) {
+      return;
+    }
+    if (step === "fit" && leanStage !== "reference") {
+      return;
+    }
+    setLeanBusy(true);
+    setLeanError(null);
+    try {
+      const status = await haloScreenCalLean();
+      if (status.stage === "reference") {
+        setLeanStage("reference");
+      } else {
+        setLeanStage("idle");
+        setLeanFitted({
+          yaw: status.transAlphaYaw,
+          pitch: status.transAlphaPitch,
+        });
+      }
+    } catch (error) {
+      setLeanError(haloErrorMessage(error));
+      // A timed-out capture clears the backend state: mirror it so the
+      // buttons go back to step 1.
+      if (haloErrorMessage(error).includes("30")) {
+        setLeanStage("idle");
+      }
+    } finally {
+      setLeanBusy(false);
+    }
+  }
+
   async function beginScreenCal() {
     if (screenCalBusy) {
       return;
@@ -2934,6 +2985,7 @@ function App() {
     try {
       await haloScreenCalCancel();
       resetScreenCalProgress();
+      resetLeanCapture();
     } catch (error) {
       setScreenCalError(haloErrorMessage(error));
     } finally {
@@ -2986,6 +3038,7 @@ function App() {
       const summary = await haloScreenCalFinish();
       setScreenCalDone(summary);
       resetScreenCalProgress();
+      resetLeanCapture();
       // Same reason as the 5-point flow: the layout on disk now carries the
       // new screen_calibration; refresh before any other save round-trips a
       // stale snapshot over it.
@@ -4366,6 +4419,65 @@ function App() {
                     </div>
                   </div>
                 </details>
+                {haloSettings.screenCalibration &&
+                haloSettings.screenCalibration.regions.length > 0 ? (
+                  <div
+                    className="surface-card"
+                    style={{ marginTop: 12, padding: 12 }}
+                  >
+                    <p className="muted-copy">{ui.settings.haloLeanTitle}</p>
+                    <p className="muted-copy">{ui.settings.haloLeanCopy}</p>
+                    {leanStage === "reference" ? (
+                      <p
+                        className="muted-copy diagnostic-message"
+                        style={{ color: "#e0a03c" }}
+                      >
+                        {ui.settings.haloLeanStepHint}
+                      </p>
+                    ) : null}
+                    {leanFitted ? (
+                      <p
+                        className="muted-copy diagnostic-message"
+                        style={{ color: "#34c759" }}
+                      >
+                        {ui.settings.haloLeanFittedPrefix}:{" "}
+                        {leanFitted.yaw.toFixed(1)}° /{" "}
+                        {leanFitted.pitch.toFixed(1)}°
+                      </p>
+                    ) : null}
+                    {leanError ? (
+                      <p
+                        className="muted-copy diagnostic-message"
+                        role="alert"
+                      >
+                        {leanError}
+                      </p>
+                    ) : null}
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        disabled={leanBusy || !isTauri() || !(haloStatus?.running ?? false)}
+                        onClick={() => void runLeanCapture("reference")}
+                      >
+                        {ui.settings.haloLeanStep1}
+                      </button>
+                      <button
+                        type="button"
+                        className="primary-button compact-button"
+                        disabled={
+                          leanBusy ||
+                          leanStage !== "reference" ||
+                          !isTauri() ||
+                          !(haloStatus?.running ?? false)
+                        }
+                        onClick={() => void runLeanCapture("fit")}
+                      >
+                        {ui.settings.haloLeanStep2}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
                 <HaloNumberField
                   label={ui.settings.haloDwell}
                   help={ui.settings.haloDwellHelp}

@@ -3295,6 +3295,88 @@ fn halo_screen_cal_cancel(state: tauri::State<'_, AppRuntime>) -> Result<(), Str
     Ok(())
 }
 
+/// S4 坐姿微移补偿拟合：两步采集协议。第一次调用在当前坐姿记录参考点（平滑
+/// yaw/pitch/u/v，要求人脸在场）；用户实际平移身体后第二次调用采样并拟合
+/// `αu = −Δyaw/Δu`、`αv = Δpitch/Δv`（与 `screen_map::compensate` 的补偿
+/// 公式符号一致）。平移幅度不足或拟合值超出 0..120 报中文错误并不落盘；
+/// 成功则写回已保存 `screen_calibration.trans_alpha_*` 并推送到运行中的
+/// 引擎。两次调用间隔超过 30 秒作废重来。
+#[tauri::command]
+fn halo_screen_cal_lean(state: tauri::State<'_, AppRuntime>) -> Result<HaloLeanStatus, String> {
+    halo_screen_cal_lean_impl(state.inner())
+}
+
+/// Shared lean-capture body. Order mirrors the corner-capture flow: smoothed
+/// pose sample (halo lock + sleeps, outside every other lock) -> stored-pitch
+/// flip (layout lock alone) -> wizard bookkeeping -> persist (layout lock
+/// alone) -> engine push (halo lock alone).
+fn halo_screen_cal_lean_impl(state: &AppRuntime) -> Result<HaloLeanStatus, String> {
+    // A calibration must already exist: the alphas refine it in place.
+    if halo_settings_snapshot(state).screen_calibration.is_none() {
+        return Err("请先完成多屏校准，再进行坐姿微移采样".to_string());
+    }
+    let (yaw, raw_pitch, u, v) = sample_latest_pose(state, true)?;
+    let flip_pitch = {
+        let focus_halo = halo_settings_snapshot(state);
+        (focus_halo.camera_position == halo::params::CameraPosition::Bottom)
+            != focus_halo.invert_pitch
+    };
+    let sample = (yaw, screen_cal_flip_pitch(raw_pitch, flip_pitch), u, v);
+
+    let mut wizard = state
+        .halo_screen_cal
+        .lock()
+        .map_err(|_| "halo screen calibration lock poisoned".to_string())?;
+    let now = now_ms();
+    match wizard.lean {
+        None => {
+            // Step 1: record the reference point.
+            wizard.lean = Some(LeanCaptureState {
+                started_at_ms: now,
+                reference: sample,
+            });
+            Ok(HaloLeanStatus::Reference { ref_u: u, ref_v: v })
+        }
+        Some(lean) => {
+            if lean_capture_expired(lean.started_at_ms, now) {
+                // Expired: discard and start over (the caller re-presses
+                // step 1; nothing was persisted).
+                wizard.lean = None;
+                return Err("距上次参考采样已超过 30 秒，请重新点击第一步".to_string());
+            }
+            let (alpha_u, alpha_v) = fit_lean_alphas(lean.reference, sample).map_err(|error| {
+                // A rejected fit keeps the reference so the user can shift
+                // more and press step 2 again (within the same 30 s window).
+                match error {
+                    LeanFitError::TooSmallMove => {
+                        "平移幅度太小，请实际向左或向右平移身体约 15cm 后再点第二步".to_string()
+                    }
+                    LeanFitError::OutOfRange => {
+                        "拟合出的补偿系数超出合理范围，请保持看同一位置重新采样".to_string()
+                    }
+                }
+            })?;
+            // Success: consume the state, persist, then push to the engine.
+            wizard.lean = None;
+            drop(wizard);
+            update_layout_focus_halo(state, |focus_halo| {
+                apply_lean_alphas(focus_halo, alpha_u, alpha_v)
+            })?;
+            if let Ok(mut runtime) = state.halo.lock() {
+                let updated = halo_settings_snapshot(state).screen_calibration;
+                runtime.set_screen_calibration(updated);
+            }
+            log::info!(
+                "halo: lean capture fitted trans_alpha_yaw={alpha_u:.2} trans_alpha_pitch={alpha_v:.2}; persisted and pushed"
+            );
+            Ok(HaloLeanStatus::Fitted {
+                trans_alpha_yaw: alpha_u,
+                trans_alpha_pitch: alpha_v,
+            })
+        }
+    }
+}
+
 /// Shared cancel body (cancel command, app exit, tracking disable): hide the
 /// badge windows and clear the wizard state. Never fails: a poisoned lock
 /// only means the badges may linger, which the next begin/reset fixes.
@@ -6435,7 +6517,8 @@ pub fn run() {
             halo_screen_cal_set_step,
             halo_screen_cal_capture,
             halo_screen_cal_finish,
-            halo_screen_cal_cancel
+            halo_screen_cal_cancel,
+            halo_screen_cal_lean
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -17963,4 +18046,130 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // S4 tests: lean capture (坐姿微移补偿拟合)
+    // ------------------------------------------------------------------
+
+    /// Synthetic "watch a fixed point, translate" generator: with true
+    /// coefficients (αu, αv), a seat shift (Δu, Δv) makes the observer read
+    /// `Δyaw = −αu·Δu`, `Δpitch = +αv·Δv` (the exact relation
+    /// `screen_map::compensate` inverts).
+    fn lean_sample(
+        reference: (f64, f64, f64, f64),
+        alpha_u: f64,
+        alpha_v: f64,
+        delta_u: f64,
+        delta_v: f64,
+    ) -> (f64, f64, f64, f64) {
+        (
+            reference.0 - alpha_u * delta_u,
+            reference.1 + alpha_v * delta_v,
+            reference.2 + delta_u,
+            reference.3 + delta_v,
+        )
+    }
+
+    #[test]
+    fn lean_fit_recovers_known_alphas_from_synthetic_translation() {
+        let reference = (5.0, -2.0, 0.5, 0.5);
+        // ~15 cm sideways + a bit of vertical: both deltas clear the 0.01
+        // gate, and the recovered coefficients match the simulated ones.
+        let sample = lean_sample(reference, 90.0, 45.0, 0.1, 0.05);
+        let (alpha_u, alpha_v) = fit_lean_alphas(reference, sample).expect("fit succeeds");
+        assert!((alpha_u - 90.0).abs() < 1e-9, "alpha_u = {alpha_u}");
+        assert!((alpha_v - 45.0).abs() < 1e-9, "alpha_v = {alpha_v}");
+        // Round-trip against the runtime compensation formula: compensating
+        // the shifted sample must restore the reference gaze exactly.
+        let cal = halo::screen_map::ScreenCalibration {
+            ref_u: reference.2,
+            ref_v: reference.3,
+            trans_alpha_yaw: alpha_u,
+            trans_alpha_pitch: alpha_v,
+            ..halo::screen_map::ScreenCalibration::default()
+        };
+        let compensated =
+            halo::screen_map::compensate((sample.0, sample.1), (sample.2, sample.3), &cal);
+        assert!(
+            (compensated.0 - reference.0).abs() < 1e-9
+                && (compensated.1 - reference.1).abs() < 1e-9,
+            "compensated {compensated:?} must equal the reference gaze"
+        );
+        // The opposite shift (left and down) recovers the same alphas: the
+        // signs of Δu/Δv cancel by construction.
+        let sample = lean_sample(reference, 90.0, 45.0, -0.1, -0.05);
+        let (alpha_u, alpha_v) = fit_lean_alphas(reference, sample).expect("reverse fit");
+        assert!((alpha_u - 90.0).abs() < 1e-9 && (alpha_v - 45.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lean_fit_rejects_small_moves_without_persisting() {
+        let reference = (5.0, -2.0, 0.5, 0.5);
+        // u barely moved (below 0.01): rejected even though v moved plenty.
+        let sample = lean_sample(reference, 90.0, 45.0, 0.005, 0.1);
+        assert_eq!(
+            fit_lean_alphas(reference, sample),
+            Err(LeanFitError::TooSmallMove)
+        );
+        // v barely moved: same.
+        let sample = lean_sample(reference, 90.0, 45.0, 0.1, 0.009);
+        assert_eq!(
+            fit_lean_alphas(reference, sample),
+            Err(LeanFitError::TooSmallMove)
+        );
+        // Exactly at the gate counts as enough (>=).
+        let sample = lean_sample(reference, 90.0, 45.0, 0.01, 0.01);
+        assert!(fit_lean_alphas(reference, sample).is_ok());
+    }
+
+    #[test]
+    fn lean_fit_rejects_implausible_coefficients() {
+        let reference = (5.0, -2.0, 0.5, 0.5);
+        // 200 deg per unit u: outside the 0..120 window.
+        let sample = lean_sample(reference, 200.0, 45.0, 0.1, 0.1);
+        assert_eq!(
+            fit_lean_alphas(reference, sample),
+            Err(LeanFitError::OutOfRange)
+        );
+        // A negative coefficient means the sample pair disagrees with the
+        // physical direction convention: rejected too.
+        let sample = lean_sample(reference, -30.0, 45.0, 0.1, 0.1);
+        assert_eq!(
+            fit_lean_alphas(reference, sample),
+            Err(LeanFitError::OutOfRange)
+        );
+        // Exactly 120 is the exclusive upper bound: rejected.
+        let sample = lean_sample(reference, 120.0, 45.0, 0.1, 0.1);
+        assert_eq!(
+            fit_lean_alphas(reference, sample),
+            Err(LeanFitError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn lean_capture_window_expires_after_30s() {
+        assert!(!lean_capture_expired(1000, 1000 + LEAN_CAPTURE_TIMEOUT_MS));
+        assert!(
+            lean_capture_expired(1000, 1000 + LEAN_CAPTURE_TIMEOUT_MS + 1),
+            "one ms past the window expires the capture"
+        );
+        // Clock glitch backwards saturates to 0: fresh, not expired.
+        assert!(!lean_capture_expired(5000, 1000));
+    }
+
+    #[test]
+    fn apply_lean_alphas_writes_the_stored_calibration_or_fails() {
+        let mut settings = halo::FocusHaloSettings::default();
+        settings.screen_calibration = Some(topology_calibration(&["screen-0"], 0));
+        apply_lean_alphas(&mut settings, 88.0, 72.0).expect("persist succeeds");
+        let cal = settings.screen_calibration.expect("still present");
+        assert_eq!(cal.trans_alpha_yaw, 88.0);
+        assert_eq!(cal.trans_alpha_pitch, 72.0);
+        // No stored calibration: the mutate closure fails with the
+        // user-facing message and nothing changes.
+        let mut settings = halo::FocusHaloSettings::default();
+        let error =
+            apply_lean_alphas(&mut settings, 88.0, 72.0).expect_err("fails without a calibration");
+        assert!(error.contains("多屏校准"));
+        assert!(settings.screen_calibration.is_none());
+    }
 }
