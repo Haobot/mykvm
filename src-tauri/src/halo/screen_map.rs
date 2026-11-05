@@ -532,6 +532,58 @@ pub fn topology_matches(cal: &ScreenCalibration, current: &[BoardRect]) -> bool 
     true
 }
 
+/// S3 recenter for the multi-screen calibration: translate every region's
+/// pose quad by the same (yaw, pitch) offset so the given *compensated* pose
+/// coincides with the nearest region's centroid (the bilinear center). After
+/// the shift, looking at that screen's center region maps the pose to
+/// (0.5, 0.5), which is what the single-screen recenter achieves.
+///
+/// The centroid is a first-order approximation of the exact
+/// `bilinear_map((0.5, 0.5))` inverse: exact for parallelogram regions,
+/// close for the mildly skewed quads a real corner capture produces. Board
+/// rects and the u/v corner fields are display/layout data and are not
+/// touched; `ref_u`/`ref_v` describe the seat, not the pose plane, and stay
+/// put so the translation compensation keeps working.
+pub fn recenter_screen_calibration(cal: &ScreenCalibration, pose: (f64, f64)) -> ScreenCalibration {
+    if cal.regions.is_empty() {
+        return cal.clone();
+    }
+    // Anchor region: the one the pose is attributed to (with the runtime
+    // margin so a borderline pose still finds its screen); fall back to the
+    // nearest region boundary when the pose is outside every quad.
+    let anchor = region_at(pose, &cal.regions, 1.0).unwrap_or_else(|| {
+        cal.regions
+            .iter()
+            .enumerate()
+            .min_by(|a, b| {
+                dist_to_region(pose, &cal.regions[a.0])
+                    .total_cmp(&dist_to_region(pose, &cal.regions[b.0]))
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    });
+    let region = &cal.regions[anchor];
+    let centroid = (
+        (region.tl.yaw + region.tr.yaw + region.br.yaw + region.bl.yaw) / 4.0,
+        (region.tl.pitch + region.tr.pitch + region.br.pitch + region.bl.pitch) / 4.0,
+    );
+    let offset = (pose.0 - centroid.0, pose.1 - centroid.1);
+    let shift = |p: &PosePoint| PosePoint {
+        yaw: p.yaw + offset.0,
+        pitch: p.pitch + offset.1,
+        u: p.u,
+        v: p.v,
+    };
+    let mut shifted = cal.clone();
+    for region in &mut shifted.regions {
+        region.tl = shift(&region.tl);
+        region.tr = shift(&region.tr);
+        region.br = shift(&region.br);
+        region.bl = shift(&region.bl);
+    }
+    shifted
+}
+
 /// Which region to render for one tick of the region hysteresis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionDecision {
@@ -1387,5 +1439,69 @@ mod tests {
         }
         let back: ScreenCalibration = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cal);
+    }
+
+    // ------------------------------------------------------------------
+    // recenter_screen_calibration (S3)
+    // ------------------------------------------------------------------
+
+    fn two_region_calibration() -> ScreenCalibration {
+        ScreenCalibration {
+            regions: vec![rect_region("a", -10.0, -2.0), rect_region("b", 2.0, 10.0)],
+            ref_u: 0.5,
+            ref_v: 0.5,
+            trans_alpha_yaw: 0.0,
+            trans_alpha_pitch: 0.0,
+            ..ScreenCalibration::default()
+        }
+    }
+
+    #[test]
+    fn recenter_translates_all_regions_to_align_the_pose_with_the_centroid() {
+        let cal = two_region_calibration();
+        // Pose inside region b, 1 deg right of its centroid (yaw 6).
+        let pose = (7.0, 5.0);
+        let shifted = recenter_screen_calibration(&cal, pose);
+        // Every region moved by the same +1 yaw offset; pitch is untouched
+        // (the pose sits on region b's centroid height).
+        assert!((shifted.regions[1].tl.yaw - 3.0).abs() < 1e-12, "b tl");
+        assert!((shifted.regions[1].tr.yaw - 11.0).abs() < 1e-12, "b tr");
+        assert!(
+            (shifted.regions[0].tl.yaw + 9.0).abs() < 1e-12,
+            "a tl shifted too"
+        );
+        assert!(
+            (shifted.regions[0].tl.pitch - cal.regions[0].tl.pitch).abs() < 1e-12,
+            "pitch untouched"
+        );
+        // The pose now coincides with region b's centroid, so bilinear
+        // centered on it returns (0.5, 0.5) and region attribution lands on
+        // the same region.
+        let idx = region_at(pose, &shifted.regions, 1.15).expect("still inside");
+        assert_eq!(idx, 1);
+        let (s, t) = bilinear_map(pose, &shifted.regions[idx]);
+        assert!((s - 0.5).abs() < 1e-9 && (t - 0.5).abs() < 1e-9);
+        // Board rects and seat reference are display/seat data: untouched.
+        assert_eq!(shifted.regions[0].board, cal.regions[0].board);
+        assert_eq!((shifted.ref_u, shifted.ref_v), (cal.ref_u, cal.ref_v));
+    }
+
+    #[test]
+    fn recenter_outside_all_regions_anchors_on_the_nearest_boundary() {
+        let cal = two_region_calibration();
+        // Pose in the gap between the two regions: nearest boundary is
+        // region a's right edge (-2): distance 1 vs region b's left edge
+        // (2): distance 3.
+        let pose = (-1.0, 5.0);
+        let shifted = recenter_screen_calibration(&cal, pose);
+        // Offset = pose - centroid(a) = (-1 - (-6), 0) = (+5, 0).
+        assert!((shifted.regions[0].tl.yaw - (-5.0)).abs() < 1e-12);
+        assert!((shifted.regions[1].tl.yaw - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn recenter_empty_calibration_is_a_no_op() {
+        let cal = ScreenCalibration::default();
+        assert_eq!(recenter_screen_calibration(&cal, (1.0, 2.0)), cal);
     }
 }

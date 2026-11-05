@@ -12,16 +12,20 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::halo::activator::WindowActivator;
-use crate::halo::kalman::Kalman1D;
-use crate::halo::smoothing::{ServoAxis, ServoTuning};
 use crate::halo::input_probe::InputActivityProbe;
+use crate::halo::kalman::Kalman1D;
 use crate::halo::mapping::{map_pose, CalibrationProfile};
 use crate::halo::overlay::{
     BorderFrame, HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry,
 };
 use crate::halo::params::{CameraPosition, FocusHaloSettings};
+use crate::halo::screen_map::{
+    bilinear_map, compensate, region_at, RegionDecision, RegionSelector, ScreenCalibration,
+};
+use crate::halo::smoothing::{ServoAxis, ServoTuning};
 use crate::halo::state_machine::{advance, DwellConfig, DwellInput, DwellPhase, DwellState};
 use crate::halo::tracker::HeadSample;
+use crate::halo::warp::{self, CursorWarper};
 use crate::halo::windows_layer::WindowService;
 
 /// Suspend the halo after the face has been missing this long.
@@ -39,15 +43,36 @@ const MAX_DT: f64 = 1.0;
 pub(crate) const EMERGENCY_LOCK_MS: u64 = 5000;
 /// Undo-stack depth cap: the 8 most recent switches stay undoable.
 pub(crate) const UNDO_STACK_MAX: usize = 8;
+/// After a warp the engine masks probe input readings for this long: the OS
+/// pointer replay right after `CGWarpMouseCursorPosition` looks exactly like
+/// physical input and must not re-suspend the pipeline the engine itself
+/// just served. (See `step`: the mask only filters *new* probe readings, the
+/// existing `last_input_active_ms` timer semantics stay untouched.)
+pub(crate) const WARP_GUARD_MS: u64 = 300;
 
-/// One undoable switch: the foreground window the halo took the user away
-/// from, and when the switch fired. `previous_foreground_id` is `None` when
-/// the foreground window was not in the enumerable set (or there was none) —
-/// undoing such an entry is a no-op pop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One undoable switch. The two `previous_*` ids are independent: a dwell
+/// window switch fills only `previous_foreground_id`, a region (screen)
+/// switch fills only `previous_screen_id`, and a future switch that does
+/// both can fill both — undo applies whichever parts are present.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UndoEntry {
+    /// Foreground window the halo took the user away from. `None` when the
+    /// foreground window was not in the enumerable set (or there was none) —
+    /// undoing such an entry is a no-op pop.
     pub(crate) previous_foreground_id: Option<u64>,
+    /// Board screen the user was on before a region (screen) switch, by
+    /// screen id; `None` when the switch was not a screen switch (or there
+    /// was no active region yet, e.g. the very first acquisition).
+    pub(crate) previous_screen_id: Option<String>,
     pub(crate) switched_at_ms: u64,
+}
+
+/// One local screen the engine can switch to (S3 region switching): stable
+/// id plus its board-space geometry, mirroring the layout's local screens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScreenEntry {
+    pub screen_id: String,
+    pub geometry: OverlayScreenGeometry,
 }
 
 /// Whether the emergency lock is up at `now_ms`: `until` is the lock's
@@ -72,18 +97,28 @@ pub(crate) fn undo_push(stack: &mut Vec<UndoEntry>, entry: UndoEntry) {
 /// fresh. Returns the popped entry's `previous_foreground_id` (`Some(None)` =
 /// recorded switch whose undo is a no-op), or `None` when nothing was
 /// undoable (empty stack / every entry expired).
-pub(crate) fn undo_take(
+pub(crate) fn undo_take_entry(
     stack: &mut Vec<UndoEntry>,
     now_ms: u64,
     undo_ms: u64,
-) -> Option<Option<u64>> {
+) -> Option<UndoEntry> {
     while let Some(top) = stack.last() {
         if now_ms.saturating_sub(top.switched_at_ms) <= undo_ms {
             break;
         }
         stack.pop();
     }
-    stack.pop().map(|entry| entry.previous_foreground_id)
+    stack.pop()
+}
+
+/// Foreground-id-only view of [`undo_take_entry`] (the pre-S3 shape, kept so
+/// existing call sites and tests keep their semantics).
+pub(crate) fn undo_take(
+    stack: &mut Vec<UndoEntry>,
+    now_ms: u64,
+    undo_ms: u64,
+) -> Option<Option<u64>> {
+    undo_take_entry(stack, now_ms, undo_ms).map(|entry| entry.previous_foreground_id)
 }
 
 /// Coarse engine phase as consumed by the debug channel (P1-D). Both
@@ -102,7 +137,7 @@ pub enum EnginePhase {
 /// Per-tick telemetry snapshot consumed by the P1-D debug stream. Sent on a
 /// bounded channel; if the consumer stalls, snapshots are dropped, never
 /// back-pressured into the engine loop.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DebugSnapshot {
     pub ts_ms: u64,
@@ -127,6 +162,12 @@ pub struct DebugSnapshot {
     /// Border the overlay should show this tick (before deduplication);
     /// `Some` exactly while a candidate is being dwelled on.
     pub border: Option<BorderFrame>,
+    /// S3: screen id of the currently active pose region while the
+    /// multi-screen calibration drives the engine; `None` in single-screen
+    /// (map_pose) mode or before the first region commit.
+    pub active_screen_id: Option<String>,
+    /// S3: true exactly on the tick a region (screen) switch committed.
+    pub screen_switched: bool,
 }
 
 /// Engine wiring snapshot handed to [`spawn`]. Not `Clone`/`Debug` because it
@@ -143,6 +184,14 @@ pub struct EngineConfig {
     /// events and undo requests. Always present — even a placeholder
     /// activator keeps the engine logic uniform.
     pub activator: Box<dyn WindowActivator>,
+    /// S3: every local screen, so a region commit can switch the engine's
+    /// tracked screen and warp the pointer to the new screen's center.
+    pub screens: Vec<ScreenEntry>,
+    /// S3: multi-screen pose calibration; `None` (or a disabled
+    /// `screen_warp_enabled`) keeps the single-screen `map_pose` path.
+    pub screen_calibration: Option<ScreenCalibration>,
+    /// S3: cursor warp backend for region commits and screen undo.
+    pub warper: Box<dyn CursorWarper>,
 }
 
 /// Commands the engine thread accepts while running.
@@ -151,12 +200,17 @@ pub enum EngineCommand {
     /// Stop the thread (overlay hidden on exit).
     Shutdown,
     /// Replace the sanitized settings snapshot (dead zone / gain / camera
-    /// position / keyboard suspends take effect next tick).
+    /// position / keyboard suspends take effect next tick). The multi-screen
+    /// calibration travels inside the snapshot, so it updates here too.
     SetSettings(FocusHaloSettings),
     /// Replace the calibration profile.
     SetCalibration(CalibrationProfile),
     /// Screen moved/resized/scale changed.
     SetScreen(OverlayScreenGeometry),
+    /// S3: replace the whole local-screen list (display topology changed).
+    SetScreens(Vec<ScreenEntry>),
+    /// S3: replace the multi-screen calibration (recenter, re-calibration).
+    SetScreenCalibration(Option<ScreenCalibration>),
     /// Undo the most recent switch if it fired within `undo_ms` (P3-B undo
     /// hotkey lands here via HaloRuntime::undo_switch).
     UndoSwitch,
@@ -209,6 +263,27 @@ pub(crate) struct EngineState {
     pub(crate) undo_stack: Vec<UndoEntry>,
     /// Emergency-lock deadline in tick time; `None`/past deadline = unlocked.
     pub(crate) emergency_until: Option<u64>,
+    // ----- S3 region switching (turn-head screen switch) -----
+    /// Every local screen; a region commit switches `screen` to the
+    /// committed region's screen entry.
+    pub(crate) screens: Vec<ScreenEntry>,
+    /// Multi-screen pose calibration; `None` keeps the single-screen path.
+    pub(crate) screen_cal: Option<ScreenCalibration>,
+    /// Hysteresis gate between raw pose attribution and the committed region.
+    region_selector: RegionSelector,
+    /// Committed region index (`cal.regions` position), `None` until the
+    /// first commit and while the multi-screen path is inactive.
+    pub(crate) active_region: Option<usize>,
+    /// Tick time before which further warps are suppressed (switch cooldown).
+    warp_cooldown_until: Option<u64>,
+    /// Tick time before which probe input readings are masked (warp guard).
+    warp_guard_until: Option<u64>,
+    /// Latest face-center position (u, v) from the tracker; feeds the seat
+    /// translation compensation.
+    last_uv: (f64, f64),
+    /// Cursor warp backend (real platform calls in production, a recorder in
+    /// tests).
+    warper: Box<dyn CursorWarper>,
 }
 
 impl EngineState {
@@ -237,7 +312,26 @@ impl EngineState {
             activator: config.activator,
             undo_stack: Vec::new(),
             emergency_until: None,
+            screens: config.screens,
+            screen_cal: config.screen_calibration,
+            region_selector: RegionSelector::new(),
+            active_region: None,
+            warp_cooldown_until: None,
+            warp_guard_until: None,
+            last_uv: (0.5, 0.5),
+            warper: config.warper,
         }
+    }
+
+    /// Whether the S3 multi-screen region path drives this tick: it needs the
+    /// master switch on and at least one calibrated region. Everything else
+    /// (screens list, warper) is inert without it.
+    fn region_mode(&self) -> bool {
+        self.settings.screen_warp_enabled
+            && self
+                .screen_cal
+                .as_ref()
+                .is_some_and(|cal| !cal.regions.is_empty())
     }
 }
 
@@ -258,6 +352,22 @@ pub(crate) fn step(
     };
     state.last_tick_ms = Some(now_ms);
 
+    // S3 warp guard: while it is up, physical-input probe readings are
+    // masked so the pointer events the OS replays around our own warp
+    // cannot re-suspend the pipeline. The mask only filters *new* readings —
+    // `last_input_active_ms` (and the 1 s quiet window it drives) keeps its
+    // normal semantics, so a suspension that was already running when the
+    // warp fired still expires on schedule.
+    let warp_guard = state
+        .warp_guard_until
+        .is_some_and(|deadline| now_ms < deadline);
+    let input_active = input_active && !warp_guard;
+
+    // S3 region decision carried out of the sample branch: applied after the
+    // phase/emergency computation below, because the warp gates depend on
+    // both. `None` = this tick did not run the region path.
+    let mut region_decision: Option<RegionDecision> = None;
+
     if let Some(sample) = sample {
         // dt for the Kalman filters comes from sample timestamps (capture
         // rate, not tick rate); clamped so clock glitches cannot destabilize.
@@ -274,14 +384,60 @@ pub(crate) fn step(
             let (fp, _) = state.pitch_kalman.update(sample.pitch_deg, dt);
             state.raw = (sample.yaw_deg, sample.pitch_deg);
             state.filtered = (fy, fp);
-            state.norm = map_pose(
-                (fy, fp),
-                &state.calibration,
-                state.settings.dead_zone_percent,
-                state.settings.gain,
-                state.settings.camera_position == CameraPosition::Bottom,
-                state.settings.invert_pitch,
-            );
+            state.last_uv = (sample.u, sample.v);
+
+            if state.region_mode() {
+                // S3 multi-screen path: seat-compensated pose -> region
+                // attribution -> hysteresis -> bilinear in-screen position.
+                // Screen switching and warping happen after the phase is
+                // known (see `region_decision` above).
+                let decision = {
+                    let cal = state
+                        .screen_cal
+                        .as_ref()
+                        .expect("region_mode implies a calibration");
+                    let (cy, cp) = compensate((fy, fp), state.last_uv, cal);
+                    let target = region_at((cy, cp), &cal.regions, state.settings.region_margin);
+                    let decision = state.region_selector.observe(
+                        target,
+                        now_ms,
+                        state.settings.region_settle_ms as u64,
+                    );
+                    // Continuous in-screen follow on the held region; the
+                    // classic map_pose profile keeps driving the target
+                    // until the first commit (no region yet).
+                    if let Some(idx) = decision.region {
+                        let region = &cal.regions[idx];
+                        state.norm = bilinear_map((cy, cp), region);
+                    } else {
+                        state.norm = map_pose(
+                            (fy, fp),
+                            &state.calibration,
+                            state.settings.dead_zone_percent,
+                            state.settings.gain,
+                            state.settings.camera_position == CameraPosition::Bottom,
+                            state.settings.invert_pitch,
+                        );
+                    }
+                    decision
+                };
+                region_decision = Some(decision);
+            } else {
+                if state.active_region.is_some() {
+                    // Leaving region mode (switch off or calibration
+                    // cleared) must not leave a stale active screen in the
+                    // telemetry.
+                    state.active_region = None;
+                }
+                state.norm = map_pose(
+                    (fy, fp),
+                    &state.calibration,
+                    state.settings.dead_zone_percent,
+                    state.settings.gain,
+                    state.settings.camera_position == CameraPosition::Bottom,
+                    state.settings.invert_pitch,
+                );
+            }
         } else {
             // Face lost: reset the Kalman filters (a returning face must not
             // be dragged through stale velocity); the target becomes screen
@@ -291,6 +447,18 @@ pub(crate) fn step(
             state.raw = (0.0, 0.0);
             state.filtered = (0.0, 0.0);
             state.norm = (0.5, 0.5);
+            if state.region_mode() {
+                // Losing the face holds the current region and drops any
+                // pending transition (RegionSelector holds on `None`); the
+                // decision still flows through the commit block so
+                // `active_region` stays consistent.
+                let decision = state.region_selector.observe(
+                    None,
+                    now_ms,
+                    state.settings.region_settle_ms as u64,
+                );
+                region_decision = Some(decision);
+            }
         }
     }
 
@@ -343,6 +511,34 @@ pub(crate) fn step(
     // dwell machine gets suspend=true (visual Suspended, no timing), so no
     // new candidates or switches can fire while the lock is up.
     let emergency = emergency_locked(state.emergency_until, now_ms);
+
+    // S3 region commit application (deferred from the sample branch so the
+    // warp gates can see the final phase/emergency state). `decision.region`
+    // differs from `active_region` exactly on commit ticks; the screen
+    // geometry switch happens on every held-region change, the pointer warp
+    // and undo push only on commits whose gates are open.
+    let mut committed_switch = false;
+    if let Some(decision) = region_decision {
+        let previous_screen_id = state
+            .active_region
+            .zip(state.screen_cal.as_ref())
+            .map(|(idx, cal)| cal.regions[idx].screen_id.clone());
+        state.active_region = decision.region;
+        if let Some(idx) = decision.region {
+            switch_engine_screen_for_region(state, idx);
+        }
+        if decision.committed {
+            committed_switch = true;
+            maybe_warp_for_region_commit(
+                state,
+                decision.region.expect("committed implies a region"),
+                previous_screen_id,
+                now_ms,
+                emergency,
+                phase == EnginePhase::Idle,
+            );
+        }
+    }
 
     // P2 dwell machine: one hit-test per tick (the window service caches its
     // enumeration for 300 ms) feeds the pure state machine. `None` service
@@ -399,6 +595,9 @@ pub(crate) fn step(
             &mut state.undo_stack,
             UndoEntry {
                 previous_foreground_id: previous_foreground,
+                // Dwell window switches carry no screen undo: the tracked
+                // screen did not change, only the foreground window.
+                previous_screen_id: None,
                 switched_at_ms: now_ms,
             },
         );
@@ -464,8 +663,169 @@ pub(crate) fn step(
             _ => state.dwell.debug_phase_str(),
         },
         border: wanted_border,
+        // S3 telemetry: the active region's screen id (single-screen mode
+        // reports None) and the commit flag for the switch event stream.
+        active_screen_id: state
+            .active_region
+            .zip(state.screen_cal.as_ref())
+            .map(|(idx, cal)| cal.regions[idx].screen_id.clone()),
+        screen_switched: committed_switch,
     };
     (visual, local, snapshot)
+}
+
+/// S3: switch the engine's tracked screen to the held region's screen entry
+/// (matched by screen id). A missing entry keeps the current screen — the
+/// screen list and the calibration can briefly disagree during a topology
+/// change — and logs once per commit so misconfiguration is visible.
+fn switch_engine_screen_for_region(state: &mut EngineState, idx: usize) {
+    let Some(cal) = state.screen_cal.as_ref() else {
+        return;
+    };
+    let screen_id = cal.regions[idx].screen_id.clone();
+    let entry = state
+        .screens
+        .iter()
+        .find(|entry| entry.screen_id == screen_id)
+        .map(|entry| entry.geometry);
+    match entry {
+        Some(geometry) => {
+            if state.screen != geometry {
+                state.screen = geometry;
+            }
+        }
+        None => {
+            log::info!(
+                "halo: region screen {screen_id} not in the engine screen list; keeping the current screen"
+            );
+        }
+    }
+}
+
+/// S3: pointer warp on a region commit. Gates (all must pass): pipeline not
+/// suspended, no emergency lock, switch cooldown elapsed. On success the
+/// cooldown and warp guard re-arm and the pre-switch screen is recorded for
+/// undo; on a skipped gate the visual switch still happened (already applied
+/// by [`switch_engine_screen_for_region`]) and only the pointer stays put.
+fn maybe_warp_for_region_commit(
+    state: &mut EngineState,
+    idx: usize,
+    previous_screen_id: Option<String>,
+    now_ms: u64,
+    emergency: bool,
+    phase_idle: bool,
+) {
+    if emergency || !phase_idle {
+        log::debug!("halo: region commit skipped warp (suspended/emergency)");
+        return;
+    }
+    if state
+        .warp_cooldown_until
+        .is_some_and(|deadline| now_ms < deadline)
+    {
+        log::debug!("halo: region commit inside switch cooldown; warp skipped");
+        return;
+    }
+    // Warp target: the committed screen entry's board center, converted to
+    // native coordinates through the engine's screen list. The entry (not
+    // the calibration's stale board snapshot) is authoritative: with a
+    // drifted topology the region quad and the live screen can disagree, and
+    // warping to the calibration's coordinates could land the pointer on the
+    // wrong physical display. No entry -> no warp (the visual switch already
+    // kept the current screen).
+    let Some(cal) = state.screen_cal.as_ref() else {
+        return;
+    };
+    let screen_id = cal.regions[idx].screen_id.clone();
+    let entry = state
+        .screens
+        .iter()
+        .find(|entry| entry.screen_id == screen_id)
+        .map(|entry| {
+            (
+                entry.geometry.x + entry.geometry.width / 2.0,
+                entry.geometry.y + entry.geometry.height / 2.0,
+            )
+        });
+    let Some((board_x, board_y)) = entry else {
+        log::debug!("halo: region screen {screen_id} missing from the screen list; warp skipped");
+        return;
+    };
+    let tuples: Vec<(String, OverlayScreenGeometry)> = state
+        .screens
+        .iter()
+        .map(|entry| (entry.screen_id.clone(), entry.geometry))
+        .collect();
+    let Some((native_x, native_y)) = warp::board_to_native(&tuples, board_x, board_y) else {
+        log::warn!("halo: no usable screen for warp target; pointer stays put");
+        return;
+    };
+    if !state.warper.warp(native_x, native_y) {
+        log::warn!("halo: cursor warp rejected by the platform; pointer stays put");
+        return;
+    }
+    let cooldown_ms = state.settings.cooldown_ms as u64;
+    state.warp_cooldown_until = Some(now_ms.saturating_add(cooldown_ms));
+    state.warp_guard_until = Some(now_ms.saturating_add(WARP_GUARD_MS));
+    undo_push(
+        &mut state.undo_stack,
+        UndoEntry {
+            previous_foreground_id: None,
+            previous_screen_id,
+            switched_at_ms: now_ms,
+        },
+    );
+    log::info!(
+        "halo: screen switch committed to region {idx}, cursor warped to ({native_x}, {native_y})"
+    );
+}
+
+/// S3: undo side of a screen switch — warp the pointer back to the given
+/// screen's board center. Same cooldown/guard gates as a forward warp; the
+/// entry is consumed either way (a gated skip cannot be retried, matching
+/// the undo window semantics). The region selector is left alone: the head
+/// decides the next region on its own after the hysteresis settles.
+fn undo_warp_to_screen(state: &mut EngineState, screen_id: &str, now_ms: u64) -> bool {
+    if state
+        .warp_cooldown_until
+        .is_some_and(|deadline| now_ms < deadline)
+        || state
+            .warp_guard_until
+            .is_some_and(|deadline| now_ms < deadline)
+    {
+        log::debug!("halo: undo screen warp inside cooldown/guard; skipped");
+        return false;
+    }
+    let target = state
+        .screens
+        .iter()
+        .find(|entry| entry.screen_id == screen_id)
+        .map(|entry| {
+            (
+                entry.geometry.x + entry.geometry.width / 2.0,
+                entry.geometry.y + entry.geometry.height / 2.0,
+            )
+        });
+    let Some((board_x, board_y)) = target else {
+        log::warn!("halo: undo screen {screen_id} not in the engine screen list; skipped");
+        return false;
+    };
+    let tuples: Vec<(String, OverlayScreenGeometry)> = state
+        .screens
+        .iter()
+        .map(|entry| (entry.screen_id.clone(), entry.geometry))
+        .collect();
+    let Some((native_x, native_y)) = warp::board_to_native(&tuples, board_x, board_y) else {
+        return false;
+    };
+    if !state.warper.warp(native_x, native_y) {
+        return false;
+    }
+    let cooldown_ms = state.settings.cooldown_ms as u64;
+    state.warp_cooldown_until = Some(now_ms.saturating_add(cooldown_ms));
+    state.warp_guard_until = Some(now_ms.saturating_add(WARP_GUARD_MS));
+    log::info!("halo: undo switch -> warped back to screen {screen_id} center");
+    true
 }
 
 /// Border decision: a border is wanted exactly while a candidate is being
@@ -535,6 +895,11 @@ fn handle_command(
         EngineCommand::SetSettings(settings) => {
             state.settings = settings.sanitized();
             probe.set_keyboard_suspends(state.settings.keyboard_suspends);
+            // The multi-screen calibration travels inside the settings
+            // snapshot, so a settings save alone keeps the region path in
+            // sync (a `SetScreenCalibration` command exists for callers that
+            // only want to move the calibration).
+            state.screen_cal = state.settings.screen_calibration.clone();
             false
         }
         EngineCommand::SetCalibration(calibration) => {
@@ -546,6 +911,14 @@ fn handle_command(
             overlay.set_screen(screen);
             false
         }
+        EngineCommand::SetScreens(screens) => {
+            state.screens = screens;
+            false
+        }
+        EngineCommand::SetScreenCalibration(calibration) => {
+            state.screen_cal = calibration;
+            false
+        }
         EngineCommand::UndoSwitch => {
             // During the emergency lock the product leaves undo undefined;
             // EmergencyStop already cleared the stack, this guard just keeps
@@ -555,19 +928,35 @@ fn handle_command(
                 return false;
             }
             let undo_ms = state.settings.undo_ms as u64;
-            match undo_take(&mut state.undo_stack, now_ms, undo_ms) {
-                Some(Some(previous)) => {
-                    let outcome = state.activator.activate(previous);
-                    log::info!(
-                        "halo: undo switch -> window={} activated={} fell_back={} detail={}",
-                        previous,
-                        outcome.activated,
-                        outcome.fell_back,
-                        outcome.detail
-                    );
-                }
-                Some(None) => {
-                    log::info!("halo: undo switch: previous foreground not enumerable, no-op");
+            match undo_take_entry(&mut state.undo_stack, now_ms, undo_ms) {
+                Some(entry) => {
+                    // Screen undo first: warp the pointer back to the
+                    // pre-switch screen's center (S3), then the classic
+                    // window activation undo. An entry can carry either or
+                    // both.
+                    let screen_undone = entry
+                        .previous_screen_id
+                        .as_deref()
+                        .map(|screen_id| undo_warp_to_screen(state, screen_id, now_ms))
+                        .unwrap_or(false);
+                    match entry.previous_foreground_id {
+                        Some(previous) => {
+                            let outcome = state.activator.activate(previous);
+                            log::info!(
+                                "halo: undo switch -> window={} activated={} fell_back={} detail={}",
+                                previous,
+                                outcome.activated,
+                                outcome.fell_back,
+                                outcome.detail
+                            );
+                        }
+                        None if !screen_undone => {
+                            log::info!(
+                                "halo: undo switch: previous foreground not enumerable, no-op"
+                            );
+                        }
+                        None => {}
+                    }
                 }
                 None => {
                     log::info!("halo: undo switch: nothing eligible");
@@ -602,6 +991,10 @@ fn run_loop(
 ) {
     overlay.set_screen(state.screen);
     probe.set_keyboard_suspends(state.settings.keyboard_suspends);
+    // S3: the overlay is re-hosted only when the tracked screen actually
+    // changes (region switch or a SetScreen command) — deduplication by
+    // geometry equality keeps unchanged ticks at zero set_screen calls.
+    let mut pushed_screen = Some(state.screen);
     let mut overlay_visible = false;
     // The frame is only rebuilt when the visual or opacity changes; otherwise
     // the same cached frame is reused so ticks just update the position.
@@ -668,6 +1061,13 @@ fn run_loop(
             overlay.show();
             overlay_visible = true;
         }
+        // S3 region switch: when the tracked screen changed this tick (either
+        // flagged by the snapshot or observed via the geometry), re-host the
+        // overlay window on the new screen before drawing on it.
+        if snapshot.screen_switched || pushed_screen != Some(state.screen) {
+            overlay.set_screen(state.screen);
+            pushed_screen = Some(state.screen);
+        }
         overlay.update(local, &frame);
         // Border calls are deduplicated: only real state changes reach the
         // overlay (entering Candidate, frame change, leaving).
@@ -705,8 +1105,16 @@ mod tests {
     use super::*;
     use crate::halo::activator::ActivationOutcome;
     use crate::halo::params::FocusHaloSettings;
+    use crate::halo::screen_map::{BoardRect, PosePoint, ScreenRegion};
+    use crate::halo::warp::WarpRecorder;
     use crate::halo::windows_layer::WindowInfo;
     use std::sync::{Arc, Mutex};
+
+    /// Inert warp backend for the pre-S3 tests: records nothing, never
+    /// fails, and is queried by no assertion.
+    fn noop_warper() -> Box<dyn CursorWarper> {
+        Box::new(WarpRecorder::new(true))
+    }
 
     fn test_screen() -> OverlayScreenGeometry {
         OverlayScreenGeometry {
@@ -757,6 +1165,9 @@ mod tests {
             screen: test_screen(),
             window_service: None,
             activator,
+            screens: Vec::new(),
+            screen_calibration: None,
+            warper: noop_warper(),
         })
     }
 
@@ -786,6 +1197,9 @@ mod tests {
             screen: test_screen(),
             window_service: Some(Box::new(FixedWindowService { window })),
             activator,
+            screens: Vec::new(),
+            screen_calibration: None,
+            warper: noop_warper(),
         })
     }
 
@@ -823,6 +1237,9 @@ mod tests {
                 foreground,
             })),
             activator,
+            screens: Vec::new(),
+            screen_calibration: None,
+            warper: noop_warper(),
         });
         (state, calls)
     }
@@ -1213,6 +1630,9 @@ mod tests {
             screen: test_screen(),
             window_service: Some(Box::new(ExplodingService)),
             activator,
+            screens: Vec::new(),
+            screen_calibration: None,
+            warper: noop_warper(),
         });
         let (visual, _, snap) = step(&mut s, Some(sample(0, true, 0.0, 0.0)), 0, false);
         assert_eq!(visual, HaloVisual::Idle, "hit-test failure == blank area");
@@ -1225,6 +1645,7 @@ mod tests {
     fn undo_entry(previous: Option<u64>, switched_at_ms: u64) -> UndoEntry {
         UndoEntry {
             previous_foreground_id: previous,
+            previous_screen_id: None,
             switched_at_ms,
         }
     }
@@ -1419,5 +1840,406 @@ mod tests {
     fn constants_and_config_carry_the_p3_fields() {
         assert_eq!(EMERGENCY_LOCK_MS, 5000);
         assert_eq!(UNDO_STACK_MAX, 8);
+        assert_eq!(WARP_GUARD_MS, 300);
+    }
+
+    // ------------------------------------------------------------------
+    // S3 tests: multi-screen region switching (turn-head screen switch)
+    // ------------------------------------------------------------------
+
+    /// Two board screens side by side, native == board (macOS identity).
+    fn s3_screen(id: &str, x: f64) -> ScreenEntry {
+        ScreenEntry {
+            screen_id: id.into(),
+            geometry: OverlayScreenGeometry {
+                x,
+                y: 0.0,
+                width: 1000.0,
+                height: 500.0,
+                scale: 1.0,
+                native_x: x,
+                native_y: 0.0,
+            },
+        }
+    }
+
+    fn s3_screens() -> Vec<ScreenEntry> {
+        vec![s3_screen("s1", 0.0), s3_screen("s2", 1000.0)]
+    }
+
+    /// Rectangular pose quad: yaw `[x0, x1]`, pitch `[0, 10]`, zero
+    /// compensation coefficients so `compensate` is the identity at the
+    /// reference seat.
+    fn s3_region(id: &str, x0: f64, x1: f64) -> ScreenRegion {
+        let point = |yaw: f64, pitch: f64, u: f64, v: f64| PosePoint { yaw, pitch, u, v };
+        ScreenRegion {
+            screen_id: id.into(),
+            board: BoardRect {
+                screen_id: id.into(),
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 500.0,
+            },
+            tl: point(x0, 10.0, 0.0, 0.0),
+            tr: point(x1, 10.0, 1.0, 0.0),
+            br: point(x1, 0.0, 1.0, 1.0),
+            bl: point(x0, 0.0, 0.0, 1.0),
+        }
+    }
+
+    fn s3_calibration() -> ScreenCalibration {
+        ScreenCalibration {
+            regions: vec![s3_region("s1", -10.0, -2.0), s3_region("s2", 2.0, 10.0)],
+            trans_alpha_yaw: 0.0,
+            trans_alpha_pitch: 0.0,
+            ..ScreenCalibration::default()
+        }
+    }
+
+    /// Region-mode state over the two-screen rig: settle 300 ms, cooldown
+    /// 500 ms, warp guard 300 ms. Returns the warp call log so assertions
+    /// run against the shared recorder.
+    fn s3_state(warp_succeeds: bool) -> (EngineState, WarpRecorder) {
+        let (activator, _) = fake_activator();
+        let recorder = WarpRecorder::new(warp_succeeds);
+        let handle = recorder.clone();
+        let mut settings = FocusHaloSettings::default();
+        settings.screen_warp_enabled = true;
+        settings.region_settle_ms = 300;
+        settings.cooldown_ms = 500;
+        let state = EngineState::new(EngineConfig {
+            settings,
+            calibration: CalibrationProfile::default(),
+            screen: s3_screen("s1", 0.0).geometry,
+            window_service: None,
+            activator,
+            screens: s3_screens(),
+            screen_calibration: Some(s3_calibration()),
+            warper: Box::new(recorder),
+        });
+        (state, handle)
+    }
+
+    /// Head sample at the reference seat (`u = v = 0.5`, compensation no-op).
+    fn s3_sample(ts_ms: u64, yaw: f64) -> HeadSample {
+        HeadSample {
+            ts_ms,
+            face_detected: true,
+            yaw_deg: yaw,
+            pitch_deg: 5.0,
+            roll_deg: 0.0,
+            u: 0.5,
+            v: 0.5,
+        }
+    }
+
+    /// Jump the tracked pose deterministically: a face-loss tick resets the
+    /// Kalman filters, and the next face sample passes through unchanged, so
+    /// the filtered pose equals the raw pose exactly. Consecutive identical
+    /// samples (see [`s3_hold_until`]) keep it there. Returns the new tick.
+    fn s3_jump(s: &mut EngineState, t: u64, yaw: f64, pitch: f64) -> u64 {
+        let mut lost = s3_sample(t, yaw);
+        lost.face_detected = false;
+        step(s, Some(lost), t, false);
+        let t = t + 33;
+        let first = HeadSample {
+            pitch_deg: pitch,
+            ..s3_sample(t, yaw)
+        };
+        step(s, Some(first), t, false);
+        t
+    }
+
+    /// Feed identical face-present samples at 33 ms (~30 Hz) until the
+    /// commit flag appears (`want_commit`) or `deadline_ms` passes. Returns
+    /// the last tick and its snapshot.
+    fn s3_hold_until(
+        s: &mut EngineState,
+        t: u64,
+        yaw: f64,
+        pitch: f64,
+        deadline_ms: u64,
+        want_commit: bool,
+    ) -> (u64, DebugSnapshot) {
+        let mut t = t;
+        loop {
+            let sample = HeadSample {
+                pitch_deg: pitch,
+                ..s3_sample(t, yaw)
+            };
+            let (_, _, snap) = step(s, Some(sample), t, false);
+            if want_commit && snap.screen_switched {
+                return (t, snap);
+            }
+            if t >= deadline_ms {
+                return (t, snap);
+            }
+            t += 33;
+        }
+    }
+
+    #[test]
+    fn s3_region_commit_switches_screen_warps_once_and_records_undo() {
+        let (mut s, warps) = s3_state(true);
+        // Acquire region 0 (screen 1): pending at t=0, committed by t=333.
+        let (_, _, snap) = step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        assert_eq!(snap.screen_switched, false, "still settling");
+        let (t1, snap) = s3_hold_until(&mut s, 33, -6.0, 5.0, 1000, true);
+        assert_eq!(snap.screen_switched, true, "first acquisition commits");
+        assert_eq!(snap.active_screen_id.as_deref(), Some("s1"));
+        assert_eq!(s.active_region, Some(0));
+        // The first commit warps to the CURRENT screen's center (region 0 is
+        // screen 1, already tracked) and pushes an undo entry with no
+        // previous screen (nothing to go back to). Cooldown now runs until
+        // t1 + 500.
+        assert_eq!(warps.calls(), vec![(500.0, 250.0)]);
+        assert_eq!(s.undo_stack.len(), 1);
+        assert_eq!(s.undo_stack[0].previous_screen_id, None);
+
+        // Hold region 0 well past the first cooldown, then jump to region 1
+        // (screen 2) and let it settle: this commit switches the screen,
+        // warps to s2's center, and records s1 as the previous screen.
+        s3_hold_until(&mut s, t1 + 33, -6.0, 5.0, t1 + 700, false);
+        let t2 = s3_jump(&mut s, t1 + 733, 6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t2 + 33, 6.0, 5.0, t1 + 2400, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(snap.active_screen_id.as_deref(), Some("s2"));
+        assert_eq!(s.screen, s3_screen("s2", 1000.0).geometry);
+        assert_eq!(s.active_region, Some(1));
+        assert_eq!(warps.calls(), vec![(500.0, 250.0), (1500.0, 250.0)]);
+        assert_eq!(s.undo_stack.len(), 2);
+        assert_eq!(s.undo_stack[1].previous_screen_id, Some("s1".into()));
+    }
+
+    #[test]
+    fn s3_warp_target_is_the_committed_screen_center() {
+        let (mut s, warps) = s3_state(true);
+        // Acquire region 0, hold past its cooldown, then commit to region 1
+        // with the cooldown long expired: the warp lands on s2's board
+        // center (1500, 250), which is native == board on this rig.
+        let (t1, _) = {
+            step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+            s3_hold_until(&mut s, 33, -6.0, 5.0, 1000, true)
+        };
+        s3_hold_until(&mut s, t1 + 33, -6.0, 5.0, t1 + 700, false);
+        let t2 = s3_jump(&mut s, t1 + 733, 6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t2 + 33, 6.0, 5.0, t1 + 2400, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(warps.calls(), vec![(500.0, 250.0), (1500.0, 250.0)]);
+    }
+
+    #[test]
+    fn s3_cooldown_swallows_rapid_back_and_forth_warps() {
+        let (mut s, warps) = s3_state(true);
+        // First commit at ~333 arms the cooldown until ~833.
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (_, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 400, true);
+        assert_eq!(warps.warp_count(), 1);
+        // Jump to region 1 right away: the commit (~700) is still inside the
+        // cooldown, so the screen switches but the warp is gated.
+        let t2 = s3_jump(&mut s, 433, 6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t2 + 33, 6.0, 5.0, 800, true);
+        assert_eq!(snap.screen_switched, true, "visual switch still happens");
+        assert_eq!(s.screen, s3_screen("s2", 1000.0).geometry);
+        assert_eq!(warps.warp_count(), 1, "cooldown gated the warp");
+        // Jump back and settle past the cooldown: this one warps.
+        let t3 = s3_jump(&mut s, 833, -6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t3 + 33, -6.0, 5.0, 2000, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(warps.warp_count(), 2);
+    }
+
+    #[test]
+    fn s3_warp_guard_masks_probe_readings_but_not_the_timer() {
+        let (mut s, warps) = s3_state(true);
+        // First commit at ~333 arms the 300 ms guard until ~633.
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (_, snap) = s3_hold_until(&mut s, 33, -6.0, 5.0, 400, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(warps.warp_count(), 1);
+        // Physical input right after the warp: masked, the pipeline stays
+        // Idle instead of flapping to SuspendedInput.
+        let (_, _, snap) = step(&mut s, None, 400, true);
+        assert_eq!(snap.phase, EnginePhase::Idle, "guard masks the probe");
+        // 629: the guard window is [330, 630), so this is still inside it.
+        let (_, _, snap) = step(&mut s, None, 629, true);
+        assert_eq!(snap.phase, EnginePhase::Idle);
+        // Past the guard the probe reading lands and suspends normally.
+        let (_, _, snap) = step(&mut s, None, 631, true);
+        assert_eq!(snap.phase, EnginePhase::SuspendedInput);
+        // And the 1 s quiet window still applies on its own schedule: quiet
+        // from 631 resumes at 1632 (timer semantics untouched by the guard).
+        let (_, _, snap) = step(&mut s, None, 1632, false);
+        assert_eq!(snap.phase, EnginePhase::Idle);
+    }
+
+    #[test]
+    fn s3_face_loss_holds_the_region_without_committing() {
+        let (mut s, warps) = s3_state(true);
+        // Acquire region 0.
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (_, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 400, true);
+        assert_eq!(s.active_region, Some(0));
+        // Pose moves toward region 1, but the face disappears before settle:
+        // no commit, selector holds region 0, no warp.
+        let t = s3_jump(&mut s, 433, 6.0, 5.0);
+        let mut lost = s3_sample(t + 33, 6.0);
+        lost.face_detected = false;
+        let (_, _, snap) = step(&mut s, Some(lost), t + 33, false);
+        assert_eq!(snap.screen_switched, false);
+        assert_eq!(s.active_region, Some(0), "selector holds on face loss");
+        // Face stays gone well past the settle window: still no commit.
+        let (_, _, snap) = step(&mut s, None, 3000, false);
+        assert_eq!(snap.screen_switched, false);
+        assert_eq!(s.active_region, Some(0));
+        assert_eq!(warps.warp_count(), 1, "only the acquisition warp");
+    }
+
+    #[test]
+    fn s3_in_screen_follow_uses_bilinear_on_the_held_region() {
+        let (mut s, warps) = s3_state(true);
+        // Acquire region 0 (yaw [-10, -2], pitch [0, 10]).
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        s3_hold_until(&mut s, 33, -6.0, 5.0, 400, true);
+        assert_eq!(s.active_region, Some(0));
+        // Each pose below lands as the first sample after a Kalman reset, so
+        // the filtered pose equals the raw pose and bilinear is exact.
+        let cases = [
+            (-10.0, 10.0, 0.0, 0.0), // top-left corner
+            (-6.0, 5.0, 0.5, 0.5),   // region center
+            (-2.0, 0.0, 1.0, 1.0),   // bottom-right corner
+            (-8.0, 2.5, 0.25, 0.75), // interior point
+        ];
+        let mut t = 433;
+        for (yaw, pitch, want_x, want_y) in cases {
+            t = s3_jump(&mut s, t, yaw, pitch);
+            // Identical follow-up sample: the filter stays exactly at the
+            // first sample's value (zero innovation), so bilinear is exact.
+            let sample = HeadSample {
+                pitch_deg: pitch,
+                ..s3_sample(t + 33, yaw)
+            };
+            let (_, _, snap) = step(&mut s, Some(sample), t + 33, false);
+            assert!(
+                (snap.norm_x - want_x).abs() < 1e-6 && (snap.norm_y - want_y).abs() < 1e-6,
+                "pose ({yaw},{pitch}) -> ({want_x},{want_y}), got {:?}",
+                (snap.norm_x, snap.norm_y)
+            );
+            t += 66;
+        }
+        assert_eq!(warps.warp_count(), 1, "in-region follow never re-warps");
+    }
+
+    #[test]
+    fn s3_undo_command_warps_back_to_the_previous_screen_center() {
+        let (mut s, warps) = s3_state(true);
+        // Acquire s1, hold past its cooldown, switch to s2 with a warp.
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (t1, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 1000, true);
+        s3_hold_until(&mut s, t1 + 33, -6.0, 5.0, t1 + 700, false);
+        let t2 = s3_jump(&mut s, t1 + 733, 6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t2 + 33, 6.0, 5.0, t1 + 2400, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(warps.calls(), vec![(500.0, 250.0), (1500.0, 250.0)]);
+        // Undo 1 s later: the top entry carries previous_screen_id = s1, so
+        // the pointer warps back to s1's center. Only the top entry pops —
+        // the first acquisition entry stays (it has no previous screen).
+        drive(&mut s, EngineCommand::UndoSwitch, t1 + 2600);
+        assert_eq!(
+            warps.calls(),
+            vec![(500.0, 250.0), (1500.0, 250.0), (500.0, 250.0)]
+        );
+        assert_eq!(s.undo_stack.len(), 1, "only the top entry was popped");
+    }
+
+    #[test]
+    fn s3_without_warp_enabled_keeps_the_map_pose_path() {
+        // Calibration present but the master switch off: exactly the old
+        // behavior (region selector idle, no switches, no warps).
+        let (activator, _) = fake_activator();
+        let recorder = WarpRecorder::new(true);
+        let handle = recorder.clone();
+        let state = EngineState::new(EngineConfig {
+            settings: FocusHaloSettings::default(),
+            calibration: CalibrationProfile::default(),
+            screen: test_screen(),
+            window_service: None,
+            activator,
+            screens: s3_screens(),
+            screen_calibration: Some(s3_calibration()),
+            warper: Box::new(recorder),
+        });
+        let mut s = state;
+        let (_, _, snap) = step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        assert_eq!(snap.screen_switched, false);
+        assert_eq!(snap.active_screen_id, None);
+        let (_, _, snap) = step(&mut s, Some(s3_sample(2000, 6.0)), 2000, false);
+        assert_eq!(snap.active_screen_id, None, "region path stays off");
+        assert_eq!(handle.warp_count(), 0);
+        assert!(s.undo_stack.is_empty());
+        // Same screen geometry as configured (no switch happened).
+        assert_eq!(s.screen, test_screen());
+    }
+
+    #[test]
+    fn s3_set_screen_calibration_command_swaps_the_region_path() {
+        let (mut s, warps) = s3_state(true);
+        // Acquire region 0 with calibration.
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (_, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 400, true);
+        assert_eq!(s.active_region, Some(0));
+        // Clearing the calibration via command returns to the single-screen
+        // path: no region telemetry, no further warps.
+        drive(&mut s, EngineCommand::SetScreenCalibration(None), 500);
+        let (_, _, snap) = step(&mut s, Some(s3_sample(2000, 6.0)), 2000, false);
+        assert_eq!(snap.active_screen_id, None);
+        assert_eq!(warps.warp_count(), 1, "no new warps without calibration");
+        // Reinstalling the calibration re-arms the region path; the held
+        // selector state (region 0) survives, so a region 1 pose needs a
+        // fresh settle and then commits with a warp (cooldown long expired).
+        drive(
+            &mut s,
+            EngineCommand::SetScreenCalibration(Some(s3_calibration())),
+            2100,
+        );
+        let t = s3_jump(&mut s, 2133, 6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t + 33, 6.0, 5.0, 4000, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(snap.active_screen_id.as_deref(), Some("s2"));
+        assert_eq!(warps.warp_count(), 2);
+    }
+
+    #[test]
+    fn s3_missing_screen_entry_keeps_the_current_screen_without_warp() {
+        let (activator, _) = fake_activator();
+        let recorder = WarpRecorder::new(true);
+        let handle = recorder.clone();
+        let mut settings = FocusHaloSettings::default();
+        settings.screen_warp_enabled = true;
+        settings.region_settle_ms = 300;
+        let state = EngineState::new(EngineConfig {
+            settings,
+            calibration: CalibrationProfile::default(),
+            screen: test_screen(),
+            window_service: None,
+            activator,
+            // Only screen 1 known; region 1 (s2) has no matching entry.
+            screens: vec![s3_screen("s1", 0.0)],
+            screen_calibration: Some(s3_calibration()),
+            warper: Box::new(recorder),
+        });
+        let mut s = state;
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (_, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 400, true);
+        // Commit to region 1 (s2 not in the list): screen stays, no warp,
+        // no undo entry (nothing switched for the pointer).
+        let t = s3_jump(&mut s, 433, 6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t + 33, 6.0, 5.0, 2000, true);
+        assert_eq!(snap.screen_switched, true, "the region itself commits");
+        assert_eq!(snap.active_screen_id.as_deref(), Some("s2"));
+        assert_eq!(s.screen, test_screen(), "unknown screen keeps the old one");
+        assert_eq!(handle.warp_count(), 1, "only the initial acquisition warp");
+        assert_eq!(s.undo_stack.len(), 1, "no undo entry without a warp");
     }
 }

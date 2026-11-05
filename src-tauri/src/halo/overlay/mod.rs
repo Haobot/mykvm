@@ -48,7 +48,10 @@ pub struct BorderFrame {
 
 /// Screen geometry in the engine's layout-board space plus the platform's
 /// global native origin, so the backend never needs layout knowledge.
-#[derive(Debug, Clone, Copy)]
+/// `PartialEq` (exact float equality) drives the engine's overlay re-host
+/// deduplication: two calls with identical geometry are considered the same
+/// screen, so only real topology changes re-host the window.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverlayScreenGeometry {
     /// Logical origin of this screen in layout-board space.
     pub x: f64,

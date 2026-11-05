@@ -25,10 +25,13 @@ pub mod screen_map;
 pub mod smoothing;
 pub mod state_machine;
 pub mod tracker;
+pub mod warp;
 pub mod windows_layer;
 
 pub use activator::{create_activator, ActivationOutcome, WindowActivator};
-pub use engine::{spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase};
+pub use engine::{
+    spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase, ScreenEntry,
+};
 pub use filter::OneEuroFilter;
 pub use focus_router::{
     apply_focus_event, install_receive_hook, BoardScreen, FocusDisplayOutcome, FocusEmission,
@@ -48,6 +51,7 @@ pub use state_machine::{
     advance as advance_dwell, DwellConfig, DwellPhase, DwellState, SwitchEvent,
 };
 pub use tracker::{default_models_dir, Frame, HeadSample, PoseEngine};
+pub use warp::{create_cursor_warper, CursorWarper, WarpRecorder};
 pub use windows_layer::{create_window_service, WindowInfo, WindowService};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,6 +60,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::halo::screen_map::ScreenCalibration;
 use tracker::camera::CameraControl;
 
 /// How long a remote-focus highlight stays on screen without a refresh
@@ -149,6 +154,11 @@ pub struct HaloRuntime {
     /// the window so its pixel size follows the setting.
     built_diameter: f64,
     geometry: Option<OverlayScreenGeometry>,
+    /// S3: every local screen in board space, handed to the engine so a
+    /// region commit can switch screens and warp the pointer. Kept on the
+    /// runtime so the next enable picks up the current topology without the
+    /// caller having to re-push it.
+    screens: Vec<ScreenEntry>,
     /// Live while running: signals the tracker thread to stop (its loop owns
     /// the camera object, so all camera calls stay on one thread).
     tracker_stop: Option<Arc<AtomicBool>>,
@@ -186,6 +196,7 @@ impl HaloRuntime {
             overlay: None,
             built_diameter: 0.0,
             geometry: None,
+            screens: Vec::new(),
             tracker_stop: None,
             tracker_handle: None,
             engine_handle: None,
@@ -249,6 +260,7 @@ impl HaloRuntime {
             self.settings = settings;
             self.calibration = calibration;
             self.geometry = Some(screen);
+            self.forward(EngineCommand::SetScreens(self.screens.clone()));
             self.forward(EngineCommand::SetSettings(self.settings.clone()));
             self.forward(EngineCommand::SetCalibration(calibration));
             self.forward(EngineCommand::SetScreen(screen));
@@ -332,6 +344,13 @@ impl HaloRuntime {
             // switches through this backend.
             activator: activator::create_activator(),
             screen,
+            // S3 region switching: the caller pushes the live screen list via
+            // `set_screens` (kept on the runtime), the calibration travels
+            // inside the settings snapshot, and the warper is the platform
+            // cursor warp backend.
+            screens: self.screens.clone(),
+            screen_calibration: settings.screen_calibration.clone(),
+            warper: warp::create_cursor_warper(),
         };
         let (engine_handle, engine_cmd_tx, engine_debug_rx) = engine::spawn(
             config,
@@ -469,6 +488,25 @@ impl HaloRuntime {
         }
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.set_screen(geometry);
+        }
+    }
+
+    /// S3: replace the whole local-screen list (display topology changed).
+    /// Stored for the next enable and forwarded to a running engine as
+    /// [`EngineCommand::SetScreens`]; the engine's region path uses the list
+    /// to re-host the overlay and to convert warp targets to native coords.
+    pub fn set_screens(&mut self, screens: Vec<ScreenEntry>) {
+        self.screens = screens;
+        if self.is_running() {
+            self.forward(EngineCommand::SetScreens(self.screens.clone()));
+        }
+    }
+
+    /// S3: replace the multi-screen calibration; forwarded to a running
+    /// engine (used by the recenter flow, which shifts every region's quad).
+    pub(crate) fn set_screen_calibration(&mut self, calibration: Option<ScreenCalibration>) {
+        if self.is_running() {
+            self.forward(EngineCommand::SetScreenCalibration(calibration));
         }
     }
 
