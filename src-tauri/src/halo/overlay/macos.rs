@@ -101,6 +101,9 @@ extern "C" {
         transform: *const CGAffineTransform,
     ) -> *mut c_void;
     fn CGPathCreateMutable() -> *mut c_void;
+    fn CGPathMoveToPoint(path: *mut c_void, transform: *const CGAffineTransform, x: f64, y: f64);
+    fn CGPathAddLineToPoint(path: *mut c_void, transform: *const CGAffineTransform, x: f64, y: f64);
+    fn CGPathCloseSubpath(path: *mut c_void);
     fn CGPathAddRoundedRect(
         path: *mut c_void,
         transform: *const CGAffineTransform,
@@ -327,6 +330,13 @@ impl OverlayBackend for MacOSOverlay {
         // Same lazy main-thread pattern as the halo window: creation and the
         // frame application stay ordered on the main queue.
         on_main(show_border, Box::into_raw(Box::new(rect)) as *mut c_void);
+        // macOS 27 compositing quirk (verified live 2026-11-05, see the
+        // badge.rs module docs): a borderless non-opaque window whose
+        // sublayer was un-hidden inside the creation block never composites
+        // until a later frame touch — the halo ring survives only because
+        // the engine moves it every tick. A follow-up block re-asserting the
+        // frame with display:YES forces the window-server surface update.
+        on_main(border_reveal, Box::into_raw(Box::new(rect)) as *mut c_void);
     }
 
     fn border_visible(&self) -> bool {
@@ -548,58 +558,93 @@ unsafe fn build_window(diameter: f64) -> *mut c_void {
 // moves/resizes the window and refreshes the outline path.
 // ---------------------------------------------------------------------------
 
-/// Rounded-rect outline path for the border window: the board frame is inset
-/// `BORDER_PAD` points from the window edges so the centered stroke stays
-/// inside. Built with `CGPathAddRoundedRect` — `CGPathCreateWithRoundedCGRect`
-/// is no longer exported by the macOS 27 SDK. Returns a raw +1
-/// CGMutablePathRef (usable as a CGPathRef); the caller releases it after
+/// Rounded-rect outline path for the border, positioned ABSOLUTELY inside
+/// the full-screen border window (see `build_border_window`): `rect` is the
+/// target frame in main-display NS coordinates, padded by `BORDER_PAD` so
+/// the centered stroke stays inside. Built with `CGPathAddRoundedRect` —
+/// `CGPathCreateWithRoundedCGRect` is no longer exported by the macOS 27
+/// SDK. Returns a raw +1 CGMutablePathRef; the caller releases it after
 /// handing it to a layer.
 unsafe fn border_path(rect: NsRect) -> *mut c_void {
     let mutable = CGPathCreateMutable();
     if mutable.is_null() {
         return std::ptr::null_mut();
     }
-    let inner = CGRect {
-        origin: CGPoint {
-            x: BORDER_PAD,
-            y: BORDER_PAD,
-        },
-        size: CGSize {
-            width: rect.w - BORDER_PAD * 2.0,
-            height: rect.h - BORDER_PAD * 2.0,
-        },
-    };
-    CGPathAddRoundedRect(
-        mutable,
-        std::ptr::null(),
-        inner,
-        BORDER_CORNER_RADIUS,
-        BORDER_CORNER_RADIUS,
-    );
+    // Sharp corners via explicit MoveTo/AddLine segments (the same
+    // primitives badge.rs brackets use — verified live against the macOS 27
+    // runtime; keep the path API surface minimal).
+    let x0 = rect.x + BORDER_PAD;
+    let y0 = rect.y + BORDER_PAD;
+    let x1 = rect.x + rect.w - BORDER_PAD;
+    let y1 = rect.y + rect.h - BORDER_PAD;
+    CGPathMoveToPoint(mutable, std::ptr::null(), x0, y0);
+    CGPathAddLineToPoint(mutable, std::ptr::null(), x1, y0);
+    CGPathAddLineToPoint(mutable, std::ptr::null(), x1, y1);
+    CGPathAddLineToPoint(mutable, std::ptr::null(), x0, y1);
+    CGPathCloseSubpath(mutable);
     mutable
 }
 
-unsafe fn build_border_window(rect: NsRect) -> *mut c_void {
-    let (window, host) = make_click_through_window(rect);
+/// The border window spans the whole MAIN display (origin-anchored, like the
+/// badge windows) instead of hugging the candidate frame. Two reasons,
+/// both verified live on macOS 27 (2026-11-05):
+///
+/// 1. Origin-anchored full-coverage overlay windows composite reliably; a
+///    borderless window born at an arbitrary position never got its layer
+///    geometry picked up, which kept the candidate border pixel-invisible
+///    through several reveal-pattern attempts.
+/// 2. The outline path carries the position instead, so "moving" the border
+///    between candidates is a single setPath: — no window resize churn.
+unsafe fn border_window_frame() -> NsRect {
+    let bounds = CGDisplay::main().bounds();
+    NsRect {
+        x: bounds.origin.x,
+        y: bounds.origin.y,
+        w: bounds.size.width,
+        h: bounds.size.height,
+    }
+}
+
+unsafe fn build_border_window(target: NsRect) -> *mut c_void {
+    let full = border_window_frame();
+    let (window, host) = make_click_through_window(full);
     if window.is_null() {
         return std::ptr::null_mut();
     }
     if host.is_null() {
         return window;
     }
-    let layer = make_shape_layer(rect, send_f64(window, b"backingScaleFactor\0"));
+    // Build the layer from scratch (badge.rs's bracket construction), NOT
+    // via make_shape_layer: that helper installs its ellipse as the initial
+    // `path`, and REPLACING an animatable property (path) inside the
+    // creation block leaves an implicit transition action stranded on a
+    // never-composited layer — the outline never appears. The rect path
+    // here is the layer's first and only path. Frame covers the whole
+    // window at (0,0); the path carries the candidate's absolute position.
+    let layer = send(
+        send(cls(b"CAShapeLayer\0"), sel(b"alloc\0")),
+        sel(b"init\0"),
+    );
     if layer.is_null() {
         return window;
     }
-    // Swap the shape layer's default ellipse for the rounded outline, stroke
-    // it in the accent color and keep it visible while the window is.
-    let path = border_path(rect);
+    let path = border_path(target);
     send1(layer, sel(b"setPath:\0"), path);
     CFRelease(path);
-    send1(layer, sel(b"setStrokeColor:\0"), cg_color(ACCENT));
+    send1(
+        layer,
+        sel(b"setStrokeColor:\0"),
+        cg_color((ACCENT.0, ACCENT.1, ACCENT.2, BORDER_OPACITY_MAX)),
+    );
+    send1(layer, sel(b"setFillColor:\0"), std::ptr::null_mut());
     set_f64(layer, b"setLineWidth:\0", BORDER_STROKE);
-    set_bool(layer, b"setHidden:\0", false);
-    set_f64(layer, b"setOpacity:\0", BORDER_OPACITY_MAX);
+    set_f64(
+        layer,
+        b"setContentsScale:\0",
+        send_f64(window, b"backingScaleFactor\0"),
+    );
+    set_rect(layer, b"setFrame:\0", full);
+    set_bool(layer, b"setHidden:\0", true);
     send1(host, sel(b"addSublayer:\0"), layer);
     BORDER_LAYER.store(layer as usize, Ordering::Relaxed);
     window
@@ -678,32 +723,59 @@ extern "C" fn show_border(ctx: *mut c_void) {
                 return;
             }
             BORDER_WINDOW.store(window as usize, Ordering::Relaxed);
-            let layer = BORDER_LAYER.load(Ordering::Relaxed) as *mut c_void;
-            if !layer.is_null() {
-                start_border_breathing(layer);
-            }
+            // The breathing animation is deliberately NOT attached here: on
+            // macOS 27 an animation added inside the creation block (to a
+            // hidden, never-yet-composited layer) strands the presentation
+            // — `border_reveal` attaches it once the layer is visible, the
+            // same ordering badge.rs uses for its corner breathing.
         } else {
-            // Reuse: move/resize, then refresh the outline path (sublayers do
-            // not follow window resizes on their own).
-            set_frame_display(window, *rect, true);
+            // Reuse: the full-screen window never moves; only the outline
+            // path carries the new candidate position.
             let layer = BORDER_LAYER.load(Ordering::Relaxed) as *mut c_void;
             if !layer.is_null() {
-                set_rect(
-                    layer,
-                    b"setFrame:\0",
-                    NsRect {
-                        x: 0.0,
-                        y: 0.0,
-                        w: rect.w,
-                        h: rect.h,
-                    },
-                );
                 let path = border_path(*rect);
                 send1(layer, sel(b"setPath:\0"), path);
                 CFRelease(path);
             }
         }
         send(window, sel(b"orderFrontRegardless\0"));
+    }
+}
+
+/// Second main-queue block after [`show_border`]: re-assert the same frame
+/// with display:YES and the layer visibility so the freshly created border
+/// actually composites (macOS 27 quirk; the opacity breathing animation is
+/// deliberately untouched — re-asserting layer opacity strands the
+/// presentation, see badge.rs).
+extern "C" fn border_reveal(ctx: *mut c_void) {
+    let rect = unsafe { Box::from_raw(ctx as *mut NsRect) };
+    let _ = rect; // target position lives in the layer path; window is full-screen
+    let window = BORDER_WINDOW.load(Ordering::Relaxed) as *mut c_void;
+    if window.is_null() {
+        return;
+    }
+    unsafe {
+        let layer = BORDER_LAYER.load(Ordering::Relaxed) as *mut c_void;
+        if !layer.is_null() {
+            // Mirror badge.rs's reveal writes exactly: re-asserting the
+            // stroke properties in THIS block (not just hidden:false) is
+            // what marks the layer for the window server on macOS 27.
+            send1(
+                layer,
+                sel(b"setStrokeColor:\0"),
+                cg_color((ACCENT.0, ACCENT.1, ACCENT.2, BORDER_OPACITY_MAX)),
+            );
+            send1(layer, sel(b"setFillColor:\0"), std::ptr::null_mut());
+            set_f64(layer, b"setLineWidth:\0", BORDER_STROKE);
+            set_bool(layer, b"setHidden:\0", false);
+            // Attach the breathing only after the visible transition (same
+            // ordering as badge.rs's corner breathing: an animation added to
+            // a never-composited layer inside the creation block strands the
+            // presentation on macOS 27).
+            start_border_breathing(layer);
+        }
+        set_frame_display(window, border_window_frame(), true);
+        set_f64(window, b"setAlphaValue:\0", 1.0);
     }
 }
 
