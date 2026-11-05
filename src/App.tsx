@@ -40,6 +40,11 @@ import {
   haloGetStatus,
   haloHideOverlay,
   haloRecenter,
+  haloScreenCalBegin,
+  haloScreenCalCancel,
+  haloScreenCalCapture,
+  haloScreenCalFinish,
+  haloScreenCalSetStep,
   haloSetEnabled,
   haloTestOverlay,
   haloUndoSwitch,
@@ -79,7 +84,21 @@ import {
   uninstallInputService,
   writeClipboardText,
 } from "./desktopApi";
-import type { AppUpdateInfo, HaloVisual } from "./desktopApi";
+import type {
+  AppUpdateInfo,
+  HaloScreenCalPlanItem,
+  HaloScreenCalProgress,
+  HaloVisual,
+} from "./desktopApi";
+import {
+  SCREEN_CAL_CORNER_ORDER,
+  canFinishScreenCal,
+  cornerOrdinal,
+  nextCorner,
+  showScreenCalTopologyWarning,
+  type HaloScreenCalSummary,
+  type ScreenCalCorner,
+} from "./screenCalWizard";
 import { compareVersions } from "./versions";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
@@ -382,6 +401,17 @@ function App() {
   const [haloCalibBusy, setHaloCalibBusy] = useState(false);
   const [haloCalibError, setHaloCalibError] = useState<string | null>(null);
   const [haloDebug, setHaloDebug] = useState<HaloDebugSnapshot | null>(null);
+  // FocusHalo S2 multi-screen region calibration wizard: mirrors the
+  // backend's plan/progress (the backend keeps the authoritative state).
+  const [screenCalPlan, setScreenCalPlan] = useState<HaloScreenCalPlanItem[]>([]);
+  const [screenCalProgress, setScreenCalProgress] = useState<HaloScreenCalProgress>({
+    acceptedScreens: 0,
+    totalScreens: 0,
+    cornersDone: 0,
+  });
+  const [screenCalBusy, setScreenCalBusy] = useState(false);
+  const [screenCalError, setScreenCalError] = useState<string | null>(null);
+  const [screenCalDone, setScreenCalDone] = useState<HaloScreenCalSummary | null>(null);
   // FocusHalo P3: which halo hotkey recorder is capturing a combo (same
   // recorder protocol as the edge-switch/screen-switch buttons).
   const [capturingHaloHotkey, setCapturingHaloHotkey] = useState<
@@ -2853,6 +2883,116 @@ function App() {
     }
   }
 
+  // -----------------------------------------------------------------
+  // FocusHalo S2 multi-screen region calibration (转头切屏). The backend
+  // owns the authoritative wizard state; these handlers mirror its progress
+  // for the UI and advance the badge highlight in lockstep with captures.
+  // -----------------------------------------------------------------
+
+  function resetScreenCalProgress() {
+    setScreenCalPlan([]);
+    setScreenCalProgress({ acceptedScreens: 0, totalScreens: 0, cornersDone: 0 });
+  }
+
+  async function beginScreenCal() {
+    if (screenCalBusy) {
+      return;
+    }
+    setScreenCalBusy(true);
+    setScreenCalError(null);
+    setScreenCalDone(null);
+    try {
+      const plan = await haloScreenCalBegin();
+      setScreenCalPlan(plan);
+      setScreenCalProgress({
+        acceptedScreens: 0,
+        totalScreens: plan.length,
+        cornersDone: 0,
+      });
+      if (plan.length > 0) {
+        await haloScreenCalSetStep(0, SCREEN_CAL_CORNER_ORDER[0]);
+      }
+    } catch (error) {
+      setScreenCalError(haloErrorMessage(error));
+    } finally {
+      setScreenCalBusy(false);
+    }
+  }
+
+  async function cancelScreenCal() {
+    if (screenCalBusy) {
+      return;
+    }
+    setScreenCalBusy(true);
+    setScreenCalError(null);
+    try {
+      await haloScreenCalCancel();
+      resetScreenCalProgress();
+    } catch (error) {
+      setScreenCalError(haloErrorMessage(error));
+    } finally {
+      setScreenCalBusy(false);
+    }
+  }
+
+  // Capture the corner the wizard is currently asking for. screenIndex is
+  // sequential: accepted regions equal completed screens, so the screen
+  // under capture is always index `acceptedScreens`.
+  async function captureScreenCalCorner() {
+    if (screenCalBusy || screenCalProgress.acceptedScreens >= screenCalProgress.totalScreens) {
+      return;
+    }
+    setScreenCalBusy(true);
+    setScreenCalError(null);
+    const screenIndex = screenCalProgress.acceptedScreens;
+    const corner = nextCorner(screenCalProgress.cornersDone);
+    try {
+      const progress = await haloScreenCalCapture(screenIndex, corner);
+      setScreenCalProgress(progress);
+      if (progress.acceptedScreens === screenIndex + 1) {
+        // The region was accepted: advance to the next screen's first corner.
+        // After the last screen the backend already cleared the highlight.
+        if (progress.acceptedScreens < progress.totalScreens) {
+          await haloScreenCalSetStep(progress.acceptedScreens, SCREEN_CAL_CORNER_ORDER[0]);
+        }
+      } else {
+        // Corner committed but the screen is not complete yet: highlight the
+        // next corner of the same screen.
+        const cornersInScreen = progress.cornersDone - screenIndex * SCREEN_CAL_CORNER_ORDER.length;
+        await haloScreenCalSetStep(screenIndex, nextCorner(cornersInScreen));
+      }
+    } catch (error) {
+      // Failed capture keeps the same step: the user retries the corner.
+      await haloScreenCalSetStep(screenIndex, corner).catch(() => {});
+      setScreenCalError(haloErrorMessage(error));
+    } finally {
+      setScreenCalBusy(false);
+    }
+  }
+
+  async function finishScreenCal() {
+    if (screenCalBusy || !canFinishScreenCal(screenCalProgress)) {
+      return;
+    }
+    setScreenCalBusy(true);
+    setScreenCalError(null);
+    try {
+      const summary = await haloScreenCalFinish();
+      setScreenCalDone(summary);
+      resetScreenCalProgress();
+      // Same reason as the 5-point flow: the layout on disk now carries the
+      // new screen_calibration; refresh before any other save round-trips a
+      // stale snapshot over it.
+      setSnapshot(await loadAppState());
+      // 短暂展示成功提示，自动消失。
+      window.setTimeout(() => setScreenCalDone(null), 6000);
+    } catch (error) {
+      setScreenCalError(haloErrorMessage(error));
+    } finally {
+      setScreenCalBusy(false);
+    }
+  }
+
   function screenFileTransferTargetId(screen: FlattenedScreen) {
     if (
       !fileTransferEnabled ||
@@ -3907,6 +4047,15 @@ function App() {
                         : ui.settings.haloStatusStopped}
                   </span>
                 </div>
+                {showScreenCalTopologyWarning(haloStatus?.screenTopologyOk) ? (
+                  <p
+                    className="muted-copy diagnostic-message"
+                    role="alert"
+                    style={{ color: "#e0a03c" }}
+                  >
+                    {ui.settings.haloScreenCalTopologyWarning}
+                  </p>
+                ) : null}
                 <p className="muted-copy">{ui.settings.haloCopy}</p>
                 <div className="settings-control-row">
                   <span>
@@ -3956,6 +4105,209 @@ function App() {
                     {ui.settings.haloRecenter}
                   </button>
                 </div>
+                <details
+                  className="surface-card"
+                  style={{ marginTop: 12, padding: 12 }}
+                >
+                  <summary
+                    style={{
+                      cursor: "pointer",
+                      color: "#a1a1aa",
+                      fontSize: 14,
+                      userSelect: "none",
+                    }}
+                  >
+                    {ui.settings.haloScreenCalTitle}
+                  </summary>
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 4,
+                      marginTop: 10,
+                    }}
+                  >
+                    <p className="muted-copy">{ui.settings.haloScreenCalCopy}</p>
+                    {haloSettings.screenCalibration &&
+                    haloSettings.screenCalibration.regions.length > 0 ? (
+                      <p className="muted-copy">
+                        {ui.settings.haloScreenCalSummaryPrefix}{" "}
+                        {haloSettings.screenCalibration.regions.length}{" "}
+                        {ui.settings.haloScreenCalSummarySuffix} ·{" "}
+                        {ui.settings.haloScreenCalCapturedAt}{" "}
+                        {new Date(
+                          haloSettings.screenCalibration.capturedAtMs,
+                        ).toLocaleString(language === "cn" ? "zh-CN" : "en-US")}
+                      </p>
+                    ) : null}
+                    {screenCalDone ? (
+                      <p className="muted-copy diagnostic-message" style={{ color: "#34c759" }}>
+                        {ui.settings.haloScreenCalDone}
+                      </p>
+                    ) : null}
+                    {screenCalError ? (
+                      <p className="muted-copy diagnostic-message" role="alert">
+                        {screenCalError}
+                      </p>
+                    ) : null}
+                    {screenCalPlan.length > 0 ? (
+                      <>
+                        <div
+                          style={{
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: 4,
+                          }}
+                        >
+                          {screenCalPlan.map((item) => {
+                            const accepted =
+                              item.screenIndex < screenCalProgress.acceptedScreens;
+                            const capturing =
+                              item.screenIndex === screenCalProgress.acceptedScreens;
+                            return (
+                              <div
+                                key={item.screenId}
+                                className="settings-control-row"
+                                style={{ opacity: accepted ? 0.55 : 1 }}
+                              >
+                                <span
+                                  style={{
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 8,
+                                  }}
+                                >
+                                  <span
+                                    aria-hidden="true"
+                                    style={{
+                                      width: 24,
+                                      height: 24,
+                                      borderRadius: 6,
+                                      display: "inline-flex",
+                                      alignItems: "center",
+                                      justifyContent: "center",
+                                      fontSize: 13,
+                                      fontWeight: 600,
+                                      color: capturing ? "#111" : "#ddd",
+                                      backgroundColor: accepted
+                                        ? "#34c759"
+                                        : capturing
+                                          ? "#dcdcde"
+                                          : "#3a3a3c",
+                                    }}
+                                  >
+                                    {item.label}
+                                  </span>
+                                  {item.width}×{item.height} @ ({item.x},{item.y})
+                                </span>
+                                <span className="muted-copy">
+                                  {accepted ? "✓" : ""}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div className="settings-control-row">
+                          <span>{ui.settings.haloLiveReadout}</span>
+                          <span className="muted-copy">
+                            {ui.settings.haloScreenCalScreenLabel}{" "}
+                            {Math.min(
+                              screenCalProgress.acceptedScreens + 1,
+                              Math.max(screenCalProgress.totalScreens, 1),
+                            )}
+                            /{screenCalProgress.totalScreens} ·{" "}
+                            {ui.settings.haloScreenCalCornerLabel}{" "}
+                            {cornerOrdinal(screenCalProgress.cornersDone)}{" "}
+                            {cornerName(nextCorner(screenCalProgress.cornersDone), {
+                              tl: ui.settings.haloScreenCalCornerTl,
+                              tr: ui.settings.haloScreenCalCornerTr,
+                              br: ui.settings.haloScreenCalCornerBr,
+                              bl: ui.settings.haloScreenCalCornerBl,
+                            })}
+                          </span>
+                        </div>
+                        <div className="settings-control-row">
+                          <span>{ui.settings.haloLiveFace}</span>
+                          <span
+                            style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+                          >
+                            <span
+                              aria-hidden="true"
+                              style={{
+                                width: 10,
+                                height: 10,
+                                borderRadius: "50%",
+                                display: "inline-block",
+                                backgroundColor: haloDebug?.faceDetected
+                                  ? "#34c759"
+                                  : "#e0524f",
+                              }}
+                            />
+                            {haloDebug?.faceDetected
+                              ? ui.settings.haloPhaseIdle
+                              : ui.settings.haloPhaseSuspendedFace}
+                          </span>
+                        </div>
+                        <div className="settings-control-row">
+                          <span>{ui.settings.haloLiveRaw}</span>
+                          <span className="settings-number-input" style={{ textAlign: "right" }}>
+                            {formatHaloDegrees(haloDebug?.rawYaw)} /{" "}
+                            {formatHaloDegrees(haloDebug?.rawPitch)}
+                          </span>
+                        </div>
+                      </>
+                    ) : null}
+                    <div className="inline-actions">
+                      {screenCalPlan.length === 0 ? (
+                        <button
+                          type="button"
+                          className="primary-button compact-button"
+                          onClick={() => void beginScreenCal()}
+                          disabled={
+                            screenCalBusy ||
+                            !isTauri() ||
+                            !(haloStatus?.running ?? false)
+                          }
+                        >
+                          {haloSettings.screenCalibration?.regions.length
+                            ? ui.settings.haloScreenCalRecalibrate
+                            : ui.settings.haloScreenCalStart}
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="primary-button compact-button"
+                            onClick={() => void captureScreenCalCorner()}
+                            disabled={
+                              screenCalBusy || canFinishScreenCal(screenCalProgress)
+                            }
+                          >
+                            {ui.settings.haloScreenCalCapture}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button compact-button"
+                            onClick={() => void finishScreenCal()}
+                            disabled={
+                              screenCalBusy || !canFinishScreenCal(screenCalProgress)
+                            }
+                          >
+                            {ui.settings.haloScreenCalFinish}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button compact-button"
+                            onClick={() => void cancelScreenCal()}
+                            disabled={screenCalBusy}
+                          >
+                            {ui.settings.haloScreenCalCancel}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </details>
                 <HaloNumberField
                   label={ui.settings.haloDwell}
                   help={ui.settings.haloDwellHelp}
@@ -4772,6 +5124,15 @@ function formatHaloDegrees(value: number | undefined): string {
     return "--";
   }
   return `${value.toFixed(1)}°`;
+}
+
+// Screen-calibration progress line: localized corner name for the corner the
+// wizard is currently asking for.
+function cornerName(
+  corner: ScreenCalCorner,
+  labels: Record<ScreenCalCorner, string>,
+): string {
+  return labels[corner];
 }
 
 function resolveTheme(

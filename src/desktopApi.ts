@@ -514,6 +514,103 @@ export async function haloEmergencyStop(): Promise<void> {
   await invoke('halo_emergency_stop')
 }
 
+// FocusHalo S2: multi-screen region calibration wizard (转头切屏).
+
+/** Mirrors the Rust `HaloScreenCalPlanItem` (serde camelCase). */
+export interface HaloScreenCalPlanItem {
+  screenIndex: number
+  screenId: string
+  label: number
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** Mirrors the Rust `HaloScreenCalProgress` (serde camelCase). */
+export interface HaloScreenCalProgress {
+  acceptedScreens: number
+  totalScreens: number
+  cornersDone: number
+}
+
+/** Mirrors the Rust `HaloScreenCalExtent` (serde camelCase). */
+export interface HaloScreenCalExtent {
+  screenIndex: number
+  screenId: string
+  label: number
+  widthDeg: number
+  heightDeg: number
+}
+
+/** Mirrors the Rust `HaloScreenCalSummary` (serde camelCase). */
+export interface HaloScreenCalSummary {
+  totalScreens: number
+  capturedAtMs: number
+  refU: number
+  refV: number
+  transAlphaYaw: number
+  transAlphaPitch: number
+  extents: HaloScreenCalExtent[]
+}
+
+export type HaloScreenCalCorner = 'tl' | 'tr' | 'br' | 'bl'
+
+/**
+ * Start the wizard: builds the plan (board x then y, numbered 1..N), shows
+ * the native badge layer, and returns the plan. Rejects when FocusHalo is
+ * not running (user-facing Chinese reason).
+ */
+export async function haloScreenCalBegin(): Promise<HaloScreenCalPlanItem[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return invoke<HaloScreenCalPlanItem[]>('halo_screen_cal_begin')
+}
+
+/** Highlight `corner` of the screen at `screenIndex` on the badge layer. */
+export async function haloScreenCalSetStep(
+  screenIndex: number,
+  corner: HaloScreenCalCorner,
+): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_screen_cal_set_step', { screenIndex, corner })
+}
+
+/** Capture the currently highlighted corner; validates on the backend. */
+export async function haloScreenCalCapture(
+  screenIndex: number,
+  corner: HaloScreenCalCorner,
+): Promise<HaloScreenCalProgress> {
+  if (!isTauri()) {
+    return { acceptedScreens: 0, totalScreens: 0, cornersDone: 0 }
+  }
+
+  return invoke<HaloScreenCalProgress>('halo_screen_cal_capture', { screenIndex, corner })
+}
+
+/** Persist the finished calibration into focus_halo and tear the wizard down. */
+export async function haloScreenCalFinish(): Promise<HaloScreenCalSummary> {
+  if (!isTauri()) {
+    throw new Error('Available only in the Tauri desktop runtime.')
+  }
+
+  return invoke<HaloScreenCalSummary>('halo_screen_cal_finish')
+}
+
+/** Cancel the wizard: hide the badges, drop plan/corners. */
+export async function haloScreenCalCancel(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_screen_cal_cancel')
+}
+
 /**
  * Subscribe to the FocusHalo debug stream (5 Hz while tracking runs).
  * Returns an unlisten function; resolves to a no-op outside the Tauri
