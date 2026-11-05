@@ -136,6 +136,12 @@ export interface HaloDebugSnapshot {
   activeScreenId?: string | null
   /** 转头切屏：本快照窗口内发生了区域切换（引擎仅在提交 tick 置位）。 */
   screenSwitched?: boolean
+  /** S4 跨机切屏：本快照 tick 锁存的远程落点（仅提交 tick 出现）。 */
+  remoteSwitch?: {
+    screenId: string
+    boardX: number
+    boardY: number
+  } | null
 }
 
 export interface PairedController {

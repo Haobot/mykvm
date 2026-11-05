@@ -406,10 +406,12 @@ fn run_windows_subcommand() {
 /// runs it through the exact same processing function the app's receive hook
 /// uses (apply_focus_event): screen selection, window hit-test, passive
 /// border highlight (auto-cleared by the runtime's 5 s watcher) and, for
-/// `activate`, window activation. Coordinates are board/global logical
-/// points; screen ids here are the synthesized `screen-<index>` of the
-/// locally attached displays, and a point inside a display also resolves by
-/// containment, so any on-screen coordinate works.
+/// `activate`, window activation. `land` (S4) additionally warps this
+/// machine's cursor onto the landing point before activating — its printed
+/// outcome carries the warp target and acceptance. Coordinates are
+/// board/global logical points; screen ids here are the synthesized
+/// `screen-<index>` of the locally attached displays, and a point inside a
+/// display also resolves by containment, so any on-screen coordinate works.
 fn run_focus_receive_subcommand(args: &[String]) {
     let kind = args.get(2).map(String::as_str).unwrap_or("");
     let screen_id = args
@@ -439,9 +441,14 @@ fn run_focus_receive_subcommand(args: &[String]) {
             x,
             y,
         },
+        "land" => HaloFocusEvent::Land {
+            screen_id: screen_id.clone(),
+            x,
+            y,
+        },
         "clear" => HaloFocusEvent::Clear,
         _ => {
-            eprintln!("usage: halo_manual focus-receive <edge|candidate|activate|clear> <screen_id> <x> <y>");
+            eprintln!("usage: halo_manual focus-receive <edge|candidate|activate|land|clear> <screen_id> <x> <y>");
             std::process::exit(2);
         }
     };
@@ -471,12 +478,14 @@ fn run_focus_receive_subcommand(args: &[String]) {
     let mut runtime = HaloRuntime::new();
     let mut windows = create_window_service(&geometries);
     let mut activator = create_activator();
+    let mut warper = create_cursor_warper();
     let outcome = apply_focus_event(
         &event,
         &mut runtime,
         &screens,
         &mut *windows,
         &mut *activator,
+        &mut *warper,
     );
     println!(
         "outcome: kind={} window={:?} highlighted={} activated={} {}",

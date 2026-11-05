@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use super::activator::{ActivationOutcome, WindowActivator};
 use super::overlay::BorderFrame;
 use super::protocol::{decode_halo_focus_packet, FocusSender, HaloFocusEvent, HaloFocusPacket};
+use super::warp::{self, CursorWarper};
 use super::windows_layer::WindowService;
 use super::{HaloRuntime, OverlayScreenGeometry};
 use crate::LayoutState;
@@ -440,15 +441,18 @@ pub(crate) fn try_dispatch_received_focus(
 
 /// Apply one decoded remote event to this machine's passive display: find
 /// the target screen, hit-test the landing point, drive the halo overlay
-/// border and (for Activate) the window activator. Shared by the app hook
-/// and the `halo_manual focus-receive` rig, so both exercise identical
-/// behavior.
+/// border and (for Activate) the window activator. A `Land` additionally
+/// warps this machine's own cursor to the landing point first (S4 takeover:
+/// the sender's engine committed a region on one of our screens). Shared by
+/// the app hook and the `halo_manual focus-receive` rig, so both exercise
+/// identical behavior.
 pub fn apply_focus_event(
     event: &HaloFocusEvent,
     runtime: &mut HaloRuntime,
     screens: &[FocusScreen],
     windows: &mut dyn WindowService,
     activator: &mut dyn WindowActivator,
+    warper: &mut dyn CursorWarper,
 ) -> FocusDisplayOutcome {
     let kind = event_kind(event);
     let Some((screen_id, x, y)) = event_point(event) else {
@@ -473,6 +477,29 @@ pub fn apply_focus_event(
             detail: format!("unknown screen {screen_id}"),
         };
     };
+    // S4 Land: move this machine's own cursor onto the landing point before
+    // the focus work below. Board -> native through the local screen list
+    // (the same conversion the engine's local warps use). Best-effort: a
+    // failed warp logs and continues — window activation and the highlight
+    // still land where the sender aimed.
+    let mut detail_prefix = String::new();
+    if matches!(event, HaloFocusEvent::Land { .. }) {
+        let tuples: Vec<(String, OverlayScreenGeometry)> = screens
+            .iter()
+            .map(|screen| (screen.id.clone(), screen.geometry))
+            .collect();
+        match warp::board_to_native(&tuples, x, y) {
+            Some((native_x, native_y)) => {
+                let moved = warper.warp(native_x, native_y);
+                detail_prefix = format!("warped=({native_x},{native_y}) moved={moved} ");
+                log::info!("halo focus: land warp to ({native_x}, {native_y}) accepted={moved}");
+            }
+            None => {
+                detail_prefix = "warp skipped (no usable screen) ".into();
+                log::warn!("halo focus: land warp skipped: no usable screen for ({x},{y})");
+            }
+        }
+    }
     let hit = match windows.hit_test(x, y) {
         Ok(hit) => hit,
         Err(error) => {
@@ -508,14 +535,20 @@ pub fn apply_focus_event(
     };
     let highlighted = runtime.show_remote_highlight(frame, geometry);
     let mut activated = false;
-    let mut detail = String::new();
-    if matches!(event, HaloFocusEvent::Activate { .. }) {
+    let mut detail = detail_prefix;
+    if matches!(
+        event,
+        HaloFocusEvent::Activate { .. } | HaloFocusEvent::Land { .. }
+    ) {
+        // Land reuses the exact Activate activation path: raise the window
+        // under the landing point so the takeover arrives on the window the
+        // sender was looking at.
         let activation = activator.activate(window.id);
         activated = activation.activated;
-        detail = format!(
+        detail.push_str(&format!(
             "activated={} fell_back={} {}",
             activation.activated, activation.fell_back, activation.detail
-        );
+        ));
     }
     log::info!(
         "halo focus: {kind} at ({x},{y}) screen={screen_id} highlight={highlighted} window={:?} activated={activated} {detail}",
@@ -535,6 +568,7 @@ fn event_kind(event: &HaloFocusEvent) -> &'static str {
         HaloFocusEvent::Edge { .. } => "edge",
         HaloFocusEvent::Candidate { .. } => "candidate",
         HaloFocusEvent::Activate { .. } => "activate",
+        HaloFocusEvent::Land { .. } => "land",
         HaloFocusEvent::Clear => "clear",
     }
 }
@@ -543,7 +577,8 @@ fn event_point(event: &HaloFocusEvent) -> Option<(&str, f64, f64)> {
     match event {
         HaloFocusEvent::Edge { screen_id, x, y }
         | HaloFocusEvent::Candidate { screen_id, x, y }
-        | HaloFocusEvent::Activate { screen_id, x, y } => Some((screen_id, *x, *y)),
+        | HaloFocusEvent::Activate { screen_id, x, y }
+        | HaloFocusEvent::Land { screen_id, x, y } => Some((screen_id, *x, *y)),
         HaloFocusEvent::Clear => None,
     }
 }

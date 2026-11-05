@@ -49,6 +49,16 @@ pub enum HaloFocusEvent {
     /// it.
     #[serde(rename_all = "camelCase")]
     Activate { screen_id: String, x: f64, y: f64 },
+    /// S4 cross-machine takeover landing: the sender's head-turn engine
+    /// committed a region whose screen belongs to the receiver. The receiver
+    /// warps its own cursor to (x, y) (board coordinates) and activates the
+    /// window under the point — an `Activate` plus a pointer warp, marking
+    /// the moment control intent moved to this machine. Input still flows
+    /// through the normal controller path afterwards (see the pump-side
+    /// dispatch notes in lib.rs); Land only places the peer's cursor and
+    /// focus where the user's head already is.
+    #[serde(rename_all = "camelCase")]
+    Land { screen_id: String, x: f64, y: f64 },
     /// The halo left the edge (or the sender's pipeline stopped): the peer
     /// clears its highlight.
     Clear,
@@ -68,6 +78,7 @@ impl HaloFocusEvent {
             HaloFocusEvent::Edge { x, y, .. } => ("edge", point(*x, *y)),
             HaloFocusEvent::Candidate { x, y, .. } => ("candidate", point(*x, *y)),
             HaloFocusEvent::Activate { x, y, .. } => ("activate", point(*x, *y)),
+            HaloFocusEvent::Land { x, y, .. } => ("land", point(*x, *y)),
             HaloFocusEvent::Clear => ("clear", None),
         }
     }
@@ -224,6 +235,44 @@ mod tests {
             HaloFocusPacket::new("a".into(), "c".into(), "s".into(), HaloFocusEvent::Clear, 1);
         let decoded = decode_halo_focus_packet(&packet.encode().expect("encode")).expect("decode");
         assert_eq!(decoded.event, HaloFocusEvent::Clear);
+    }
+
+    #[test]
+    fn land_variant_roundtrips_and_keeps_its_own_dedupe_space() {
+        let land = HaloFocusEvent::Land {
+            screen_id: "peer-s".into(),
+            x: 120.0,
+            y: 340.5,
+        };
+        let decoded = decode_halo_focus_packet(
+            &HaloFocusPacket::new("a".into(), "c".into(), "s".into(), land.clone(), 3)
+                .encode()
+                .expect("encode"),
+        )
+        .expect("land roundtrips");
+        assert_eq!(decoded.event, land);
+        let wire = decoded.encode().expect("re-encode");
+        let text = String::from_utf8_lossy(&wire);
+        assert!(text.contains("land"), "kind tag in wire format: {text}");
+        // Same point as an Activate: a different variant tag is a state
+        // change, so a takeover landing right after a dwell activation is
+        // never collapsed by the throttle.
+        let activate = HaloFocusEvent::Activate {
+            screen_id: "peer-s".into(),
+            x: 120.0,
+            y: 340.5,
+        };
+        assert_ne!(land.dedupe_key(), activate.dedupe_key());
+        assert_eq!(
+            land.dedupe_key(),
+            HaloFocusEvent::Land {
+                screen_id: "other".into(),
+                x: 120.0,
+                y: 340.5
+            }
+            .dedupe_key(),
+            "coordinates dominate the key; screen_id rides in the payload"
+        );
     }
 
     #[test]

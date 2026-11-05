@@ -30,7 +30,8 @@ pub mod windows_layer;
 
 pub use activator::{create_activator, ActivationOutcome, WindowActivator};
 pub use engine::{
-    spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase, ScreenEntry,
+    spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase, RemoteSwitch,
+    ScreenEntry,
 };
 pub use filter::OneEuroFilter;
 pub use focus_router::{

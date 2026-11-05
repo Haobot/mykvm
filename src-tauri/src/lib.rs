@@ -2077,14 +2077,21 @@ fn handle_remote_halo_focus(app: &AppHandle, packet: &halo::HaloFocusPacket) {
             // A fresh window service per event: remote focus traffic is
             // state-change-only plus a 1 Hz refresh, so the enumeration
             // cost (a few ms) is negligible and no cache outlives the event.
+            // The cursor warper is fresh too: a Land takes the pointer onto
+            // the landing point; the engine owns the platform backend while
+            // tracking runs on this machine, but a receiving machine is
+            // normally NOT tracking, so a fresh backend is both cheap and
+            // conflict-free here.
             let mut windows = halo::create_window_service(&geometries);
             let mut activator = halo::create_activator();
+            let mut warper = halo::create_cursor_warper();
             let _outcome = halo::apply_focus_event(
                 event,
                 &mut halo,
                 &focus_screens,
                 &mut *windows,
                 &mut *activator,
+                &mut *warper,
             );
         }
     }
@@ -3155,6 +3162,9 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
             // cross-machine decision state has a single owner and no locks.
             let mut focus_forwarder = halo::FocusForwarder::new();
             let mut focus_last_logged_kind = String::new();
+            // S4: sequence numbers for the takeover Land packets (they are
+            // control events outside the focus router's throttle stream).
+            let mut land_seq: u64 = 0;
             loop {
                 // try_state returns None while the app is being torn down;
                 // holding the AppHandle clone does not block exit (the event
@@ -3162,6 +3172,10 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
                 let Some(state) = handle.try_state::<AppRuntime>() else {
                     break;
                 };
+                // S4: the remote switch latched anywhere in this drained
+                // window (last one wins), kept outside the block so the
+                // dispatch below can use it.
+                let remote_switch_latch;
                 let snapshot = {
                     let Ok(mut runtime) = state.halo.lock() else {
                         break;
@@ -3174,8 +3188,13 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
                     // the newest snapshot — a raw `.pop()` would usually
                     // miss the commit. Latch it from the whole drained
                     // window so the debug stream always shows the switch.
+                    // S4 `remote_switch` latches the same way.
                     let drained = runtime.drain_debug();
                     let screen_switched = drained.iter().any(|snapshot| snapshot.screen_switched);
+                    remote_switch_latch = drained
+                        .iter()
+                        .filter_map(|snapshot| snapshot.remote_switch.clone())
+                        .last();
                     let mut newest = drained.into_iter().last();
                     if let Some(snapshot) = newest.as_mut() {
                         snapshot.screen_switched = screen_switched;
@@ -3189,6 +3208,14 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
                         &mut focus_forwarder,
                         &mut focus_last_logged_kind,
                     );
+                    // S4: a remote switch latched by the engine this window
+                    // (last one wins; commits are cooldown-separated so a
+                    // window can carry at most one in practice). Dispatched
+                    // after the focus tick so the Land goes out with fresh
+                    // layout data.
+                    if let Some(remote_switch) = remote_switch_latch {
+                        halo_remote_switch_dispatch(state.inner(), remote_switch, &mut land_seq);
+                    }
                     let _ = handle.emit(HALO_DEBUG_EVENT, snapshot);
                 }
                 drop(state);
@@ -3207,6 +3234,7 @@ fn halo_focus_event_kind(event: &halo::HaloFocusEvent) -> &'static str {
         halo::HaloFocusEvent::Edge { .. } => "edge",
         halo::HaloFocusEvent::Candidate { .. } => "candidate",
         halo::HaloFocusEvent::Activate { .. } => "activate",
+        halo::HaloFocusEvent::Land { .. } => "land",
         halo::HaloFocusEvent::Clear => "clear",
     }
 }
@@ -3347,7 +3375,8 @@ fn halo_focus_pump_tick(
                     match &packet.event {
                         halo::HaloFocusEvent::Edge { x, y, .. }
                         | halo::HaloFocusEvent::Candidate { x, y, .. }
-                        | halo::HaloFocusEvent::Activate { x, y, .. } => Some((*x, *y)),
+                        | halo::HaloFocusEvent::Activate { x, y, .. }
+                        | halo::HaloFocusEvent::Land { x, y, .. } => Some((*x, *y)),
                         halo::HaloFocusEvent::Clear => None,
                     }
                 );
@@ -3368,6 +3397,130 @@ fn halo_focus_pump_tick(
         Err(error) => {
             log::warn!("halo focus: send {kind} to {} failed: {error}", target.name);
         }
+    }
+}
+
+/// S4: resolve a remote-switch screen id against the live layout. Returns the
+/// owning peer device plus the board point to land on: the live layout rect's
+/// center wins over the engine's advisory snapshot center, because the engine
+/// cannot see topology changes after calibration (see `RemoteSwitch`).
+/// `None` = the screen belongs to no non-local device (or the layout has no
+/// local role at all) — the caller drops the latch.
+fn halo_remote_switch_target<'a>(
+    layout: &'a LayoutState,
+    screen_id: &str,
+) -> Option<(&'a Device, (f64, f64))> {
+    for device in &layout.devices {
+        if device.role == "local" {
+            continue;
+        }
+        if let Some(screen) = device.screens.iter().find(|screen| screen.id == screen_id) {
+            let point = (
+                screen.x as f64 + screen.width as f64 / 2.0,
+                screen.y as f64 + screen.height as f64 / 2.0,
+            );
+            return Some((device, point));
+        }
+    }
+    None
+}
+
+/// S4 pump side: one engine-latched cross-machine switch. Resolves the
+/// owning peer from the live layout, sends the `Land` packet, and — per the
+/// machine-switch research below — does nothing else: entering remote
+/// control stays with the existing capture-loop paths.
+///
+/// # 机器切换路径调研结论 (S4, deliverable 4)
+///
+/// Controller-side takeover ("跨机接管") is NOT driven by the cursor position
+/// at packet time; it is driven by `input.rs`'s capture loop through the
+/// `switch_request` slot (`Mutex<Option<SwitchDirection>>`), drained by
+/// `drain_switch_request_macos` / `drain_switch_request_windows`. The slot
+/// carries only a *direction*; the entry target is picked by
+/// `request_screen_switch_from_point` from the *current cursor's* local
+/// screen and the layout adjacency (`build_input_targets` edges). There is no
+/// crate-public API to force-enter a specific peer/screen (`enter_remote_*`
+/// is platform-private to input.rs and takes a fully-built `ActiveTarget`).
+/// Firing the switch-request slot from here would only produce a
+/// direction-based entry that may aim at the wrong peer, would race the
+/// user's current remote/local state, and would bypass the capture loop's
+/// anchor bookkeeping. Therefore: Land alone places the peer's cursor and
+/// focus; when the user then moves the physical mouse toward that edge (or
+/// presses the direction hotkey), the existing edge-crossing/hotkey path
+/// enters remote control and input flows to the peer through the normal
+/// channel. If that entry later gains a "land at (x, y)" capability, this is
+/// the call site to extend.
+fn halo_remote_switch_dispatch(state: &AppRuntime, latch: halo::RemoteSwitch, land_seq: &mut u64) {
+    let Ok(layout) = state.layout.try_lock() else {
+        return;
+    };
+    let Some((device, (board_x, board_y))) = halo_remote_switch_target(&layout, &latch.screen_id)
+    else {
+        log::warn!(
+            "halo focus: remote switch screen {} belongs to no peer in the layout; Land dropped",
+            latch.screen_id
+        );
+        return;
+    };
+    let device = device.clone();
+    let source_device_id = local_peer_from_layout(&layout).id;
+    let cluster_id = layout.cluster_id.clone();
+    let pair_secret = layout.pair_secret.clone();
+    drop(layout);
+
+    if cluster_id.trim().is_empty() || pair_secret.trim().is_empty() {
+        return; // unpaired: no credentials to authorize with, stay silent
+    }
+    if !device.online || device.transport_public_key.trim().is_empty() {
+        log::info!(
+            "halo focus: remote switch peer {} offline/unkeyed; Land dropped",
+            device.name
+        );
+        return;
+    }
+    *land_seq = land_seq.wrapping_add(1);
+    let event = halo::HaloFocusEvent::Land {
+        screen_id: latch.screen_id.clone(),
+        x: board_x,
+        y: board_y,
+    };
+    let packet =
+        halo::HaloFocusPacket::new(source_device_id, cluster_id, pair_secret, event, *land_seq);
+    let payload = match packet.encode() {
+        Ok(payload) => payload,
+        Err(error) => {
+            log::warn!("halo focus: {error}");
+            return;
+        }
+    };
+    let Some(transport) = state.quic_transport_handle() else {
+        return;
+    };
+    // Target resolution mirrors halo_focus_pump_tick / send_secure_attention_control.
+    let peer = transport.peer(
+        format!(
+            "{}:{}",
+            device.host,
+            normalize_quic_port(device.transport_port, device.quic_port)
+        ),
+        device.transport_public_key.clone(),
+        device.protocol_version,
+    );
+    match transport.send_datagram(peer, payload) {
+        Ok(true) => log::info!(
+            "halo focus: sent land takeover to {} (screen {}, board ({board_x}, {board_y}), seq {})",
+            device.name,
+            latch.screen_id,
+            *land_seq
+        ),
+        Ok(false) => log::debug!(
+            "halo focus: peer {} reconnecting; land takeover dropped",
+            device.name
+        ),
+        Err(error) => log::warn!(
+            "halo focus: send land takeover to {} failed: {error}",
+            device.name
+        ),
     }
 }
 
@@ -17024,6 +17177,31 @@ mod tests {
         }
     }
 
+    /// Device builder for S4/S2 tests: `role` is "local" or "client";
+    /// screens are set separately by the caller.
+    fn test_device(id: &str, name: &str, role: &str, online: bool) -> Device {
+        Device {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            host: format!("{name} / 10.0.0.9"),
+            transport_port: 47833,
+            quic_port: 47834,
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            color: "#0f766e".into(),
+            online,
+            input_ready: false,
+            upgrading: false,
+            upgrading_until_ms: 0,
+            role: role.into(),
+            source: "detected".into(),
+            screens: Vec::new(),
+        }
+    }
+
     // ---- S3: pump active-screen resolution + engine screen entries ----
 
     #[test]
@@ -17060,26 +17238,9 @@ mod tests {
     #[test]
     fn halo_screen_entries_mirror_the_layout_screen_list() {
         let mut layout = test_layout();
-        layout.devices = vec![Device {
-            id: "local-device".into(),
-            name: "local".into(),
-            platform: "macos".into(),
-            host: String::new(),
-            transport_port: 0,
-            quic_port: 0,
-            transport_public_key: String::new(),
-            protocol_version: 0,
-            color: "#000".into(),
-            online: false,
-            input_ready: false,
-            upgrading: false,
-            upgrading_until_ms: 0,
-            role: "local".into(),
-            source: "detected".into(),
-            screens: vec![wizard_screen("left", 0, 0), wizard_screen("right", 1920, 0)],
-            pointer_speed: 1.0,
-            scroll_speed: 1.0,
-        }];
+        layout.devices = vec![test_device("local-device", "local", "local", false)];
+        layout.devices[0].screens =
+            vec![wizard_screen("left", 0, 0), wizard_screen("right", 1920, 0)];
         let entries = halo_screen_entries(&layout);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].screen_id, "left");
@@ -17088,6 +17249,36 @@ mod tests {
         assert_eq!(entries[1].geometry.x, 1920.0);
         // Native origins are the identity on non-Windows (macOS points).
         assert_eq!(entries[1].geometry.native_x, 1920.0);
+    }
+
+    // ---- S4: remote switch target resolution ----
+
+    #[test]
+    fn halo_remote_switch_target_resolves_the_owning_peer_and_live_center() {
+        let mut layout = test_layout();
+        layout.devices = vec![
+            {
+                let mut local = test_device("local-device", "Local", "local", false);
+                local.screens = vec![wizard_screen("local-1", 0, 0)];
+                local
+            },
+            {
+                let mut peer = test_device("peer-a", "Mac mini", "client", true);
+                peer.screens = vec![wizard_screen("peer-s", -1920, 0)];
+                peer
+            },
+        ];
+        // The screen resolves to the peer, and the point is the LIVE layout
+        // rect's center (not the engine's advisory snapshot).
+        let (device, point) =
+            halo_remote_switch_target(&layout, "peer-s").expect("peer screen resolves");
+        assert_eq!(device.id, "peer-a");
+        assert_eq!(device.name, "Mac mini");
+        assert_eq!(point, (-960.0, 540.0));
+        // Local screens are never remote targets even when the id matches.
+        assert!(halo_remote_switch_target(&layout, "local-1").is_none());
+        // Unknown screen: None (the dispatch drops the latch).
+        assert!(halo_remote_switch_target(&layout, "gone").is_none());
     }
 
     fn pose(yaw: f64, pitch: f64) -> halo::screen_map::PosePoint {

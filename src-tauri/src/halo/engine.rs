@@ -168,6 +168,27 @@ pub struct DebugSnapshot {
     pub active_screen_id: Option<String>,
     /// S3: true exactly on the tick a region (screen) switch committed.
     pub screen_switched: bool,
+    /// S4: a region commit (or screen undo) whose target screen is NOT in the
+    /// engine's local screen list — the cross-machine takeover landing. The
+    /// engine cannot reach the live layout, so it latches the target here for
+    /// exactly one tick and the app-side pump (5 Hz) resolves the owning peer
+    /// from the layout and sends the `Land` packet. The pump drains the whole
+    /// debug window and keeps the last latch — the same pattern as the
+    /// `screen_switched` flag.
+    pub remote_switch: Option<RemoteSwitch>,
+}
+
+/// S4: one cross-machine switch target latched by the engine. `board_x` /
+/// `board_y` is the target's board-space center computed from the
+/// calibration's board snapshot — advisory only, because the engine cannot
+/// see the live layout; the pump prefers the live rect from the layout when
+/// the screen resolves there.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSwitch {
+    pub screen_id: String,
+    pub board_x: f64,
+    pub board_y: f64,
 }
 
 /// Engine wiring snapshot handed to [`spawn`]. Not `Clone`/`Debug` because it
@@ -284,6 +305,10 @@ pub(crate) struct EngineState {
     /// Cursor warp backend (real platform calls in production, a recorder in
     /// tests).
     warper: Box<dyn CursorWarper>,
+    /// S4: latched cross-machine switch target, drained into the next
+    /// snapshot (`remote_switch`). Set by the region-commit remote path and
+    /// by the undo path when the previous screen is not local.
+    pending_remote_switch: Option<RemoteSwitch>,
 }
 
 impl EngineState {
@@ -320,6 +345,7 @@ impl EngineState {
             warp_guard_until: None,
             last_uv: (0.5, 0.5),
             warper: config.warper,
+            pending_remote_switch: None,
         }
     }
 
@@ -670,6 +696,10 @@ pub(crate) fn step(
             .zip(state.screen_cal.as_ref())
             .map(|(idx, cal)| cal.regions[idx].screen_id.clone()),
         screen_switched: committed_switch,
+        // S4: drain the latched cross-machine target (set this tick by the
+        // region-commit remote path, or in the previous run-loop iteration by
+        // an undo command) so it appears on exactly one snapshot.
+        remote_switch: state.pending_remote_switch.take(),
     };
     (visual, local, snapshot)
 }
@@ -731,8 +761,8 @@ fn maybe_warp_for_region_commit(
     // the calibration's stale board snapshot) is authoritative: with a
     // drifted topology the region quad and the live screen can disagree, and
     // warping to the calibration's coordinates could land the pointer on the
-    // wrong physical display. No entry -> no warp (the visual switch already
-    // kept the current screen).
+    // wrong physical display. No entry -> the screen is not one of ours
+    // (S4): the cross-machine takeover path below.
     let Some(cal) = state.screen_cal.as_ref() else {
         return;
     };
@@ -748,7 +778,37 @@ fn maybe_warp_for_region_commit(
             )
         });
     let Some((board_x, board_y)) = entry else {
-        log::debug!("halo: region screen {screen_id} missing from the screen list; warp skipped");
+        // S4 remote path: the committed region's screen belongs to a peer.
+        // No local warp (the pointer would land nowhere useful); latch the
+        // target for the app-side pump, which resolves the owning peer from
+        // the live layout and sends the `Land` packet. Same gates, cooldown
+        // re-arm and undo record as a local warp — the takeover is the
+        // remote analogue of the pointer move. The board center comes from
+        // the calibration's snapshot (the engine has no live layout); the
+        // pump prefers the live rect when the screen resolves there.
+        let region = &cal.regions[idx];
+        let latch = RemoteSwitch {
+            screen_id: screen_id.clone(),
+            board_x: region.board.x + region.board.width / 2.0,
+            board_y: region.board.y + region.board.height / 2.0,
+        };
+        let cooldown_ms = state.settings.cooldown_ms as u64;
+        state.warp_cooldown_until = Some(now_ms.saturating_add(cooldown_ms));
+        state.warp_guard_until = Some(now_ms.saturating_add(WARP_GUARD_MS));
+        undo_push(
+            &mut state.undo_stack,
+            UndoEntry {
+                previous_foreground_id: None,
+                previous_screen_id,
+                switched_at_ms: now_ms,
+            },
+        );
+        state.pending_remote_switch = Some(latch);
+        log::info!(
+            "halo: region {idx} targets remote screen {screen_id}; Land takeover latched at ({}, {})",
+            cal.regions[idx].board.x + cal.regions[idx].board.width / 2.0,
+            cal.regions[idx].board.y + cal.regions[idx].board.height / 2.0
+        );
         return;
     };
     let tuples: Vec<(String, OverlayScreenGeometry)> = state
@@ -785,6 +845,11 @@ fn maybe_warp_for_region_commit(
 /// entry is consumed either way (a gated skip cannot be retried, matching
 /// the undo window semantics). The region selector is left alone: the head
 /// decides the next region on its own after the hysteresis settles.
+///
+/// S4: a previous screen that is not in the local list is a remote screen —
+/// the undo latches a remote switch instead (board center from the
+/// calibration's snapshot), so the pump sends the `Land` back to the owning
+/// peer. Same cooldown/guard re-arm as the local undo.
 fn undo_warp_to_screen(state: &mut EngineState, screen_id: &str, now_ms: u64) -> bool {
     if state
         .warp_cooldown_until
@@ -807,8 +872,33 @@ fn undo_warp_to_screen(state: &mut EngineState, screen_id: &str, now_ms: u64) ->
             )
         });
     let Some((board_x, board_y)) = target else {
-        log::warn!("halo: undo screen {screen_id} not in the engine screen list; skipped");
-        return false;
+        // S4 remote undo. The engine's only board data is the calibration's
+        // snapshot; without a matching region there is nothing to aim at and
+        // the undo is skipped (the entry is still consumed by the caller).
+        let region = state
+            .screen_cal
+            .as_ref()
+            .and_then(|cal| cal.regions.iter().find(|r| r.screen_id == screen_id));
+        let Some(region) = region else {
+            log::warn!(
+                "halo: undo screen {screen_id} not local and not calibrated; remote undo skipped"
+            );
+            return false;
+        };
+        state.pending_remote_switch = Some(RemoteSwitch {
+            screen_id: screen_id.to_string(),
+            board_x: region.board.x + region.board.width / 2.0,
+            board_y: region.board.y + region.board.height / 2.0,
+        });
+        let cooldown_ms = state.settings.cooldown_ms as u64;
+        state.warp_cooldown_until = Some(now_ms.saturating_add(cooldown_ms));
+        state.warp_guard_until = Some(now_ms.saturating_add(WARP_GUARD_MS));
+        log::info!(
+            "halo: undo switch -> remote screen {screen_id}; Land return latched at ({}, {})",
+            region.board.x + region.board.width / 2.0,
+            region.board.y + region.board.height / 2.0
+        );
+        return true;
     };
     let tuples: Vec<(String, OverlayScreenGeometry)> = state
         .screens
@@ -2210,36 +2300,182 @@ mod tests {
         assert_eq!(warps.warp_count(), 2);
     }
 
-    #[test]
-    fn s3_missing_screen_entry_keeps_the_current_screen_without_warp() {
+    // (The old `s3_missing_screen_entry_keeps_the_current_screen_without_warp`
+    // is superseded by `s4_remote_commit_latches_once_without_local_warp_and_
+    // records_undo` below: a commit whose screen is not in the local list now
+    // takes the S4 remote path instead of silently doing nothing.)
+
+    // ------------------------------------------------------------------
+    // S4 tests: cross-machine switches (remote region targets)
+    // ------------------------------------------------------------------
+
+    /// Region-mode state whose screen list knows only the local s1: every
+    /// commit to region 1 (s2) takes the remote path. `settle_ms`/`cooldown`
+    /// mirror [`s3_state`].
+    fn s4_state(warp_succeeds: bool) -> (EngineState, WarpRecorder) {
         let (activator, _) = fake_activator();
-        let recorder = WarpRecorder::new(true);
+        let recorder = WarpRecorder::new(warp_succeeds);
         let handle = recorder.clone();
         let mut settings = FocusHaloSettings::default();
         settings.screen_warp_enabled = true;
         settings.region_settle_ms = 300;
+        settings.cooldown_ms = 500;
         let state = EngineState::new(EngineConfig {
             settings,
             calibration: CalibrationProfile::default(),
-            screen: test_screen(),
+            screen: s3_screen("s1", 0.0).geometry,
             window_service: None,
             activator,
-            // Only screen 1 known; region 1 (s2) has no matching entry.
             screens: vec![s3_screen("s1", 0.0)],
             screen_calibration: Some(s3_calibration()),
             warper: Box::new(recorder),
         });
-        let mut s = state;
+        (state, handle)
+    }
+
+    #[test]
+    fn s4_remote_commit_latches_once_without_local_warp_and_records_undo() {
+        let (mut s, warps) = s4_state(true);
+        // Acquire the local region 0 (s1): a normal local warp.
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (t1, snap) = s3_hold_until(&mut s, 33, -6.0, 5.0, 1000, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(snap.remote_switch, None, "local commit latches nothing");
+        assert_eq!(warps.calls(), vec![(500.0, 250.0)]);
+        // Hold past the cooldown, then jump to region 1 (s2, remote) and
+        // commit: the screen stays s1, no local warp fires, and the target
+        // latches onto exactly one snapshot.
+        s3_hold_until(&mut s, t1 + 33, -6.0, 5.0, t1 + 700, false);
+        let t2 = s3_jump(&mut s, t1 + 733, 6.0, 5.0);
+        let (t3, snap) = s3_hold_until(&mut s, t2 + 33, 6.0, 5.0, t1 + 2400, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(
+            s.screen,
+            s3_screen("s1", 0.0).geometry,
+            "screen stays local"
+        );
+        assert_eq!(
+            warps.calls(),
+            vec![(500.0, 250.0)],
+            "no local warp for a remote target"
+        );
+        assert_eq!(
+            snap.remote_switch,
+            Some(RemoteSwitch {
+                screen_id: "s2".into(),
+                // Board center from the calibration's snapshot.
+                board_x: 500.0,
+                board_y: 250.0
+            })
+        );
+        // The undo entry records the pre-switch local screen.
+        assert_eq!(s.undo_stack.len(), 2);
+        assert_eq!(s.undo_stack[1].previous_screen_id, Some("s1".into()));
+        // Exactly one tick: the next snapshot drains to None again.
+        let (_, _, snap) = step(&mut s, Some(s3_sample(t3 + 33, 6.0)), t3 + 33, false);
+        assert_eq!(snap.remote_switch, None);
+    }
+
+    #[test]
+    fn s4_remote_commit_inside_cooldown_gates_the_latch() {
+        let (mut s, warps) = s4_state(true);
+        // Acquire s1 at ~333 (cooldown until ~833).
         step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
         let (_, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 400, true);
-        // Commit to region 1 (s2 not in the list): screen stays, no warp,
-        // no undo entry (nothing switched for the pointer).
-        let t = s3_jump(&mut s, 433, 6.0, 5.0);
-        let (_, snap) = s3_hold_until(&mut s, t + 33, 6.0, 5.0, 2000, true);
-        assert_eq!(snap.screen_switched, true, "the region itself commits");
-        assert_eq!(snap.active_screen_id.as_deref(), Some("s2"));
-        assert_eq!(s.screen, test_screen(), "unknown screen keeps the old one");
-        assert_eq!(handle.warp_count(), 1, "only the initial acquisition warp");
-        assert_eq!(s.undo_stack.len(), 1, "no undo entry without a warp");
+        assert_eq!(warps.warp_count(), 1);
+        // Commit to the remote region while still inside the cooldown: no
+        // local warp AND no remote latch (the gates are shared).
+        let t2 = s3_jump(&mut s, 433, 6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t2 + 33, 6.0, 5.0, 800, true);
+        assert_eq!(snap.screen_switched, true);
+        assert_eq!(snap.remote_switch, None, "cooldown gates the takeover too");
+        assert_eq!(s.undo_stack.len(), 1, "no undo entry without a switch");
+    }
+
+    #[test]
+    fn s4_remote_commit_skipped_when_pipeline_suspended() {
+        let (mut s, warps) = s4_state(true);
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (t1, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 1000, true);
+        s3_hold_until(&mut s, t1 + 33, -6.0, 5.0, t1 + 700, false);
+        // Jump to the remote region with physical input active: the commit
+        // happens visually, but the pipeline is suspended so neither a local
+        // warp nor a remote latch fires.
+        let mut t2 = s3_jump(&mut s, t1 + 733, 6.0, 5.0);
+        loop {
+            let (_, _, snap) = step(&mut s, Some(s3_sample(t2 + 33, 6.0)), t2 + 33, true);
+            if snap.screen_switched {
+                assert_eq!(snap.remote_switch, None, "suspension gates the takeover");
+                break;
+            }
+            if t2 >= t1 + 4000 {
+                panic!("commit never arrived");
+            }
+            t2 += 33;
+        }
+        assert_eq!(warps.warp_count(), 1);
+        assert_eq!(s.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn s4_undo_of_a_remote_switch_warps_back_to_the_local_screen() {
+        let (mut s, warps) = s4_state(true);
+        // Acquire s1, switch to the remote s2 (latches the takeover).
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (t1, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 1000, true);
+        s3_hold_until(&mut s, t1 + 33, -6.0, 5.0, t1 + 700, false);
+        let t2 = s3_jump(&mut s, t1 + 733, 6.0, 5.0);
+        let (_, snap) = s3_hold_until(&mut s, t2 + 33, 6.0, 5.0, t1 + 2400, true);
+        assert!(snap.remote_switch.is_some());
+        // Undo after the cooldown: the previous screen (s1) is local, so the
+        // pointer warps back locally and nothing remote latches.
+        drive(&mut s, EngineCommand::UndoSwitch, t1 + 3400);
+        assert_eq!(
+            warps.calls(),
+            vec![(500.0, 250.0), (500.0, 250.0)],
+            "undo of a remote switch warps back to the local screen"
+        );
+        let (_, _, snap) = step(&mut s, None, t1 + 3500, false);
+        assert_eq!(
+            snap.remote_switch, None,
+            "no remote return for a local undo"
+        );
+    }
+
+    #[test]
+    fn s4_undo_into_a_remote_screen_latches_the_return_land() {
+        // The engine cannot reach a remote screen by normal play (it starts
+        // on a local screen), so the remote-previous entry is injected
+        // directly: exactly what a commit chain that passes through a remote
+        // screen would leave behind.
+        let (mut s, warps) = s4_state(true);
+        // Acquire s1 so the pipeline is in region mode and the undo window
+        // semantics are live.
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (t1, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 1000, true);
+        undo_push(
+            &mut s.undo_stack,
+            UndoEntry {
+                previous_foreground_id: None,
+                previous_screen_id: Some("s2".into()),
+                switched_at_ms: t1 + 100,
+            },
+        );
+        drive(&mut s, EngineCommand::UndoSwitch, t1 + 1200);
+        let (_, _, snap) = step(&mut s, None, t1 + 1300, false);
+        assert_eq!(
+            snap.remote_switch,
+            Some(RemoteSwitch {
+                screen_id: "s2".into(),
+                board_x: 500.0,
+                board_y: 250.0
+            }),
+            "undo into a remote screen latches the return Land"
+        );
+        assert_eq!(
+            warps.warp_count(),
+            1,
+            "the remote undo performs no local warp"
+        );
     }
 }
