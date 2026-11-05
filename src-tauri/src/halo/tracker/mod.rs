@@ -63,6 +63,12 @@ pub struct HeadSample {
     pub yaw_deg: f64,
     pub pitch_deg: f64,
     pub roll_deg: f64,
+    /// Face-box center x in the camera frame, normalized 0..1 (left = 0,
+    /// origin top-left). 0.0 when no face was detected.
+    pub u: f64,
+    /// Face-box center y in the camera frame, normalized 0..1 (top = 0).
+    /// 0.0 when no face was detected.
+    pub v: f64,
 }
 
 /// Candidate model directories, most likely first.
@@ -171,6 +177,8 @@ impl PoseEngine {
             yaw_deg: 0.0,
             pitch_deg: 0.0,
             roll_deg: 0.0,
+            u: 0.0,
+            v: 0.0,
         };
         let Some(img) = RgbImage::from_raw(frame.width, frame.height, frame.data.clone()) else {
             log::warn!(
@@ -190,17 +198,20 @@ impl PoseEngine {
             let Some(face) = faces.into_iter().next() else {
                 return Ok(sample);
             };
+            let (u, v) = face.center_uv(img.width(), img.height());
             let (cx, cy, cw, ch) = pose::crop_window(&img, &face, pose::CROP_EXPAND);
             let crop = image::imageops::crop_imm(&img, cx, cy, cw, ch).to_image();
             let mut pose_session = self.pose.lock().map_err(lock_poisoned)?;
             let [pitch, yaw, roll] = pose::estimate_pose(&mut pose_session, &crop, self.pose_dims)?;
             drop(pose_session);
             Ok(HeadSample {
+                ts_ms: frame.ts_ms,
                 face_detected: true,
                 yaw_deg: yaw,
                 pitch_deg: pitch,
                 roll_deg: roll,
-                ..sample
+                u,
+                v,
             })
         })();
 

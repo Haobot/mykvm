@@ -5,10 +5,13 @@
 
 pub use crate::halo::params::FocusHaloSettings;
 
+pub mod badge;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod win32;
+
+pub use badge::{BadgeCorner, BadgeLayer, BadgeScreen};
 
 /// What the halo ring should currently look like.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -21,17 +21,17 @@ use crate::halo::params::FocusHaloSettings;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct NsPoint {
-    x: f64,
-    y: f64,
+pub(crate) struct NsPoint {
+    pub x: f64,
+    pub y: f64,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct NsRect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
+pub(crate) struct NsRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
 }
 
 // NSMainMenuWindowLevel-ish; above normal windows (same anchor as the drag
@@ -113,49 +113,57 @@ extern "C" {
 
 /// Raw CGColorRef (r, g, b, a tuple). setStrokeColor: is a strong property,
 /// so the returned +1 reference is handed over to the layer, not released.
-fn cg_color(color: (f64, f64, f64, f64)) -> *mut c_void {
+pub(crate) fn cg_color(color: (f64, f64, f64, f64)) -> *mut c_void {
     unsafe { CGColorCreateGenericRGB(color.0, color.1, color.2, color.3) }
 }
 
-unsafe fn cls(name: &[u8]) -> *mut c_void {
+// Shared low-level objc helpers: also used by the sibling badge overlay
+// (badge.rs) so the codebase keeps exactly one raw-msgSend style per file
+// cluster.
+pub(crate) unsafe fn cls(name: &[u8]) -> *mut c_void {
     objc_getClass(name.as_ptr() as *const c_char)
 }
-unsafe fn sel(name: &[u8]) -> *mut c_void {
+pub(crate) unsafe fn sel(name: &[u8]) -> *mut c_void {
     sel_registerName(name.as_ptr() as *const c_char)
 }
-unsafe fn send(obj: *mut c_void, s: *mut c_void) -> *mut c_void {
+pub(crate) unsafe fn send(obj: *mut c_void, s: *mut c_void) -> *mut c_void {
     let f: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, s)
 }
-unsafe fn send1(obj: *mut c_void, s: *mut c_void, a: *mut c_void) -> *mut c_void {
+pub(crate) unsafe fn send1(obj: *mut c_void, s: *mut c_void, a: *mut c_void) -> *mut c_void {
     let f: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, s, a)
 }
-unsafe fn send2(obj: *mut c_void, s: *mut c_void, a: *mut c_void, b: *mut c_void) -> *mut c_void {
+pub(crate) unsafe fn send2(
+    obj: *mut c_void,
+    s: *mut c_void,
+    a: *mut c_void,
+    b: *mut c_void,
+) -> *mut c_void {
     let f: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, s, a, b)
 }
-unsafe fn send_f64(obj: *mut c_void, selector: &[u8]) -> f64 {
+pub(crate) unsafe fn send_f64(obj: *mut c_void, selector: &[u8]) -> f64 {
     let f: extern "C" fn(*mut c_void, *mut c_void) -> f64 =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, sel(selector))
 }
-unsafe fn set_bool(obj: *mut c_void, selector: &[u8], value: bool) {
+pub(crate) unsafe fn set_bool(obj: *mut c_void, selector: &[u8], value: bool) {
     let f: extern "C" fn(*mut c_void, *mut c_void, bool) =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, sel(selector), value);
 }
 // CGFloat-sized setters: setLineWidth:, setStrokeEnd:, setContentsScale:,
 // setAlphaValue: …
-unsafe fn set_f64(obj: *mut c_void, selector: &[u8], value: f64) {
+pub(crate) unsafe fn set_f64(obj: *mut c_void, selector: &[u8], value: f64) {
     let f: extern "C" fn(*mut c_void, *mut c_void, f64) =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, sel(selector), value);
 }
-unsafe fn set_rect(obj: *mut c_void, selector: &[u8], rect: NsRect) {
+pub(crate) unsafe fn set_rect(obj: *mut c_void, selector: &[u8], rect: NsRect) {
     let f: extern "C" fn(*mut c_void, *mut c_void, NsRect) =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, sel(selector), rect);
@@ -167,11 +175,11 @@ unsafe fn set_frame_display(obj: *mut c_void, rect: NsRect, display: bool) {
     f(obj, sel(b"setFrame:display:\0"), rect, display);
 }
 
-fn main_queue() -> *mut c_void {
+pub(crate) fn main_queue() -> *mut c_void {
     unsafe { &_dispatch_main_q as *const c_void as *mut c_void }
 }
 
-fn on_main(work: extern "C" fn(*mut c_void), ctx: *mut c_void) {
+pub(crate) fn on_main(work: extern "C" fn(*mut c_void), ctx: *mut c_void) {
     unsafe { dispatch_async_f(main_queue(), ctx, work) }
 }
 
@@ -454,11 +462,12 @@ extern "C" fn apply_frame(ctx: *mut c_void) {
     }
 }
 
-/// Shared NSWindow boilerplate for both overlay windows: borderless,
-/// transparent, shadowless, click-through, level-25, all-spaces window with a
-/// layer-backed content view. Returns (window, host layer); the host is null
-/// when the view could not be created (callers degrade to a plain window).
-unsafe fn make_click_through_window(rect: NsRect) -> (*mut c_void, *mut c_void) {
+/// Shared NSWindow boilerplate for the halo, border and badge overlay
+/// windows: borderless, transparent, shadowless, click-through, level-25,
+/// all-spaces window with a layer-backed content view. Returns (window, host
+/// layer); the host is null when the view could not be created (callers
+/// degrade to a plain window).
+pub(crate) unsafe fn make_click_through_window(rect: NsRect) -> (*mut c_void, *mut c_void) {
     let alloc = send(cls(b"NSWindow\0"), sel(b"alloc\0"));
     // initWithContentRect:styleMask:backing:defer: (borderless=0, buffered=2)
     let init: extern "C" fn(*mut c_void, *mut c_void, NsRect, u64, u64, bool) -> *mut c_void =

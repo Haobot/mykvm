@@ -852,6 +852,8 @@ mod tests {
             yaw_deg: yaw,
             pitch_deg: pitch,
             roll_deg: 0.0,
+            u: 0.5,
+            v: 0.5,
         }
     }
 

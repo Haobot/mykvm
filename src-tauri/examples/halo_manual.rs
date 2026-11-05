@@ -10,6 +10,7 @@
 //!   cargo run --example halo_manual -- windows
 //!   cargo run --example halo_manual -- activate <window_id>
 //!   cargo run --example halo_manual -- focus-receive <kind> <screen_id> <x> <y>
+//!   cargo run --example halo_manual -- badges [clear_after_ms]
 //!
 //! Examples:
 //!   halo_manual 756 491 idle 160            # static ring at screen center
@@ -25,12 +26,18 @@
 //!                                           # event through the real
 //!                                           # receive path (no second
 //!                                           # machine needed)
+//!   halo_manual badges 3000 [tl|tr|br|bl]   # S2: number badges on every
+//!                                           # display (no camera needed),
+//!                                           # auto-cleared after 3 s; the
+//!                                           # optional corner highlights
+//!                                           # screen 1's bracket set
 //!
 //! The process just pumps the main run loop; Ctrl-C exits.
 
 use mykvm_lib::halo::{
-    apply_focus_event, create_activator, create_window_service, BorderFrame, FocusHaloSettings,
-    FocusScreen, HaloFocusEvent, HaloRuntime, HaloVisual, OverlayScreenGeometry,
+    apply_focus_event, create_activator, create_window_service, BadgeCorner, BadgeLayer,
+    BadgeScreen, BorderFrame, FocusHaloSettings, FocusScreen, HaloFocusEvent, HaloRuntime,
+    HaloVisual, OverlayScreenGeometry,
 };
 
 #[cfg(target_os = "macos")]
@@ -89,6 +96,10 @@ fn main() {
         }
         Some("focus-receive") => {
             run_focus_receive_subcommand(&args);
+            return;
+        }
+        Some("badges") => {
+            run_badges_subcommand(&args);
             return;
         }
         _ => {}
@@ -468,6 +479,90 @@ fn run_focus_receive_subcommand(args: &[String]) {
     }
     // Keep pumping so the overlay's async blocks execute and the runtime's
     // watcher thread can clear the highlight on schedule.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        run_main_loop();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// `halo_manual badges [clear_after_ms]` (appended): S2 badge-layer
+/// verification rig. Shows the numbered badge (center label + four corner
+/// brackets) on every attached display — exactly what the multi-screen
+/// region wizard draws — without needing a camera, then optionally clears
+/// after `clear_after_ms`. Run with two or more displays to check each
+/// screen gets its own window and number.
+fn run_badges_subcommand(args: &[String]) {
+    let clear_after_ms: Option<u64> = args.get(2).and_then(|value| value.parse().ok());
+    // Optional third arg: highlight this corner of screen 1 after showing
+    // (exercises the set_active path: active corner brightens, others dim).
+    let active_corner = args.get(3).and_then(|value| match value.as_str() {
+        "tl" => Some(BadgeCorner::Tl),
+        "tr" => Some(BadgeCorner::Tr),
+        "br" => Some(BadgeCorner::Br),
+        "bl" => Some(BadgeCorner::Bl),
+        _ => None,
+    });
+    #[cfg(target_os = "macos")]
+    unsafe {
+        init_nsapp();
+    }
+    let geometries = subcommand_screen_geometries();
+    if geometries.is_empty() {
+        eprintln!("no screens detected; cannot show badges");
+        std::process::exit(2);
+    }
+    let screens: Vec<BadgeScreen> = geometries
+        .iter()
+        .enumerate()
+        .map(|(index, geometry)| BadgeScreen {
+            geometry: *geometry,
+            label: (index + 1).to_string(),
+        })
+        .collect();
+    println!(
+        "halo_manual badges: {} screen(s) clear_after={:?} active={:?}",
+        screens.len(),
+        clear_after_ms,
+        active_corner
+    );
+    for screen in &screens {
+        println!(
+            "  badge {}: board=({}, {}) {}x{}",
+            screen.label,
+            screen.geometry.x,
+            screen.geometry.y,
+            screen.geometry.width,
+            screen.geometry.height
+        );
+    }
+    let mut badge = BadgeLayer::new();
+    badge.show(&screens);
+    if let Some(corner) = active_corner {
+        // Small delay so the highlight lands after the reveal pass.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let mut badge = BadgeLayer::new();
+            badge.set_active(0, corner);
+            std::mem::forget(badge);
+        });
+    }
+    if let Some(delay_ms) = clear_after_ms {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let mut badge = BadgeLayer::new();
+            badge.hide();
+            std::mem::forget(badge);
+            println!("halo_manual badges: cleared after {delay_ms} ms");
+        });
+    }
+    // Keep pumping so the dispatch_async_f blocks execute and the badges
+    // stay visible until Ctrl-C (or until the optional clear fires).
     #[cfg(target_os = "macos")]
     unsafe {
         run_main_loop();
