@@ -4245,6 +4245,13 @@ function App() {
                                     {item.label}
                                   </span>
                                   {item.width}×{item.height} @ ({item.x},{item.y})
+                                  {item.remote ? (
+                                    <span className="muted-copy">
+                                      {" "}
+                                      · {ui.settings.haloScreenCalRemoteTag}
+                                      {item.deviceName ? ` · ${item.deviceName}` : ""}
+                                    </span>
+                                  ) : null}
                                 </span>
                                 <span className="muted-copy">
                                   {accepted ? "✓" : ""}
@@ -4252,6 +4259,11 @@ function App() {
                               </div>
                             );
                           })}
+                          {screenCalPlan[screenCalProgress.acceptedScreens]?.remote ? (
+                            <p className="muted-copy diagnostic-message">
+                              {ui.settings.haloScreenCalRemoteHint}
+                            </p>
+                          ) : null}
                         </div>
                         <div className="settings-control-row">
                           <span>{ui.settings.haloLiveReadout}</span>

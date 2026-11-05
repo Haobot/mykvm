@@ -2175,7 +2175,7 @@ fn halo_get_status(state: tauri::State<'_, AppRuntime>) -> Result<HaloStatus, St
             .layout
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
-        screen_cal_topology_flag(&layout.focus_halo, local_layout_screens(&layout))
+        screen_cal_topology_flag(&layout.focus_halo, &layout)
     };
     Ok(HaloStatus {
         running,
@@ -2183,17 +2183,6 @@ fn halo_get_status(state: tauri::State<'_, AppRuntime>) -> Result<HaloStatus, St
         reason,
         screen_topology_ok,
     })
-}
-
-/// This machine's screens from a stored layout (`None` device = no screens).
-fn local_layout_screens(layout: &LayoutState) -> &[Screen] {
-    static EMPTY: [Screen; 0] = [];
-    layout
-        .devices
-        .iter()
-        .find(|device| device.role == "local")
-        .map(|device| device.screens.as_slice())
-        .unwrap_or(&EMPTY)
 }
 
 /// Read the latest raw head pose plus face-center position, optionally
@@ -2420,18 +2409,27 @@ fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// One screen in the wizard plan (board-x-then-y sorted, numbered 1..N).
+/// S4: the plan covers the whole shared board — local screens plus ONLINE
+/// peers' screens, all in the same board coordinate space.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HaloScreenCalPlanItem {
-    /// Index into the plan order; also the badge layer's screen index.
+    /// Index into the plan order; the badge layer's screen index only for
+    /// local screens (remote screens get no badge window).
     screen_index: usize,
     screen_id: String,
-    /// 1-based display number shown in the badge layer.
+    /// 1-based display number (badge label on local screens).
     label: usize,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
+    /// S4: true when the screen belongs to an online peer device. Remote
+    /// screens show no numbered badge (our windows cannot host there) — the
+    /// user looks at the peer display's physical corners directly.
+    remote: bool,
+    /// S4: owning device's display name ("Mac mini"), empty for local.
+    device_name: String,
 }
 
 /// Capture progress for the wizard UI.
@@ -2478,6 +2476,103 @@ struct ScreenCalCornerSample {
     point: halo::screen_map::PosePoint,
 }
 
+/// S4 lean capture: the reference (yaw, pitch, u, v) recorded by the first
+/// `halo_screen_cal_lean` call, with its start time for the 30 s timeout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LeanCaptureState {
+    started_at_ms: u64,
+    reference: (f64, f64, f64, f64),
+}
+
+/// S4 lean capture result. `reference` is the first step (stored, waiting
+/// for the user to shift seat); `fitted` is the second step's success (the
+/// alphas were validated, persisted into the stored calibration and pushed
+/// to a running engine).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "stage")]
+enum HaloLeanStatus {
+    Reference {
+        ref_u: f64,
+        ref_v: f64,
+    },
+    Fitted {
+        trans_alpha_yaw: f64,
+        trans_alpha_pitch: f64,
+    },
+}
+
+/// S4 lean-capture knobs. The minimum u/v delta corresponds to a few
+/// centimeters of face movement in the camera frame; the alpha range is the
+/// geometric prior's neighborhood (a typical webcam FOV maps a full-frame
+/// shift to tens of degrees, so anything outside 0..120 is a bad sample).
+const LEAN_CAPTURE_TIMEOUT_MS: u64 = 30_000;
+const LEAN_MIN_DELTA_UV: f64 = 0.01;
+const LEAN_ALPHA_MAX: f64 = 120.0;
+
+/// Why a lean fit was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeanFitError {
+    /// The user barely moved between the two samples (|Δu| or |Δv| below
+    /// [`LEAN_MIN_DELTA_UV`]): dividing by it would amplify noise.
+    TooSmallMove,
+    /// The fitted coefficient is outside 0..[`LEAN_ALPHA_MAX`] deg per unit
+    /// u/v: physically implausible, almost always a bad sample pair.
+    OutOfRange,
+}
+
+/// Whether the lean capture window expired (`started_at_ms` older than
+/// [`LEAN_CAPTURE_TIMEOUT_MS`] at `now_ms`).
+fn lean_capture_expired(started_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(started_at_ms) > LEAN_CAPTURE_TIMEOUT_MS
+}
+
+/// Fit the seat-translation compensation coefficients from two samples of
+/// the SAME gaze point taken before and after the user shifted seat.
+///
+/// Derivation (mirrors `screen_map::compensate`, whose inverse correction is
+/// `yaw_eff = yaw + αu·(u−ref_u)` and `pitch_eff = pitch − αv·(v−ref_v)`):
+/// the compensated reading must stay invariant across the translation, so
+/// with `Δyaw = yaw2 − yaw1`, `Δu = u2 − u1` (and symmetrically for pitch):
+/// - `yaw_ref = (yaw_ref + Δyaw) + αu·Δu` → `αu = −Δyaw / Δu`
+/// - `pitch_ref = (pitch_ref + Δpitch) − αv·Δv` → `αv = Δpitch / Δv`
+///
+/// Both angles must already be in the stored (post-flip) convention the
+/// calibration uses; the caller applies `screen_cal_flip_pitch`.
+fn fit_lean_alphas(
+    reference: (f64, f64, f64, f64),
+    sample: (f64, f64, f64, f64),
+) -> Result<(f64, f64), LeanFitError> {
+    let delta_u = sample.2 - reference.2;
+    let delta_v = sample.3 - reference.3;
+    if delta_u.abs() < LEAN_MIN_DELTA_UV || delta_v.abs() < LEAN_MIN_DELTA_UV {
+        return Err(LeanFitError::TooSmallMove);
+    }
+    let alpha_u = -(sample.0 - reference.0) / delta_u;
+    let alpha_v = (sample.1 - reference.1) / delta_v;
+    let in_range = |alpha: f64| alpha > 0.0 && alpha < LEAN_ALPHA_MAX;
+    if !in_range(alpha_u) || !in_range(alpha_v) {
+        return Err(LeanFitError::OutOfRange);
+    }
+    Ok((alpha_u, alpha_v))
+}
+
+/// The persistence step of a successful lean fit: write the fitted
+/// coefficients into the stored multi-screen calibration. Pure (the mutate
+/// closure of `update_layout_focus_halo`), so the validation path is
+/// testable without a runtime.
+fn apply_lean_alphas(
+    focus_halo: &mut halo::FocusHaloSettings,
+    trans_alpha_yaw: f64,
+    trans_alpha_pitch: f64,
+) -> Result<(), String> {
+    let Some(calibration) = focus_halo.screen_calibration.as_mut() else {
+        return Err("未找到已保存的多屏校准，请先完成多屏校准".to_string());
+    };
+    calibration.trans_alpha_yaw = trans_alpha_yaw;
+    calibration.trans_alpha_pitch = trans_alpha_pitch;
+    Ok(())
+}
+
 /// Wizard state behind `AppRuntime::halo_screen_cal`. Badge is optional so a
 /// non-macOS build (no badge windows) still records the plan and corners.
 #[derive(Default)]
@@ -2489,6 +2584,14 @@ struct ScreenCalWizardState {
     /// Currently highlighted step, mirroring the last set_step call.
     active: Option<(usize, halo::BadgeCorner)>,
     badge: Option<halo::BadgeLayer>,
+    /// S4: per plan item, the index inside the badge layer's screen list
+    /// (`None` for remote screens, which have no badge window). The badge
+    /// layer indexes its own list, and a remote screen sorting before a
+    /// local one shifts every later badge.
+    badge_indices: Vec<Option<usize>>,
+    /// S4 lean capture (坐姿微移补偿拟合): `Some` between the two protocol
+    /// steps; cleared on success, timeout, and every wizard reset.
+    lean: Option<LeanCaptureState>,
 }
 
 impl ScreenCalWizardState {
@@ -2501,6 +2604,8 @@ impl ScreenCalWizardState {
         self.corners.clear();
         self.regions.clear();
         self.active = None;
+        self.badge_indices.clear();
+        self.lean = None;
     }
 
     fn corners_for_screen(&self, screen_index: usize) -> Vec<&ScreenCalCornerSample> {
@@ -2522,24 +2627,73 @@ impl ScreenCalWizardState {
     }
 }
 
-/// Build the wizard plan from this machine's screens: board-x-then-y sort,
-/// numbered 1..N, `screen_index` = index in that order.
-fn screen_cal_plan_from_screens(screens: &[Screen]) -> Vec<HaloScreenCalPlanItem> {
-    let mut sorted: Vec<&Screen> = screens.iter().collect();
-    sorted.sort_by(|a, b| (a.x, a.y).cmp(&(b.x, b.y)));
+/// One wizard plan source: a screen plus the owning device's display name and
+/// whether it lives on a peer (S4).
+struct ScreenCalPlanSource {
+    screen: Screen,
+    device_name: String,
+    remote: bool,
+}
+
+/// S4: the wizard plan's source set — the local device's screens plus every
+/// ONLINE peer's screens, all in the shared board coordinate space, sorted
+/// board-x-then-y. Offline peers are excluded: a screen you cannot currently
+/// look at cannot be calibrated, and including it would make the wizard wait
+/// on corners nobody can capture.
+fn screen_cal_plan_sources(layout: &LayoutState) -> Vec<ScreenCalPlanSource> {
+    let mut sources: Vec<ScreenCalPlanSource> = Vec::new();
+    for device in &layout.devices {
+        let remote = device.role != "local";
+        if remote && !device.online {
+            continue;
+        }
+        for screen in &device.screens {
+            sources.push(ScreenCalPlanSource {
+                screen: screen.clone(),
+                device_name: device.name.clone(),
+                remote,
+            });
+        }
+    }
+    sources
+}
+
+/// Build the wizard plan from plan sources: board-x-then-y sorted, numbered
+/// 1..N, `screen_index` = index in that order. The sort lives here so every
+/// caller (layout-sourced or local-only) numbers the same way.
+fn screen_cal_plan_from_sources(sources: &[ScreenCalPlanSource]) -> Vec<HaloScreenCalPlanItem> {
+    let mut sorted: Vec<&ScreenCalPlanSource> = sources.iter().collect();
+    sorted.sort_by(|a, b| (a.screen.x, a.screen.y).cmp(&(b.screen.x, b.screen.y)));
     sorted
         .iter()
         .enumerate()
-        .map(|(index, screen)| HaloScreenCalPlanItem {
+        .map(|(index, source)| HaloScreenCalPlanItem {
             screen_index: index,
-            screen_id: screen.id.clone(),
+            screen_id: source.screen.id.clone(),
             label: index + 1,
-            x: screen.x,
-            y: screen.y,
-            width: screen.width,
-            height: screen.height,
+            x: source.screen.x,
+            y: source.screen.y,
+            width: source.screen.width,
+            height: source.screen.height,
+            remote: source.remote,
+            device_name: source.device_name.clone(),
         })
         .collect()
+}
+
+/// Build the wizard plan from one machine's screens (local-only variant,
+/// used by tests and as the local-device fallback): board-x-then-y sort,
+/// numbered 1..N, `screen_index` = index in that order.
+fn screen_cal_plan_from_screens(screens: &[Screen]) -> Vec<HaloScreenCalPlanItem> {
+    let sources: Vec<ScreenCalPlanSource> = screens
+        .iter()
+        .map(|screen| ScreenCalPlanSource {
+            screen: screen.clone(),
+            device_name: String::new(),
+            remote: false,
+        })
+        .collect();
+    screen_cal_plan_from_sources(&sources)
 }
 
 /// Apply the same effective vertical flip the runtime mapping uses
@@ -2567,16 +2721,86 @@ fn screen_cal_board_rects(screens: &[Screen]) -> Vec<halo::screen_map::BoardRect
         .collect()
 }
 
+/// S4: the live board list the topology check compares against — local
+/// screens plus ONLINE peers' screens that the calibration actually covers
+/// (a peer screen the user never calibrated does not belong to the checked
+/// domain and must not flag "please recalibrate"; offline peers are
+/// unverifiable, not changed).
+fn screen_cal_live_board_rects(
+    layout: &LayoutState,
+    calibrated_ids: &std::collections::HashSet<&str>,
+) -> Vec<halo::screen_map::BoardRect> {
+    let mut rects = Vec::new();
+    for device in &layout.devices {
+        if device.role != "local" {
+            if !device.online {
+                continue;
+            }
+            let calibrated: Vec<Screen> = device
+                .screens
+                .iter()
+                .filter(|screen| calibrated_ids.contains(screen.id.as_str()))
+                .cloned()
+                .collect();
+            rects.extend(screen_cal_board_rects(&calibrated));
+            continue;
+        }
+        rects.extend(screen_cal_board_rects(&device.screens));
+    }
+    rects
+}
+
 /// Whether the stored multi-screen calibration still matches the live layout:
 /// `Some(matches)` when a calibration exists, `None` otherwise (halo_get_status).
+///
+/// S4 offline-peer tolerance: a calibration may cover peer screens, and a
+/// peer being offline is not a display-topology change. Regions whose screen
+/// belongs to an OFFLINE peer are skipped and the offline peer's screens are
+/// dropped from the live list before the pure
+/// [`halo::screen_map::topology_matches`] runs on the filtered inputs — so
+/// "peer asleep" never flags "please recalibrate". A calibration that covers
+/// only local screens behaves exactly like the pre-S4 check.
 fn screen_cal_topology_flag(
     focus_halo: &halo::FocusHaloSettings,
-    screens: &[Screen],
+    layout: &LayoutState,
 ) -> Option<bool> {
     let calibration = focus_halo.screen_calibration.as_ref()?;
+    let offline_peer_screens: std::collections::HashSet<&str> = layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local" && !device.online)
+        .flat_map(|device| {
+            device
+                .screens
+                .iter()
+                .map(|screen| screen.id.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let calibrated_ids: std::collections::HashSet<&str> = calibration
+        .regions
+        .iter()
+        .map(|region| region.screen_id.as_str())
+        .collect();
+    let mut regions: Vec<halo::screen_map::ScreenRegion> = calibration
+        .regions
+        .iter()
+        .filter(|region| !offline_peer_screens.contains(region.screen_id.as_str()))
+        .cloned()
+        .collect();
+    if regions.is_empty() {
+        // Every calibrated region belongs to an offline peer: nothing
+        // contradicts the check, so it passes vacuously (no recalibrate nag
+        // while the peer is asleep).
+        return Some(true);
+    }
+    let filtered = halo::screen_map::ScreenCalibration {
+        regions,
+        ..calibration.clone()
+    };
     Some(halo::screen_map::topology_matches(
-        calibration,
-        &screen_cal_board_rects(screens),
+        &filtered,
+        &screen_cal_live_board_rects(layout, &calibrated_ids),
     ))
 }
 
@@ -2752,41 +2976,46 @@ fn halo_screen_cal_begin(
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<Vec<HaloScreenCalPlanItem>, String> {
     // 1. Layout snapshot (layout lock taken alone).
-    let (plan, badge_screens) = {
+    let (plan, badge_screens, badge_indices) = {
         let layout = state
             .layout
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
-        let screens = layout
-            .devices
-            .iter()
-            .find(|device| device.role == "local")
-            .map(|device| device.screens.clone())
-            .unwrap_or_default();
-        if screens.is_empty() {
+        let sources = screen_cal_plan_sources(&layout);
+        if !sources.iter().any(|source| !source.remote) {
             return Err("未检测到本机屏幕，无法开始多屏校准".to_string());
         }
-        let plan = screen_cal_plan_from_screens(&screens);
-        let badge_screens = plan
-            .iter()
-            .zip(screens.iter())
-            .map(|(item, screen)| {
-                let (native_x, native_y) = halo_native_origin(screen);
-                halo::BadgeScreen {
-                    geometry: halo::OverlayScreenGeometry {
-                        x: screen.x as f64,
-                        y: screen.y as f64,
-                        width: screen.width as f64,
-                        height: screen.height as f64,
-                        scale: screen.scale,
-                        native_x,
-                        native_y,
-                    },
-                    label: item.label.to_string(),
-                }
-            })
-            .collect::<Vec<_>>();
-        (plan, badge_screens)
+        let plan = screen_cal_plan_from_sources(&sources);
+        // Badge windows only for LOCAL screens: the badge layer hosts one
+        // window per screen on this machine, and a peer display cannot host
+        // our windows. Remote screens keep their plan slot; the badge layer
+        // indexes its own list, so every local item records its badge index.
+        let mut badge_screens = Vec::new();
+        let mut badge_indices = Vec::with_capacity(plan.len());
+        for item in &plan {
+            let Some(source) = sources.iter().find(|s| s.screen.id == item.screen_id) else {
+                continue;
+            };
+            if source.remote {
+                badge_indices.push(None);
+                continue;
+            }
+            let (native_x, native_y) = halo_native_origin(&source.screen);
+            badge_indices.push(Some(badge_screens.len()));
+            badge_screens.push(halo::BadgeScreen {
+                geometry: halo::OverlayScreenGeometry {
+                    x: source.screen.x as f64,
+                    y: source.screen.y as f64,
+                    width: source.screen.width as f64,
+                    height: source.screen.height as f64,
+                    scale: source.screen.scale,
+                    native_x,
+                    native_y,
+                },
+                label: item.label.to_string(),
+            });
+        }
+        (plan, badge_screens, badge_indices)
     };
     // 2. Tracking must be running (halo lock taken alone, after layout).
     {
@@ -2808,6 +3037,7 @@ fn halo_screen_cal_begin(
     badge.show(&badge_screens);
     wizard.badge = Some(badge);
     wizard.plan = plan.clone();
+    wizard.badge_indices = badge_indices;
     Ok(plan)
 }
 
@@ -2831,8 +3061,11 @@ fn halo_screen_cal_set_step(
             wizard.plan.len()
         ));
     }
-    if let Some(badge) = wizard.badge.as_mut() {
-        badge.set_active(screen_index, corner);
+    // S4: only local screens have a badge window; highlight the plan item's
+    // badge index, not the plan index itself (remote items shift them).
+    let badge_index = wizard.badge_indices.get(screen_index).copied().flatten();
+    if let (Some(badge), Some(badge_index)) = (wizard.badge.as_mut(), badge_index) {
+        badge.set_active(badge_index, corner);
     }
     wizard.active = Some((screen_index, corner));
     Ok(())
@@ -3020,6 +3253,8 @@ fn halo_screen_cal_finish_impl(state: &AppRuntime) -> Result<HaloScreenCalSummar
                     y: 0,
                     width: 0,
                     height: 0,
+                    remote: false,
+                    device_name: String::new(),
                 });
             HaloScreenCalExtent {
                 screen_index: item.screen_index,
@@ -17304,6 +17539,8 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            remote: false,
+            device_name: String::new(),
         }];
         wizard.corners.push(ScreenCalCornerSample {
             screen_index,
@@ -17378,6 +17615,8 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            remote: false,
+            device_name: String::new(),
         }];
         for (corner, point) in corners.iter().zip(plan_quad.iter()) {
             screen_cal_check_corner(*corner, point, &wizard, 0)
@@ -17435,6 +17674,8 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            remote: false,
+            device_name: String::new(),
         }];
         for (corner, point) in [
             (halo::BadgeCorner::Tl, pose(-12.0, 8.0)),
@@ -17510,6 +17751,8 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            remote: false,
+            device_name: String::new(),
         }];
         let committed: Vec<ScreenCalCornerSample> = [
             (halo::BadgeCorner::Tl, pose(-12.0, 8.0)),
@@ -17554,9 +17797,10 @@ mod tests {
     fn screen_cal_topology_flag_reflects_layout_changes() {
         let mut settings = halo::FocusHaloSettings::default();
         // No calibration yet -> null (not "mismatched").
-        assert_eq!(screen_cal_topology_flag(&settings, &[]), None);
+        assert_eq!(screen_cal_topology_flag(&settings, &test_layout()), None);
 
-        let screens = vec![wizard_screen("screen-0", 0, 0)];
+        let mut layout = test_layout();
+        layout.devices[0].screens = vec![wizard_screen("screen-0", 0, 0)];
         settings.screen_calibration = Some(halo::screen_map::ScreenCalibration {
             regions: vec![halo::screen_map::ScreenRegion {
                 screen_id: "screen-0".into(),
@@ -17575,17 +17819,20 @@ mod tests {
             ..halo::screen_map::ScreenCalibration::default()
         });
         assert_eq!(
-            screen_cal_topology_flag(&settings, &screens),
+            screen_cal_topology_flag(&settings, &layout),
             Some(true),
             "identical layout still matches"
         );
-        let moved = vec![wizard_screen("screen-0", 40, 0)];
+        let moved = test_layout();
+        let mut moved = moved;
+        moved.devices[0].screens = vec![wizard_screen("screen-0", 40, 0)];
         assert_eq!(
             screen_cal_topology_flag(&settings, &moved),
             Some(false),
             "moved screen breaks the topology"
         );
-        let extra = vec![
+        let mut extra = test_layout();
+        extra.devices[0].screens = vec![
             wizard_screen("screen-0", 0, 0),
             wizard_screen("screen-1", 1920, 0),
         ];
@@ -17595,4 +17842,125 @@ mod tests {
             "screen count change breaks the topology"
         );
     }
+
+    // ------------------------------------------------------------------
+    // S4 tests: wizard plan covers online peer screens; topology tolerates
+    // offline peers
+    // ------------------------------------------------------------------
+
+    fn topology_calibration(screen_ids: &[&str], x0: i32) -> halo::screen_map::ScreenCalibration {
+        let regions = screen_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| halo::screen_map::ScreenRegion {
+                screen_id: (*id).into(),
+                board: halo::screen_map::BoardRect {
+                    screen_id: (*id).into(),
+                    x: (x0 + index as i32 * 1920) as f64,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                tl: pose(-12.0, 8.0),
+                tr: pose(12.0, 7.0),
+                br: pose(10.0, -7.0),
+                bl: pose(-10.0, -6.0),
+            })
+            .collect();
+        halo::screen_map::ScreenCalibration {
+            regions,
+            ..halo::screen_map::ScreenCalibration::default()
+        }
+    }
+
+    /// Layout with a local device (screens "local-1") and a peer device
+    /// (screens "peer-s" at x=-1920), each configurable online/offline.
+    fn local_plus_peer_layout(local_online: bool, peer_online: bool) -> LayoutState {
+        let mut layout = test_layout();
+        let mut local = test_device("local-device", "Local", "local", local_online);
+        local.screens = vec![wizard_screen("local-1", 0, 0)];
+        let mut peer = test_device("peer-a", "Mac mini", "client", peer_online);
+        peer.screens = vec![wizard_screen("peer-s", -1920, 0)];
+        layout.devices = vec![local, peer];
+        layout
+    }
+
+    #[test]
+    fn screen_cal_plan_includes_online_peers_and_excludes_offline_ones() {
+        // Both online: the peer screen enters the plan, sorted by board x
+        // (peer-s at -1920 first), each item carrying device + remote flags.
+        let layout = local_plus_peer_layout(true, true);
+        let plan = screen_cal_plan_from_sources(&screen_cal_plan_sources(&layout));
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].screen_id, "peer-s");
+        assert_eq!(plan[0].label, 1);
+        assert!(plan[0].remote);
+        assert_eq!(plan[0].device_name, "Mac mini");
+        assert_eq!(plan[1].screen_id, "local-1");
+        assert!(!plan[1].remote);
+        assert_eq!(plan[1].device_name, "Local");
+
+        // Peer offline: only the local screen remains.
+        let layout = local_plus_peer_layout(true, false);
+        let plan = screen_cal_plan_from_sources(&screen_cal_plan_sources(&layout));
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].screen_id, "local-1");
+        assert!(!plan[0].remote);
+
+        // No local screens at all (peer online): the plan would be remote
+        // only, which begin() rejects — pinned here at the source level.
+        // (A local device's offline flag never drops its screens — they are
+        // locally enumerable regardless — so the "no local screens" rig is
+        // built by emptying the local screen list.)
+        let mut layout = local_plus_peer_layout(false, true);
+        layout.devices[0].screens.clear();
+        let sources = screen_cal_plan_sources(&layout);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].remote);
+    }
+
+    #[test]
+    fn screen_cal_topology_flag_skips_offline_peer_regions() {
+        let mut settings = halo::FocusHaloSettings::default();
+        // Region 0 at x=-1920 (peer-s), region 1 at x=0 (local-1): matching
+        // the rig's live rects.
+        settings.screen_calibration = Some(topology_calibration(&["peer-s", "local-1"], -1920));
+
+        // Peer online and its rect unchanged: matches.
+        let layout = local_plus_peer_layout(true, true);
+        assert_eq!(screen_cal_topology_flag(&settings, &layout), Some(true));
+
+        // Peer offline: the peer region is skipped and the peer's screen is
+        // dropped from the live list, so the check still passes instead of
+        // nagging "please recalibrate" while the peer is asleep.
+        let layout = local_plus_peer_layout(true, false);
+        assert_eq!(
+            screen_cal_topology_flag(&settings, &layout),
+            Some(true),
+            "offline peer must not break the topology check"
+        );
+
+        // Peer offline again but the LOCAL screen moved: the local region
+        // still fails.
+        let mut layout = local_plus_peer_layout(true, false);
+        layout.devices[0].screens = vec![wizard_screen("local-1", 40, 0)];
+        assert_eq!(
+            screen_cal_topology_flag(&settings, &layout),
+            Some(false),
+            "a moved local screen still breaks the topology"
+        );
+
+        // EVERY region belongs to the offline peer (local-only calibration
+        // is impossible in this setup, so simulate by calibrating only the
+        // peer screen): the check passes vacuously.
+        let mut settings = halo::FocusHaloSettings::default();
+        settings.screen_calibration = Some(topology_calibration(&["peer-s"], -1920));
+        let layout = local_plus_peer_layout(true, false);
+        assert_eq!(
+            screen_cal_topology_flag(&settings, &layout),
+            Some(true),
+            "all regions offline -> vacuous pass"
+        );
+    }
+
 }

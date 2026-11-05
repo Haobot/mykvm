@@ -297,6 +297,16 @@ export const TEXT = {
       haloScreenCalCornerBr: "右下",
       haloScreenCalCornerBl: "左下",
       haloScreenCalTopologyWarning: "显示器布局已变化，建议重新校准",
+      haloScreenCalRemoteTag: "对端",
+      haloLeanTitle: "坐姿微移采样（可选，提升坐姿移动后的切屏准确性）",
+      haloLeanCopy:
+        "点第一步记录当前视线参考点，然后保持看向同一位置，身体向左或向右平移约 15cm，再点第二步拟合补偿系数。",
+      haloLeanStep1: "第一步：记录参考点",
+      haloLeanStep2: "第二步：完成拟合",
+      haloLeanStepHint: "保持视线不动，身体向左/右平移约 15cm 后点第二步（30 秒内有效）",
+      haloLeanFittedPrefix: "已更新补偿系数（yaw / pitch）",
+      haloScreenCalRemoteHint:
+        "对端屏幕没有编号徽标：请看对端显示器（无编号）的四个物理角，依次采集。",
       haloScreenCalDone: "多屏校准已保存。",
       haloScreenCalSummaryPrefix: "已校准",
       haloScreenCalSummarySuffix: "块屏幕",
@@ -696,6 +706,17 @@ export const TEXT = {
       haloScreenCalCornerBr: "bottom-right",
       haloScreenCalCornerBl: "bottom-left",
       haloScreenCalTopologyWarning: "Display layout changed — recalibrate the screens",
+      haloScreenCalRemoteTag: "Remote",
+      haloLeanTitle: "Lean capture (optional, improves switching accuracy after you shift seat)",
+      haloLeanCopy:
+        "Press step 1 to record your current gaze reference, keep looking at the same spot, physically shift about 15 cm left or right, then press step 2 to fit the compensation coefficients.",
+      haloLeanStep1: "Step 1: record reference",
+      haloLeanStep2: "Step 2: fit after shifting",
+      haloLeanStepHint:
+        "Keep your gaze fixed, shift your body about 15 cm left or right, then press step 2 (valid for 30 s)",
+      haloLeanFittedPrefix: "Updated compensation coefficients (yaw / pitch)",
+      haloScreenCalRemoteHint:
+        "Peer screens show no numbered badge: look at the four physical corners of the peer display, then capture them in order.",
       haloScreenCalDone: "Multi-screen calibration saved.",
       haloScreenCalSummaryPrefix: "Calibrated",
       haloScreenCalSummarySuffix: "screens",

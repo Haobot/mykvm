@@ -50,6 +50,10 @@ export interface HaloScreenCalPlanItem {
   y: number
   width: number
   height: number
+  /** S4: the screen lives on an online peer device (no local badge). */
+  remote: boolean
+  /** S4: owning device's display name ("Mac mini"), empty for local. */
+  deviceName: string
 }
 
 /** Mirrors the Rust `HaloScreenCalProgress` (serde camelCase). */
