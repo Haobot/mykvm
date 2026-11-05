@@ -48,6 +48,8 @@ export interface FocusHaloSettings {
   showProgress: boolean
   switchZone: 'anywhere' | 'titlebar'
   cameraPosition: 'top' | 'bottom'
+  /** Flip the vertical axis when the halo still moves opposite to the gaze. */
+  invertPitch?: boolean
   keyboardSuspends: boolean
   titleBlacklist: string[]
   processBlacklist: string[]

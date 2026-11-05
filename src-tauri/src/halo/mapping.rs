@@ -104,17 +104,21 @@ pub(crate) fn shape_axis(n: f64, dz: f64, gain: f64) -> f64 {
 /// precision, `= 1` linear. When `camera_bottom` is set (camera mounted below
 /// the screen, e.g. a laptop bottom bar), pitch is inverted first because a
 /// camera below the screen sees "looking up" with flipped geometry.
+/// `invert_pitch` is the user-facing correction for setups where the vertical
+/// axis still moves the wrong way (unusual cameras/mounts); it composes with
+/// `camera_bottom` as an XOR.
 pub fn map_pose(
     pose: (f64, f64),
     cal: &CalibrationProfile,
     dead_zone_percent: f64,
     gain: f64,
     camera_bottom: bool,
+    invert_pitch: bool,
 ) -> (f64, f64) {
     let (yaw, pitch) = pose;
     let raw_yaw = yaw - cal.center_yaw;
     let mut raw_pitch = pitch - cal.center_pitch;
-    if camera_bottom {
+    if camera_bottom != invert_pitch {
         raw_pitch = -raw_pitch;
     }
 
@@ -186,7 +190,7 @@ mod tests {
 
     #[test]
     fn center_maps_to_screen_center() {
-        let (x, y) = map_pose((0.0, 0.0), &default_cal(), 5.0, 1.0, false);
+        let (x, y) = map_pose((0.0, 0.0), &default_cal(), 5.0, 1.0, false, false);
         assert_eq!(x, 0.5);
         assert_eq!(y, 0.5);
     }
@@ -194,26 +198,26 @@ mod tests {
     #[test]
     fn four_calibrated_extremes_map_to_four_edges() {
         let cal = default_cal();
-        assert_eq!(map_pose((cal.right_yaw, 0.0), &cal, 0.0, 1.0, false).0, 1.0);
-        assert_eq!(map_pose((cal.left_yaw, 0.0), &cal, 0.0, 1.0, false).0, 0.0);
-        assert_eq!(map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false).1, 0.0);
+        assert_eq!(map_pose((cal.right_yaw, 0.0), &cal, 0.0, 1.0, false, false).0, 1.0);
+        assert_eq!(map_pose((cal.left_yaw, 0.0), &cal, 0.0, 1.0, false, false).0, 0.0);
+        assert_eq!(map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, false).1, 0.0);
         assert_eq!(
-            map_pose((0.0, -cal.down_pitch), &cal, 0.0, 1.0, false).1,
+            map_pose((0.0, -cal.down_pitch), &cal, 0.0, 1.0, false, false).1,
             1.0
         );
         // Extremes leave the other axis at center.
-        assert_eq!(map_pose((cal.right_yaw, 0.0), &cal, 0.0, 1.0, false).1, 0.5);
-        assert_eq!(map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false).0, 0.5);
+        assert_eq!(map_pose((cal.right_yaw, 0.0), &cal, 0.0, 1.0, false, false).1, 0.5);
+        assert_eq!(map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, false).0, 0.5);
     }
 
     #[test]
     fn dead_zone_glues_small_offsets_to_center() {
         let cal = default_cal();
         // 5% of the 18 deg half-range = 0.9 deg dead-zone radius.
-        let (x, y) = map_pose((0.4, 0.0), &cal, 5.0, 1.0, false);
+        let (x, y) = map_pose((0.4, 0.0), &cal, 5.0, 1.0, false, false);
         assert_eq!(x, 0.5);
         assert_eq!(y, 0.5);
-        let (x, y) = map_pose((-0.4, -0.3), &cal, 5.0, 1.0, false);
+        let (x, y) = map_pose((-0.4, -0.3), &cal, 5.0, 1.0, false, false);
         assert_eq!(x, 0.5);
         assert_eq!(y, 0.5);
     }
@@ -223,14 +227,14 @@ mod tests {
         let cal = default_cal();
         let dz_deg = 0.05 * 18.0; // 0.9 deg
         let eps = 1e-4;
-        let below = map_pose((dz_deg - eps, 0.0), &cal, 5.0, 1.0, false).0;
-        let above = map_pose((dz_deg + eps, 0.0), &cal, 5.0, 1.0, false).0;
+        let below = map_pose((dz_deg - eps, 0.0), &cal, 5.0, 1.0, false, false).0;
+        let above = map_pose((dz_deg + eps, 0.0), &cal, 5.0, 1.0, false, false).0;
         // Both sides of the boundary sit at the boundary value (0.5) and agree
         // to within the epsilon-induced slope.
         assert!((below - 0.5).abs() < 1e-5, "below boundary: {below}");
         assert!((above - 0.5).abs() < 1e-5, "above boundary: {above}");
         // And the response is strictly monotone just past the boundary.
-        let near = map_pose((dz_deg + 0.05, 0.0), &cal, 5.0, 1.0, false).0;
+        let near = map_pose((dz_deg + 0.05, 0.0), &cal, 5.0, 1.0, false, false).0;
         assert!(near > above);
     }
 
@@ -240,7 +244,7 @@ mod tests {
         // acceleration curve. Exercised through the full mapping: yaw = 9 deg
         // is exactly half of the 18 deg half-range -> x = 0.5 + 0.5 * 0.25.
         let cal = default_cal();
-        let (x, _) = map_pose((cal.right_yaw * 0.5, 0.0), &cal, 0.0, 2.0, false);
+        let (x, _) = map_pose((cal.right_yaw * 0.5, 0.0), &cal, 0.0, 2.0, false, false);
         assert!(
             (x - 0.625).abs() < 1e-9,
             "x = {x}, expected 0.625 (sx = 0.25)"
@@ -252,10 +256,24 @@ mod tests {
     #[test]
     fn camera_bottom_flips_pitch_mapping() {
         let cal = default_cal();
-        let top = map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false).1;
-        let bottom = map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, true).1;
+        let top = map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, false).1;
+        let bottom = map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, true, false).1;
         assert_eq!(top, 0.0);
         assert_eq!(bottom, 1.0);
+    }
+
+    #[test]
+    fn invert_pitch_flips_vertical_and_composes_with_camera_bottom() {
+        let cal = default_cal();
+        // Looking up (positive pitch) normally maps to the top edge (y = 0);
+        // with the user-facing invert toggle it maps to the bottom edge.
+        let normal = map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, false).1;
+        let inverted = map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, true).1;
+        assert_eq!(normal, 0.0);
+        assert_eq!(inverted, 1.0);
+        // The two flips compose as XOR: both set cancel out.
+        let both = map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, true, true).1;
+        assert_eq!(both, 0.0);
     }
 
     #[test]
@@ -339,6 +357,7 @@ mod tests {
             &shifted,
             0.0,
             1.0,
+            false,
             false,
         );
         assert_eq!(x, 0.0);

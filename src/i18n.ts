@@ -256,6 +256,10 @@ export const TEXT = {
       haloCameraPosition: "相机位置",
       haloCameraTop: "上沿",
       haloCameraBottom: "下沿",
+      haloInvertPitch: "上下方向对调",
+      haloInvertPitchOff: "关闭",
+      haloInvertPitchOn: "开启",
+      haloInvertPitchCalibHint: "校准时移动头部：若光环上下方向与视线相反，点「开启」立即对调；左右方向不受影响。",
       haloTitleBlacklist: "标题黑名单",
       haloProcessBlacklist: "进程黑名单",
       haloBlacklistHelp:
@@ -612,6 +616,10 @@ export const TEXT = {
       haloCameraPosition: "Camera position",
       haloCameraTop: "Top edge",
       haloCameraBottom: "Bottom edge",
+      haloInvertPitch: "Invert vertical",
+      haloInvertPitchOff: "Off",
+      haloInvertPitchOn: "On",
+      haloInvertPitchCalibHint: "While calibrating, if the halo moves opposite your gaze vertically, switch this on to flip it instantly; the horizontal axis is unaffected.",
       haloTitleBlacklist: "Title blacklist",
       haloProcessBlacklist: "Process blacklist",
       haloBlacklistHelp:

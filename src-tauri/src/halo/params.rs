@@ -71,6 +71,11 @@ pub struct FocusHaloSettings {
     pub switch_zone: SwitchZone,
     #[serde(default)]
     pub camera_position: CameraPosition,
+    /// User-facing vertical correction: flip the pitch axis when the halo
+    /// still moves opposite to the gaze (unusual cameras/mounts). Composes
+    /// with camera_position as an XOR in the mapping layer.
+    #[serde(default)]
+    pub invert_pitch: bool,
     #[serde(default = "d_keyboard_suspends")]
     pub keyboard_suspends: bool,
     #[serde(default)]
@@ -153,6 +158,7 @@ impl Default for FocusHaloSettings {
             show_progress: d_show_progress(),
             switch_zone: SwitchZone::default(),
             camera_position: CameraPosition::default(),
+            invert_pitch: false,
             keyboard_suspends: d_keyboard_suspends(),
             title_blacklist: Vec::new(),
             process_blacklist: Vec::new(),
@@ -185,6 +191,7 @@ impl FocusHaloSettings {
             show_progress: self.show_progress,
             switch_zone: self.switch_zone,
             camera_position: self.camera_position,
+            invert_pitch: self.invert_pitch,
             keyboard_suspends: self.keyboard_suspends,
             title_blacklist: self.title_blacklist.clone(),
             process_blacklist: self.process_blacklist.clone(),

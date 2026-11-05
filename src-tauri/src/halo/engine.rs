@@ -267,6 +267,7 @@ pub(crate) fn step(
                 state.settings.dead_zone_percent,
                 state.settings.gain,
                 state.settings.camera_position == CameraPosition::Bottom,
+                state.settings.invert_pitch,
             );
             // speed_norm: displacement per second in screen-width units
             // (vertical displacement scaled by aspect) — feeds enterSpeed.

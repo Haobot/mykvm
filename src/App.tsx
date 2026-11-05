@@ -4142,6 +4142,25 @@ function App() {
                         </button>
                       </div>
                     </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloInvertPitch}</span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={!haloSettings.invertPitch ? "active" : ""}
+                          onClick={() => setFocusHaloSetting("invertPitch", false)}
+                        >
+                          {ui.settings.haloInvertPitchOff}
+                        </button>
+                        <button
+                          type="button"
+                          className={haloSettings.invertPitch ? "active" : ""}
+                          onClick={() => setFocusHaloSetting("invertPitch", true)}
+                        >
+                          {ui.settings.haloInvertPitchOn}
+                        </button>
+                      </div>
+                    </div>
                     <HaloListField
                       label={ui.settings.haloTitleBlacklist}
                       help={ui.settings.haloBlacklistHelp}
@@ -4595,6 +4614,26 @@ function App() {
                 {haloCalibError ? (
                   <p className="muted-copy diagnostic-message">{haloCalibError}</p>
                 ) : null}
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloInvertPitch}</span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={!haloSettings.invertPitch ? "active" : ""}
+                      onClick={() => setFocusHaloSetting("invertPitch", false)}
+                    >
+                      {ui.settings.haloInvertPitchOff}
+                    </button>
+                    <button
+                      type="button"
+                      className={haloSettings.invertPitch ? "active" : ""}
+                      onClick={() => setFocusHaloSetting("invertPitch", true)}
+                    >
+                      {ui.settings.haloInvertPitchOn}
+                    </button>
+                  </div>
+                </div>
+                <p className="muted-copy">{ui.settings.haloInvertPitchCalibHint}</p>
                 <div className="pairing-actions">
                   <button
                     type="button"

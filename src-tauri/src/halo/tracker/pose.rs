@@ -203,10 +203,9 @@ pub(crate) fn crop_window(img: &RgbImage, face: &Face, factor: f32) -> (u32, u32
 }
 
 /// Rotation matrix (1x3x3, row-major) -> (pitch, yaw, roll) in degrees.
-/// Matches yakhyo rotation_matrix_to_euler() exactly. In the upstream
-/// convention **positive pitch means looking DOWN** (the nose direction is
-/// plotted with image-space y pointing down); `estimate_pose` flips the sign
-/// to FocusHalo's "positive pitch = looking up".
+/// Matches yakhyo rotation_matrix_to_euler() exactly. On live camera input
+/// the decoded pitch is positive when the user looks UP (verified on hardware
+/// 2026-11-05); the mapping layer consumes that convention directly.
 pub(crate) fn rotation_matrix_to_euler(r: &[f32]) -> [f64; 3] {
     let at = |a: usize, b: usize| r[a * 3 + b] as f64;
     let sy = (at(0, 0) * at(0, 0) + at(1, 0) * at(1, 0)).sqrt();
@@ -247,8 +246,12 @@ pub(crate) fn estimate_pose(
         .into());
     }
     let [pitch, yaw, roll] = rotation_matrix_to_euler(&data[..9]);
-    // Flip pitch so "looking up" is positive for the mapping layer.
-    Ok([-pitch, yaw, roll])
+    // Live-camera calibration (2026-11-05): the raw model pitch is already
+    // positive when looking up, so it maps straight through. The earlier
+    // negation (based on the upstream notebook's plot convention) inverted
+    // vertical motion on real hardware; users who still see an inverted
+    // vertical axis flip it with the `invertPitch` setting instead.
+    Ok([pitch, yaw, roll])
 }
 
 #[cfg(test)]

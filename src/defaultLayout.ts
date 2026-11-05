@@ -47,6 +47,7 @@ export const defaultLayout: LayoutState = {
     showProgress: true,
     switchZone: 'anywhere',
     cameraPosition: 'top',
+    invertPitch: false,
     keyboardSuspends: true,
     titleBlacklist: [],
     processBlacklist: [],
