@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::halo::activator::WindowActivator;
-use crate::halo::filter::OneEuroFilter;
+use crate::halo::kalman::Kalman1D;
+use crate::halo::smoothing::{ServoAxis, ServoTuning};
 use crate::halo::input_probe::InputActivityProbe;
 use crate::halo::mapping::{map_pose, CalibrationProfile};
 use crate::halo::overlay::{
@@ -170,10 +171,16 @@ pub(crate) struct EngineState {
     pub(crate) settings: FocusHaloSettings,
     pub(crate) calibration: CalibrationProfile,
     pub(crate) screen: OverlayScreenGeometry,
-    pub(crate) yaw_filter: OneEuroFilter,
-    pub(crate) pitch_filter: OneEuroFilter,
-    /// ts of the last accepted sample, for filter dt.
+    pub(crate) yaw_kalman: Kalman1D,
+    pub(crate) pitch_kalman: Kalman1D,
+    /// ts of the last accepted sample, for Kalman dt.
     last_sample_ms: Option<u64>,
+    /// ts of the previous engine tick, for the render servo dt.
+    last_tick_ms: Option<u64>,
+    /// Critically-damped render servos (60 Hz) toward the mapped target:
+    /// they interpolate the 30 Hz Kalman output and kill sub-pixel shimmer.
+    servo_x: ServoAxis,
+    servo_y: ServoAxis,
     /// Face state as of the last sample; starts false so an engine without a
     /// camera feed honestly reports "no face" instead of faking an active ring.
     pub(crate) face_detected: bool,
@@ -185,8 +192,6 @@ pub(crate) struct EngineState {
     /// Latest normalized screen position (0..=1).
     pub(crate) norm: (f64, f64),
     pub(crate) speed_norm: f64,
-    prev_norm: Option<(f64, f64)>,
-    prev_norm_ts: Option<u64>,
     raw: (f64, f64),
     filtered: (f64, f64),
     /// P2 dwell/switch machine; advanced only when a window service exists.
@@ -212,17 +217,18 @@ impl EngineState {
             settings: config.settings,
             calibration: config.calibration,
             screen: config.screen,
-            yaw_filter: OneEuroFilter::head_pose(),
-            pitch_filter: OneEuroFilter::head_pose(),
+            yaw_kalman: Kalman1D::head_pose(),
+            pitch_kalman: Kalman1D::head_pose(),
             last_sample_ms: None,
+            last_tick_ms: None,
+            servo_x: ServoAxis::new(),
+            servo_y: ServoAxis::new(),
             face_detected: false,
             face_absent_since: None,
             last_input_active_ms: None,
             phase: EnginePhase::Idle,
             norm: (0.5, 0.5),
             speed_norm: 0.0,
-            prev_norm: None,
-            prev_norm_ts: None,
             raw: (0.0, 0.0),
             filtered: (0.0, 0.0),
             dwell: DwellState::default(),
@@ -245,9 +251,16 @@ pub(crate) fn step(
     now_ms: u64,
     input_active: bool,
 ) -> (HaloVisual, (f64, f64), DebugSnapshot) {
+    // Servo dt runs on tick time (60 Hz), independent of the ~30 Hz samples.
+    let tick_dt = match state.last_tick_ms {
+        Some(prev) => (now_ms.saturating_sub(prev) as f64 / 1000.0).clamp(MIN_DT, MAX_DT),
+        None => 1.0 / 60.0,
+    };
+    state.last_tick_ms = Some(now_ms);
+
     if let Some(sample) = sample {
-        // dt for the filters comes from sample timestamps (capture rate, not
-        // tick rate); clamped so clock glitches cannot destabilize them.
+        // dt for the Kalman filters comes from sample timestamps (capture
+        // rate, not tick rate); clamped so clock glitches cannot destabilize.
         let dt = match state.last_sample_ms {
             Some(prev) => (sample.ts_ms.saturating_sub(prev) as f64 / 1000.0).clamp(MIN_DT, MAX_DT),
             // First sample: any dt works, the filter passes through anyway.
@@ -257,8 +270,8 @@ pub(crate) fn step(
         state.face_detected = sample.face_detected;
 
         if sample.face_detected {
-            let fy = state.yaw_filter.filter(sample.yaw_deg, dt);
-            let fp = state.pitch_filter.filter(sample.pitch_deg, dt);
+            let (fy, _) = state.yaw_kalman.update(sample.yaw_deg, dt);
+            let (fp, _) = state.pitch_kalman.update(sample.pitch_deg, dt);
             state.raw = (sample.yaw_deg, sample.pitch_deg);
             state.filtered = (fy, fp);
             state.norm = map_pose(
@@ -269,32 +282,15 @@ pub(crate) fn step(
                 state.settings.camera_position == CameraPosition::Bottom,
                 state.settings.invert_pitch,
             );
-            // speed_norm: displacement per second in screen-width units
-            // (vertical displacement scaled by aspect) — feeds enterSpeed.
-            let aspect = if state.screen.width > 0.0 {
-                state.screen.height / state.screen.width
-            } else {
-                1.0
-            };
-            if let (Some((px, py)), Some(pt)) = (state.prev_norm, state.prev_norm_ts) {
-                let dt_s = (sample.ts_ms.saturating_sub(pt) as f64 / 1000.0).clamp(MIN_DT, MAX_DT);
-                let dx = state.norm.0 - px;
-                let dy = (state.norm.1 - py) * aspect;
-                state.speed_norm = (dx * dx + dy * dy).sqrt() / dt_s;
-            }
-            state.prev_norm = Some(state.norm);
-            state.prev_norm_ts = Some(sample.ts_ms);
         } else {
-            // Face lost: pose is zero (maps to center). Freeze the filters
-            // (feeding them zeros would drag their memory toward the center
-            // and cause a snap when the face returns) and reset the speed
-            // baseline so the return jump is not measured as velocity.
+            // Face lost: reset the Kalman filters (a returning face must not
+            // be dragged through stale velocity); the target becomes screen
+            // center and the render servo glides there smoothly.
+            state.yaw_kalman.reset();
+            state.pitch_kalman.reset();
             state.raw = (0.0, 0.0);
             state.filtered = (0.0, 0.0);
             state.norm = (0.5, 0.5);
-            state.speed_norm = 0.0;
-            state.prev_norm = None;
-            state.prev_norm_ts = None;
         }
     }
 
@@ -323,10 +319,25 @@ pub(crate) fn step(
     };
     state.phase = phase;
 
+    // Render servo (P+D, critically damped): interpolates the 30 Hz Kalman
+    // target into smooth 60 Hz motion and suppresses sub-pixel shimmer.
+    // speed_norm comes from the servo velocity (screen-width units per
+    // second, vertical scaled by aspect) — feeds enterSpeed.
+    let tuning = ServoTuning::from_smooth_ms(state.settings.smooth_ms as f64);
+    let target_x = state.norm.0 * state.screen.width;
+    let target_y = state.norm.1 * state.screen.height;
     let local = (
-        state.norm.0 * state.screen.width,
-        state.norm.1 * state.screen.height,
+        state.servo_x.step(target_x, tick_dt, &tuning),
+        state.servo_y.step(target_y, tick_dt, &tuning),
     );
+    let aspect = if state.screen.width > 0.0 {
+        state.screen.height / state.screen.width
+    } else {
+        1.0
+    };
+    let vx = state.servo_x.velocity() / state.screen.width.max(1.0);
+    let vy = state.servo_y.velocity() * aspect / state.screen.width.max(1.0);
+    state.speed_norm = (vx * vx + vy * vy).sqrt();
 
     // P3 emergency lock: another suspend source next to face/input — the
     // dwell machine gets suspend=true (visual Suspended, no timing), so no
@@ -919,13 +930,32 @@ mod tests {
     }
 
     #[test]
-    fn face_loss_pulls_position_to_center_and_zeroes_speed() {
+    fn face_loss_glides_to_center_and_settles() {
         let mut s = test_state();
         step(&mut s, Some(sample(0, true, 18.0, 0.0)), 0, false);
+        // First tick after the loss: the target is screen center and the
+        // render servo starts gliding there (no teleport).
         let (_, local, snap) = step(&mut s, Some(sample(33, false, 0.0, 0.0)), 33, false);
-        assert_eq!(local, (500.0, 250.0), "no face maps to screen center");
-        assert_eq!(snap.speed_norm, 0.0);
+        assert!(
+            local.0 > 500.0 && local.0 < 1000.0,
+            "glides toward center, got {local:?}"
+        );
         assert!(!snap.face_detected);
+        // After ~2 s of ticks the servo settles at center, speed ~0.
+        let mut last = (local, snap);
+        for i in 2..=130u64 {
+            let t = 33 + i * 16;
+            last = {
+                let (_, l, sn) = step(&mut s, None, t, false);
+                (l, sn)
+            };
+        }
+        assert!(
+            (last.0 .0 - 500.0).abs() < 2.0,
+            "settled at center, got {:?}",
+            last.0
+        );
+        assert!(last.1.speed_norm < 0.01, "speed {}", last.1.speed_norm);
     }
 
     #[test]

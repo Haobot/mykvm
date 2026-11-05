@@ -3992,6 +3992,15 @@ function App() {
                   step={0.05}
                   onCommit={(value) => setFocusHaloSetting("haloOpacity", value)}
                 />
+                <HaloNumberField
+                  label={ui.settings.haloSmoothMs}
+                  help={ui.settings.haloSmoothMsHelp}
+                  value={haloSettings.smoothMs}
+                  min={80}
+                  max={400}
+                  step={10}
+                  onCommit={(value) => setFocusHaloSetting("smoothMs", value)}
+                />
                 <details
                   className="surface-card"
                   style={{ marginTop: 12, padding: 12 }}

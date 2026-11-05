@@ -44,6 +44,7 @@ export const defaultLayout: LayoutState = {
     gain: 1,
     haloDiameter: 160,
     haloOpacity: 0.55,
+    smoothMs: 140,
     showProgress: true,
     switchZone: 'anywhere',
     cameraPosition: 'top',

@@ -15,6 +15,7 @@ const DEAD_ZONE_PERCENT: (f64, f64) = (3.0, 8.0);
 const GAIN: (f64, f64) = (0.5, 2.0);
 const HALO_DIAMETER: (f64, f64) = (140.0, 180.0);
 const HALO_OPACITY: (f64, f64) = (0.35, 0.9);
+const SMOOTH_MS: (u32, u32) = (80, 400);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -65,6 +66,9 @@ pub struct FocusHaloSettings {
     pub halo_diameter: f64,
     #[serde(default = "d_halo_opacity")]
     pub halo_opacity: f64,
+    /// Render-servo settle time (ms): smaller = snappier, larger = calmer.
+    #[serde(default = "d_smooth_ms")]
+    pub smooth_ms: u32,
     #[serde(default = "d_show_progress")]
     pub show_progress: bool,
     #[serde(default)]
@@ -126,6 +130,9 @@ fn d_halo_diameter() -> f64 {
 fn d_halo_opacity() -> f64 {
     0.55
 }
+fn d_smooth_ms() -> u32 {
+    140
+}
 fn d_show_progress() -> bool {
     true
 }
@@ -155,6 +162,7 @@ impl Default for FocusHaloSettings {
             gain: d_gain(),
             halo_diameter: d_halo_diameter(),
             halo_opacity: d_halo_opacity(),
+            smooth_ms: d_smooth_ms(),
             show_progress: d_show_progress(),
             switch_zone: SwitchZone::default(),
             camera_position: CameraPosition::default(),
@@ -188,6 +196,7 @@ impl FocusHaloSettings {
             gain: self.gain.clamp(GAIN.0, GAIN.1),
             halo_diameter: self.halo_diameter.clamp(HALO_DIAMETER.0, HALO_DIAMETER.1),
             halo_opacity: self.halo_opacity.clamp(HALO_OPACITY.0, HALO_OPACITY.1),
+            smooth_ms: self.smooth_ms.clamp(SMOOTH_MS.0, SMOOTH_MS.1),
             show_progress: self.show_progress,
             switch_zone: self.switch_zone,
             camera_position: self.camera_position,

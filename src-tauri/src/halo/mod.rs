@@ -16,6 +16,8 @@ pub mod engine;
 pub mod filter;
 pub mod focus_router;
 pub mod input_probe;
+pub mod kalman;
+pub mod smoothing;
 pub mod mapping;
 pub mod overlay;
 pub mod params;

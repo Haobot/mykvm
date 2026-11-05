@@ -45,6 +45,8 @@ export interface FocusHaloSettings {
   gain: number
   haloDiameter: number
   haloOpacity: number
+  /** Render-servo settle time in ms: smaller = snappier, larger = calmer. */
+  smoothMs: number
   showProgress: boolean
   switchZone: 'anywhere' | 'titlebar'
   cameraPosition: 'top' | 'bottom'
