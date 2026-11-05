@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- FocusHalo camera capture: macOS requires a usage description or the
+	     app is killed on first AVCaptureSession use. Tauri merges this file
+	     into the bundled .app's Info.plist (bundle.macOS.infoPlist). -->
+	<key>NSCameraUsageDescription</key>
+	<string>FocusHalo 使用摄像头进行本地头部姿态追踪，视频不会离开本机</string>
+</dict>
+</plist>

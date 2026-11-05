@@ -30,16 +30,26 @@ import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Theme } from "@tauri-apps/api/window";
 import "./App.css";
+import { defaultLayout } from "./defaultLayout";
 import {
   checkForAppUpdate,
   confirmLanPairing,
   dismissPairingRequest,
+  haloCaptureCalibrationPoint,
+  haloEmergencyStop,
+  haloGetStatus,
+  haloHideOverlay,
+  haloRecenter,
+  haloSetEnabled,
+  haloTestOverlay,
+  haloUndoSwitch,
   hideMainWindow,
   installInputService,
   installAppUpdate,
   isAutostartEnabled,
   isPortableMode,
   loadAppState,
+  listenHaloDebug,
   minimizeMainWindow,
   openLogDirectory,
   openRepositoryUrl,
@@ -69,7 +79,7 @@ import {
   uninstallInputService,
   writeClipboardText,
 } from "./desktopApi";
-import type { AppUpdateInfo } from "./desktopApi";
+import type { AppUpdateInfo, HaloVisual } from "./desktopApi";
 import { compareVersions } from "./versions";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
@@ -98,6 +108,9 @@ import type {
 import type {
   AppLanguage,
   Device,
+  FocusHaloSettings,
+  HaloDebugSnapshot,
+  HaloStatus,
   LayoutState,
   MachineRole,
   ModifierMap,
@@ -208,6 +221,19 @@ type UpdateStatus =
   | "installing"
   | "error";
 type InputServiceAction = "install" | "uninstall";
+
+// FocusHalo P0 debug card: the backend's halo_test_overlay_show visual names.
+const HALO_VISUAL_OPTIONS = ["idle", "candidate", "pulse", "suspended"] as const;
+
+// FocusHalo calibration flow: five capture steps, sent to the backend in this
+// order; "finish" is sent after the last one and validated there.
+const HALO_CALIBRATION_STEPS = [
+  { point: "center", nameKey: "haloCalibCenter", copyKey: "haloCalibCenterCopy" },
+  { point: "left", nameKey: "haloCalibLeft", copyKey: "haloCalibLeftCopy" },
+  { point: "right", nameKey: "haloCalibRight", copyKey: "haloCalibRightCopy" },
+  { point: "up", nameKey: "haloCalibUp", copyKey: "haloCalibUpCopy" },
+  { point: "down", nameKey: "haloCalibDown", copyKey: "haloCalibDownCopy" },
+] as const;
 
 interface ServerPairingState {
   peer: LanPeer;
@@ -339,6 +365,31 @@ function App() {
     "left" | "right" | "up" | "down" | null
   >(null);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
+  // FocusHalo P0 debug card state: component-local, never persisted.
+  const [haloScreenId, setHaloScreenId] = useState("");
+  const [haloX, setHaloX] = useState("");
+  const [haloY, setHaloY] = useState("");
+  const [haloVisual, setHaloVisual] = useState<HaloVisual>("idle");
+  const [haloProgress, setHaloProgress] = useState(50);
+  const [haloDiameter, setHaloDiameter] = useState("160");
+  // FocusHalo P1 state: runtime status, calibration wizard, and the live
+  // debug snapshot from the backend's 5 Hz `halo-debug` pump.
+  const [haloStatus, setHaloStatus] = useState<HaloStatus | null>(null);
+  const [haloError, setHaloError] = useState<string | null>(null);
+  const [haloPending, setHaloPending] = useState(false);
+  const [haloCalibOpen, setHaloCalibOpen] = useState(false);
+  const [haloCalibStep, setHaloCalibStep] = useState(0);
+  const [haloCalibBusy, setHaloCalibBusy] = useState(false);
+  const [haloCalibError, setHaloCalibError] = useState<string | null>(null);
+  const [haloDebug, setHaloDebug] = useState<HaloDebugSnapshot | null>(null);
+  // FocusHalo P3: which halo hotkey recorder is capturing a combo (same
+  // recorder protocol as the edge-switch/screen-switch buttons).
+  const [capturingHaloHotkey, setCapturingHaloHotkey] = useState<
+    "emergencyStop" | "undo" | "recenter" | null
+  >(null);
+  const haloHotkeyButtonRefs = useRef<
+    Record<"emergencyStop" | "undo" | "recenter", HTMLButtonElement | null>
+  >({ emergencyStop: null, undo: null, recenter: null });
   const [systemTheme, setSystemTheme] = useState<Exclude<ThemeMode, "system">>(
     () => getSystemTheme(),
   );
@@ -376,6 +427,56 @@ function App() {
   useEffect(() => {
     fileDragTargetIdRef.current = fileDragTargetId;
   }, [fileDragTargetId]);
+
+  // FocusHalo P1: echo the backend runtime status once on load so the
+  // settings card reflects a halo enabled through a previous session.
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+    let active = true;
+    void haloGetStatus()
+      .then((status) => {
+        if (active) {
+          setHaloStatus(status);
+        }
+      })
+      .catch(() => {
+        // Status is a mirror, not a requirement; leave the card at "stopped".
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Subscribe to the 5 Hz debug stream while it can actually flow: the backend
+  // pump only emits while tracking runs, and the calibration wizard needs the
+  // live face indicator even across a freshly enabled session. The snapshot is
+  // only rendered inside haloDebugEnabled-guarded sections, so a leftover
+  // value after unlistening is never shown — cleanup only unlistens.
+  const haloDebugEnabled = isTauri() && (haloStatus?.running || haloCalibOpen);
+  useEffect(() => {
+    if (!haloDebugEnabled) {
+      return;
+    }
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void listenHaloDebug((snapshot) => {
+      if (!disposed) {
+        setHaloDebug(snapshot);
+      }
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [haloDebugEnabled]);
 
   useEffect(() => {
     if (!isTauri()) {
@@ -1760,6 +1861,72 @@ function App() {
     }));
   }
 
+  function setFocusHaloSetting<K extends keyof FocusHaloSettings>(
+    key: K,
+    value: FocusHaloSettings[K],
+  ) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      focusHalo: {
+        ...(layoutState.focusHalo ?? defaultLayout.focusHalo!),
+        [key]: value,
+      },
+    }));
+  }
+
+  function resetHaloDefaults() {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      focusHalo: { ...defaultLayout.focusHalo! },
+    }));
+  }
+
+  const captureHaloHotkey = useEffectEvent((event: KeyboardEvent) => {
+    const field = capturingHaloHotkey;
+    if (!field) {
+      return;
+    }
+    const hotkey = hotkeyFromKeyboardEvent(event, metaKeyLabel);
+    if (!hotkey) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    void setHotkeyRecording(false, hotkey).catch((error: unknown) => setErrorMessage(String(error)));
+    setFocusHaloSetting(haloHotkeyFieldKeys[field], hotkey);
+    setCapturingHaloHotkey(null);
+  });
+
+  useEffect(() => {
+    if (!capturingHaloHotkey) {
+      return;
+    }
+    const cancelIfOutsideRecorder = (event: Event) => {
+      const target = event.target;
+      const button = haloHotkeyButtonRefs.current[capturingHaloHotkey];
+      if (target instanceof Node && button?.contains(target)) {
+        return;
+      }
+      setCapturingHaloHotkey(null);
+    };
+    const cancelRecording = () => setCapturingHaloHotkey(null);
+
+    window.addEventListener("keydown", captureHaloHotkey, true);
+    document.addEventListener("pointerdown", cancelIfOutsideRecorder, true);
+    document.addEventListener("focusin", cancelIfOutsideRecorder, true);
+    window.addEventListener("blur", cancelRecording);
+    return () => {
+      window.removeEventListener("keydown", captureHaloHotkey, true);
+      document.removeEventListener(
+        "pointerdown",
+        cancelIfOutsideRecorder,
+        true,
+      );
+      document.removeEventListener("focusin", cancelIfOutsideRecorder, true);
+      window.removeEventListener("blur", cancelRecording);
+    };
+  }, [capturingHaloHotkey]);
+
   const captureScreenSwitchHotkey = useEffectEvent((event: KeyboardEvent) => {
     const direction = capturingDirection;
     if (!direction) {
@@ -1807,10 +1974,13 @@ function App() {
   }, [capturingDirection]);
 
   useEffect(() => {
-    const recording = isCapturingEdgeSwitchHotkey || capturingDirection !== null;
+    const recording =
+      isCapturingEdgeSwitchHotkey ||
+      capturingDirection !== null ||
+      capturingHaloHotkey !== null;
     void setHotkeyRecording(recording).catch(() => {});
     return () => { if (recording) void setHotkeyRecording(false).catch(() => {}); };
-  }, [isCapturingEdgeSwitchHotkey, capturingDirection]);
+  }, [isCapturingEdgeSwitchHotkey, capturingDirection, capturingHaloHotkey]);
 
   function setTransportPortMode(transportPortMode: TransportPortMode) {
     updateLayout((layoutState) => ({
@@ -2544,6 +2714,144 @@ function App() {
   const serverFileTransferTargetIds = new Set(
     serverFileTransferTargets.map((device) => device.id),
   );
+  // FocusHalo P0 debug card data: this machine's detected screens, with the
+  // inputs defaulting to the selected screen's center.
+  const haloScreens =
+    displayLayout.devices.find((device) => device.role === "local")?.screens ??
+    [];
+  // FocusHalo settings card: fall back to the defaults when an older
+  // snapshot omits focusHalo entirely (same contract as handleHaloEnabled).
+  const haloSettings = layout.focusHalo ?? defaultLayout.focusHalo!;
+  const selectedHaloScreen =
+    haloScreens.find((screen) => screen.id === haloScreenId) ??
+    haloScreens[0] ??
+    null;
+  // The backend takes screen-LOCAL logical points, so the defaults are the
+  // selected screen's own center — not its layout-board position.
+  const haloDefaultX = selectedHaloScreen
+    ? Math.round(selectedHaloScreen.width / 2)
+    : 0;
+  const haloDefaultY = selectedHaloScreen
+    ? Math.round(selectedHaloScreen.height / 2)
+    : 0;
+
+  function selectHaloScreen(screenId: string) {
+    setHaloScreenId(screenId);
+    const screen = haloScreens.find((entry) => entry.id === screenId);
+    if (screen) {
+      setHaloX(String(Math.round(screen.width / 2)));
+      setHaloY(String(Math.round(screen.height / 2)));
+    }
+  }
+
+  function showHaloTestOverlay() {
+    if (!selectedHaloScreen) {
+      return;
+    }
+    void haloTestOverlay({
+      screenId: selectedHaloScreen.id,
+      x: Number(haloX) || haloDefaultX,
+      y: Number(haloY) || haloDefaultY,
+      visual: haloVisual,
+      progress: haloProgress / 100,
+      diameter: Number(haloDiameter) || 160,
+    });
+  }
+
+  function haloErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  // Enable/disable: call the backend first and only persist the flag once it
+  // succeeded, so a failed camera/model start never writes enabled=true.
+  // The save_layout hook re-applies the same command; HaloRuntime treats a
+  // re-enable while running as "apply settings" (no camera restart).
+  async function handleHaloEnabled(next: boolean) {
+    if (haloPending) {
+      return;
+    }
+    setHaloPending(true);
+    setHaloError(null);
+    try {
+      await haloSetEnabled(next);
+      setHaloStatus((current) => ({
+        running: next,
+        cameraOk: true,
+        reason: next ? null : (current?.reason ?? null),
+      }));
+      updateLayout((layoutState) => {
+        // defaultLayout.focusHalo is always assigned; the optional typing comes
+        // from the LayoutState property itself.
+        const focusHalo = layoutState.focusHalo ?? defaultLayout.focusHalo!;
+        return {
+          ...layoutState,
+          focusHalo: { ...focusHalo, enabled: next },
+        };
+      });
+    } catch (error) {
+      setHaloError(haloErrorMessage(error));
+    } finally {
+      setHaloPending(false);
+    }
+  }
+
+  async function handleHaloRecenter() {
+    if (haloPending) {
+      return;
+    }
+    setHaloPending(true);
+    setHaloError(null);
+    try {
+      await haloRecenter();
+      // Recenter rewrote focus_halo on disk behind our snapshot; reload so a
+      // later unrelated save cannot roll the shifted calibration back.
+      setSnapshot(await loadAppState());
+    } catch (error) {
+      setHaloError(haloErrorMessage(error));
+    } finally {
+      setHaloPending(false);
+    }
+  }
+
+  function openHaloCalibration() {
+    setHaloCalibError(null);
+    setHaloCalibStep(0);
+    setHaloCalibOpen(true);
+  }
+
+  function closeHaloCalibration() {
+    if (!haloCalibBusy) {
+      setHaloCalibOpen(false);
+      setHaloCalibError(null);
+    }
+  }
+
+  // One wizard step: capture the current point, then advance; after the last
+  // point the backend validates monotonicity ("finish") before we close.
+  async function captureHaloCalibrationStep(stepIndex: number) {
+    if (haloCalibBusy) {
+      return;
+    }
+    setHaloCalibBusy(true);
+    setHaloCalibError(null);
+    try {
+      await haloCaptureCalibrationPoint(HALO_CALIBRATION_STEPS[stepIndex].point);
+      if (stepIndex + 1 < HALO_CALIBRATION_STEPS.length) {
+        setHaloCalibStep(stepIndex + 1);
+      } else {
+        await haloCaptureCalibrationPoint("finish");
+        setHaloCalibOpen(false);
+        // Same reason as recenter: the layout on disk now carries the
+        // captured calibration; refresh before any other save round-trips a
+        // stale snapshot over it.
+        setSnapshot(await loadAppState());
+      }
+    } catch (error) {
+      setHaloCalibError(haloErrorMessage(error));
+    } finally {
+      setHaloCalibBusy(false);
+    }
+  }
 
   function screenFileTransferTargetId(screen: FlattenedScreen) {
     if (
@@ -3584,6 +3892,577 @@ function App() {
                   </p>
                 ) : null}
               </section>
+
+              <section className="surface-card settings-card">
+                <div className="card-title-row">
+                  <h2>{ui.settings.haloTitle}</h2>
+                  <span
+                    className="muted-copy"
+                    title={haloStatus?.reason ?? undefined}
+                  >
+                    {haloStatus?.running
+                      ? ui.settings.haloStatusRunning
+                      : haloStatus?.reason
+                        ? `${ui.settings.haloStatusCameraError}: ${haloStatus.reason}`
+                        : ui.settings.haloStatusStopped}
+                  </span>
+                </div>
+                <p className="muted-copy">{ui.settings.haloCopy}</p>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.haloEnable}
+                    <InfoTip label={ui.settings.haloEnable} text={ui.settings.haloCalibrationHint} />
+                  </span>
+                  <div className="segmented-control" role="group" aria-label={ui.settings.haloEnable}>
+                    <button
+                      type="button"
+                      className={haloStatus?.running ? "active" : ""}
+                      aria-pressed={haloStatus?.running ?? false}
+                      disabled={haloPending || !isTauri()}
+                      onClick={() => void handleHaloEnabled(true)}
+                    >
+                      {ui.settings.autostartOn}
+                    </button>
+                    <button
+                      type="button"
+                      className={!haloStatus?.running ? "active" : ""}
+                      aria-pressed={!(haloStatus?.running ?? false)}
+                      disabled={haloPending || !isTauri()}
+                      onClick={() => void handleHaloEnabled(false)}
+                    >
+                      {ui.settings.autostartOff}
+                    </button>
+                  </div>
+                </div>
+                {haloError ? (
+                  <p className="muted-copy diagnostic-message">{haloError}</p>
+                ) : null}
+                <p className="muted-copy">{ui.settings.haloCalibrationHint}</p>
+                <div className="inline-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={openHaloCalibration}
+                    disabled={haloPending || !isTauri()}
+                  >
+                    {ui.settings.haloRecalibrate}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void handleHaloRecenter()}
+                    disabled={haloPending || !(haloStatus?.running ?? false)}
+                  >
+                    {ui.settings.haloRecenter}
+                  </button>
+                </div>
+                <HaloNumberField
+                  label={ui.settings.haloDwell}
+                  help={ui.settings.haloDwellHelp}
+                  value={haloSettings.dwellMs}
+                  min={600}
+                  max={2000}
+                  step={50}
+                  onCommit={(value) => setFocusHaloSetting("dwellMs", value)}
+                />
+                <HaloNumberField
+                  label={ui.settings.haloCooldown}
+                  help={ui.settings.haloCooldownHelp}
+                  value={haloSettings.cooldownMs}
+                  min={300}
+                  max={1500}
+                  step={50}
+                  onCommit={(value) => setFocusHaloSetting("cooldownMs", value)}
+                />
+                <HaloNumberField
+                  label={ui.settings.haloDiameter}
+                  help={ui.settings.haloDiameterHelp}
+                  value={haloSettings.haloDiameter}
+                  min={140}
+                  max={180}
+                  step={5}
+                  onCommit={(value) => setFocusHaloSetting("haloDiameter", value)}
+                />
+                <HaloNumberField
+                  label={ui.settings.haloOpacity}
+                  help={ui.settings.haloOpacityHelp}
+                  value={haloSettings.haloOpacity}
+                  min={0.35}
+                  max={0.9}
+                  step={0.05}
+                  onCommit={(value) => setFocusHaloSetting("haloOpacity", value)}
+                />
+                <HaloNumberField
+                  label={ui.settings.haloSmoothMs}
+                  help={ui.settings.haloSmoothMsHelp}
+                  value={haloSettings.smoothMs}
+                  min={80}
+                  max={400}
+                  step={10}
+                  onCommit={(value) => setFocusHaloSetting("smoothMs", value)}
+                />
+                <details
+                  className="surface-card"
+                  style={{ marginTop: 12, padding: 12 }}
+                >
+                  <summary
+                    style={{
+                      cursor: "pointer",
+                      color: "#a1a1aa",
+                      fontSize: 14,
+                      userSelect: "none",
+                    }}
+                  >
+                    {ui.settings.haloAdvanced}
+                  </summary>
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 4,
+                      marginTop: 10,
+                    }}
+                  >
+                    <HaloNumberField
+                      label={ui.settings.haloSettle}
+                      help={ui.settings.haloSettleHelp}
+                      value={haloSettings.settleMs}
+                      min={80}
+                      max={400}
+                      step={10}
+                      onCommit={(value) => setFocusHaloSetting("settleMs", value)}
+                    />
+                    <HaloNumberField
+                      label={ui.settings.haloEnterSpeed}
+                      help={ui.settings.haloEnterSpeedHelp}
+                      value={haloSettings.enterSpeed}
+                      min={0.05}
+                      max={0.4}
+                      step={0.05}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("enterSpeed", value)
+                      }
+                    />
+                    <HaloNumberField
+                      label={ui.settings.haloUndoMs}
+                      help={ui.settings.haloUndoMsHelp}
+                      value={haloSettings.undoMs}
+                      min={1000}
+                      max={10000}
+                      step={250}
+                      onCommit={(value) => setFocusHaloSetting("undoMs", value)}
+                    />
+                    <HaloNumberField
+                      label={ui.settings.haloDeadZone}
+                      help={ui.settings.haloDeadZoneHelp}
+                      value={haloSettings.deadZonePercent}
+                      min={3}
+                      max={8}
+                      step={0.5}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("deadZonePercent", value)
+                      }
+                    />
+                    <HaloNumberField
+                      label={ui.settings.haloGain}
+                      help={ui.settings.haloGainHelp}
+                      value={haloSettings.gain}
+                      min={0.5}
+                      max={2}
+                      step={0.1}
+                      onCommit={(value) => setFocusHaloSetting("gain", value)}
+                    />
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloShowProgress}</span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={haloSettings.showProgress ? "active" : ""}
+                          onClick={() =>
+                            setFocusHaloSetting("showProgress", true)
+                          }
+                        >
+                          {ui.common.enabled}
+                        </button>
+                        <button
+                          type="button"
+                          className={!haloSettings.showProgress ? "active" : ""}
+                          onClick={() =>
+                            setFocusHaloSetting("showProgress", false)
+                          }
+                        >
+                          {ui.common.disabled}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloSwitchZone}</span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={
+                            haloSettings.switchZone === "anywhere" ? "active" : ""
+                          }
+                          onClick={() =>
+                            setFocusHaloSetting("switchZone", "anywhere")
+                          }
+                        >
+                          {ui.settings.haloSwitchZoneAnywhere}
+                        </button>
+                        <button
+                          type="button"
+                          className={
+                            haloSettings.switchZone === "titlebar" ? "active" : ""
+                          }
+                          onClick={() =>
+                            setFocusHaloSetting("switchZone", "titlebar")
+                          }
+                        >
+                          {ui.settings.haloSwitchZoneTitlebar}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloCameraPosition}</span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={
+                            haloSettings.cameraPosition === "top" ? "active" : ""
+                          }
+                          onClick={() =>
+                            setFocusHaloSetting("cameraPosition", "top")
+                          }
+                        >
+                          {ui.settings.haloCameraTop}
+                        </button>
+                        <button
+                          type="button"
+                          className={
+                            haloSettings.cameraPosition === "bottom"
+                              ? "active"
+                              : ""
+                          }
+                          onClick={() =>
+                            setFocusHaloSetting("cameraPosition", "bottom")
+                          }
+                        >
+                          {ui.settings.haloCameraBottom}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloInvertPitch}</span>
+                      <div className="segmented-control">
+                        <button
+                          type="button"
+                          className={!haloSettings.invertPitch ? "active" : ""}
+                          onClick={() => setFocusHaloSetting("invertPitch", false)}
+                        >
+                          {ui.settings.haloInvertPitchOff}
+                        </button>
+                        <button
+                          type="button"
+                          className={haloSettings.invertPitch ? "active" : ""}
+                          onClick={() => setFocusHaloSetting("invertPitch", true)}
+                        >
+                          {ui.settings.haloInvertPitchOn}
+                        </button>
+                      </div>
+                    </div>
+                    <HaloListField
+                      label={ui.settings.haloTitleBlacklist}
+                      help={ui.settings.haloBlacklistHelp}
+                      placeholder={ui.settings.haloBlacklistPlaceholder}
+                      value={haloSettings.titleBlacklist}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("titleBlacklist", value)
+                      }
+                    />
+                    <HaloListField
+                      label={ui.settings.haloProcessBlacklist}
+                      help={ui.settings.haloBlacklistHelp}
+                      placeholder={ui.settings.haloBlacklistPlaceholder}
+                      value={haloSettings.processBlacklist}
+                      onCommit={(value) =>
+                        setFocusHaloSetting("processBlacklist", value)
+                      }
+                    />
+                    {(
+                      [
+                        ["emergencyStop", ui.settings.haloEmergencyHotkey, ui.settings.haloEmergencyHotkeyHelp],
+                        ["undo", ui.settings.haloUndoHotkey, ui.settings.haloUndoHotkeyHelp],
+                        ["recenter", ui.settings.haloRecenterHotkey, ui.settings.haloRecenterHotkeyHelp],
+                      ] as const
+                    ).map(([field, label, help]) => (
+                      <div className="settings-control-row" key={field}>
+                        <span>
+                          {label}
+                          <InfoTip label={label} text={help} />
+                        </span>
+                        <div
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 8,
+                          }}
+                        >
+                          <button
+                            type="button"
+                            ref={(el) => {
+                              haloHotkeyButtonRefs.current[field] = el;
+                            }}
+                            className={`hotkey-recorder-button ${
+                              capturingHaloHotkey === field ? "recording" : ""
+                            }`}
+                            aria-pressed={capturingHaloHotkey === field}
+                            onClick={() =>
+                              setCapturingHaloHotkey((current) =>
+                                current === field ? null : field,
+                              )
+                            }
+                          >
+                            {capturingHaloHotkey === field
+                              ? ui.settings.haloHotkeyRecording
+                              : renderHotkeyTags(
+                                  formatEdgeSwitchHotkeyForDisplay(
+                                    haloSettings[haloHotkeyFieldKeys[field]],
+                                    metaKeyLabel,
+                                  ),
+                                  localPlatform,
+                                )}
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-button compact-button"
+                            disabled={
+                              haloSettings[haloHotkeyFieldKeys[field]] ===
+                              "disabled"
+                            }
+                            onClick={() =>
+                              setFocusHaloSetting(
+                                haloHotkeyFieldKeys[field],
+                                "disabled",
+                              )
+                            }
+                          >
+                            {ui.settings.haloHotkeyClear}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        onClick={() => void haloUndoSwitch()}
+                        disabled={!isTauri()}
+                      >
+                        {ui.settings.haloUndoButton}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button compact-button danger-button"
+                        onClick={() => void haloEmergencyStop()}
+                        disabled={!isTauri()}
+                      >
+                        {ui.settings.haloEmergencyButton}
+                      </button>
+                    </div>
+                    <div className="inline-actions">
+                      <button
+                        type="button"
+                        className="secondary-button compact-button"
+                        onClick={resetHaloDefaults}
+                      >
+                        {ui.settings.haloResetDefaults}
+                      </button>
+                    </div>
+                  </div>
+                </details>
+              </section>
+
+              <section className="surface-card settings-card">
+                <div className="card-title-row">
+                  <h2>{ui.settings.haloDebugTitle}</h2>
+                  {haloStatus?.running ? (
+                    <span className="muted-copy">{ui.settings.haloStatusRunning}</span>
+                  ) : null}
+                </div>
+                {haloDebugEnabled ? (
+                  <>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveFace}</span>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        <span
+                          aria-hidden="true"
+                          style={{
+                            width: 10,
+                            height: 10,
+                            borderRadius: "50%",
+                            display: "inline-block",
+                            backgroundColor: haloDebug?.faceDetected ? "#34c759" : "#e0524f",
+                          }}
+                        />
+                        {haloDebug
+                          ? haloDebug.faceDetected
+                            ? ui.settings.haloPhaseIdle
+                            : ui.settings.haloPhaseSuspendedFace
+                          : ui.common.none}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveRaw}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {formatHaloDegrees(haloDebug?.rawYaw)} /{" "}
+                        {formatHaloDegrees(haloDebug?.rawPitch)}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveFiltered}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {formatHaloDegrees(haloDebug?.filteredYaw)} /{" "}
+                        {formatHaloDegrees(haloDebug?.filteredPitch)}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveNorm}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {haloDebug
+                          ? `${Math.round(haloDebug.normX * 100)}% / ${Math.round(
+                              haloDebug.normY * 100,
+                            )}%`
+                          : "--"}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveSpeed}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {haloDebug ? haloDebug.speedNorm.toFixed(2) : "--"}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLivePhase}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {haloDebug
+                          ? haloDebug.phase === "suspended_face"
+                            ? ui.settings.haloPhaseSuspendedFace
+                            : haloDebug.phase === "suspended_input"
+                              ? ui.settings.haloPhaseSuspendedInput
+                              : ui.settings.haloPhaseIdle
+                          : "--"}
+                      </span>
+                    </div>
+                    <div className="settings-control-row">
+                      <span>{ui.settings.haloLiveSource}</span>
+                      <span className="settings-number-input" style={{ textAlign: "right" }}>
+                        {ui.settings.haloLiveSourceCamera}
+                      </span>
+                    </div>
+                    <p className="muted-copy">{ui.settings.haloDebugManualHint}</p>
+                  </>
+                ) : null}
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloDebugScreen}</span>
+                  <select
+                    className="settings-number-input"
+                    value={selectedHaloScreen?.id ?? ""}
+                    onChange={(event) => selectHaloScreen(event.target.value)}
+                  >
+                    {haloScreens.map((screen) => (
+                      <option key={screen.id} value={screen.id}>
+                        {screen.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloDebugX}</span>
+                  <input
+                    className="settings-number-input"
+                    type="number"
+                    value={haloX}
+                    placeholder={String(haloDefaultX)}
+                    onChange={(event) => setHaloX(event.target.value)}
+                  />
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloDebugY}</span>
+                  <input
+                    className="settings-number-input"
+                    type="number"
+                    value={haloY}
+                    placeholder={String(haloDefaultY)}
+                    onChange={(event) => setHaloY(event.target.value)}
+                  />
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloDebugVisual}</span>
+                  <select
+                    className="settings-number-input"
+                    value={haloVisual}
+                    onChange={(event) =>
+                      setHaloVisual(event.target.value as HaloVisual)
+                    }
+                  >
+                    {HALO_VISUAL_OPTIONS.map((visual) => (
+                      <option key={visual} value={visual}>
+                        {visual === "idle"
+                          ? ui.settings.haloDebugVisualIdle
+                          : visual === "candidate"
+                            ? ui.settings.haloDebugVisualCandidate
+                            : visual === "pulse"
+                              ? ui.settings.haloDebugVisualPulse
+                              : ui.settings.haloDebugVisualSuspended}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {haloVisual === "candidate" ? (
+                  <div className="settings-control-row">
+                    <span>{ui.settings.haloDebugProgress}</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={haloProgress}
+                      onChange={(event) =>
+                        setHaloProgress(Number(event.target.value))
+                      }
+                    />
+                  </div>
+                ) : null}
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloDebugDiameter}</span>
+                  <input
+                    className="settings-number-input"
+                    type="number"
+                    min="140"
+                    max="180"
+                    value={haloDiameter}
+                    placeholder="160"
+                    onChange={(event) => setHaloDiameter(event.target.value)}
+                  />
+                </div>
+                <div className="inline-actions">
+                  <button
+                    type="button"
+                    className="primary-button compact-button"
+                    onClick={showHaloTestOverlay}
+                    disabled={!selectedHaloScreen || !isTauri() || haloStatus?.running}
+                  >
+                    {ui.settings.haloDebugShow}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void haloHideOverlay()}
+                    disabled={!isTauri()}
+                  >
+                    {ui.settings.haloDebugHide}
+                  </button>
+                </div>
+              </section>
             </div>
           </div>
         </section>
@@ -3707,6 +4586,119 @@ function App() {
         </div>
       ) : null}
 
+      {haloCalibOpen ? (
+        <div className="pairing-modal-backdrop" role="presentation">
+          <div className="pairing-modal">
+            <div>
+              <p className="eyebrow">FocusHalo</p>
+              <h2>{ui.settings.haloCalibTitle}</h2>
+            </div>
+            {haloStatus?.running ? (
+              <>
+                <p className="muted-copy">
+                  {ui.settings.haloCalibStep} {haloCalibStep + 1}/
+                  {HALO_CALIBRATION_STEPS.length}
+                  {" · "}
+                  {ui.settings[HALO_CALIBRATION_STEPS[haloCalibStep].nameKey]}
+                </p>
+                <p>{ui.settings[HALO_CALIBRATION_STEPS[haloCalibStep].copyKey]}</p>
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloLiveFace}</span>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: "50%",
+                        display: "inline-block",
+                        backgroundColor: haloDebug?.faceDetected ? "#34c759" : "#e0524f",
+                      }}
+                    />
+                    {haloDebug?.faceDetected
+                      ? ui.settings.haloPhaseIdle
+                      : ui.settings.haloPhaseSuspendedFace}
+                  </span>
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloLiveReadout}</span>
+                  <span className="muted-copy">
+                    {ui.settings.haloPitchLabel}{" "}
+                    {haloDebug ? (haloDebug.rawPitch ?? 0).toFixed(1) : "–"}° ·{" "}
+                    {ui.settings.haloYawLabel}{" "}
+                    {haloDebug ? (haloDebug.rawYaw ?? 0).toFixed(1) : "–"}°
+                  </span>
+                </div>
+                {haloCalibError ? (
+                  <p className="muted-copy diagnostic-message">{haloCalibError}</p>
+                ) : null}
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloInvertPitch}</span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={!haloSettings.invertPitch ? "active" : ""}
+                      onClick={() => setFocusHaloSetting("invertPitch", false)}
+                    >
+                      {ui.settings.haloInvertPitchOff}
+                    </button>
+                    <button
+                      type="button"
+                      className={haloSettings.invertPitch ? "active" : ""}
+                      onClick={() => setFocusHaloSetting("invertPitch", true)}
+                    >
+                      {ui.settings.haloInvertPitchOn}
+                    </button>
+                  </div>
+                </div>
+                <p className="muted-copy">{ui.settings.haloInvertPitchCalibHint}</p>
+                <div className="pairing-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={closeHaloCalibration}
+                    disabled={haloCalibBusy}
+                  >
+                    {ui.settings.haloCalibClose}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={() => void captureHaloCalibrationStep(haloCalibStep)}
+                    disabled={haloCalibBusy}
+                  >
+                    {haloCalibBusy
+                      ? ui.common.pending
+                      : ui.settings.haloCalibCapture}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="muted-copy">{ui.settings.haloCalibNeedRunning}</p>
+                <div className="pairing-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={closeHaloCalibration}
+                  >
+                    {ui.settings.haloCalibClose}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={haloPending || !isTauri()}
+                    onClick={() => void handleHaloEnabled(true)}
+                  >
+                    {ui.settings.autostartOn}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+
       <footer className="app-footer">
         <span className="footer-copy">
           <span>
@@ -3773,6 +4765,15 @@ function getSystemTheme(): Exclude<ThemeMode, "system"> {
   return "dark";
 }
 
+// Debug-panel degree readout: one decimal, always signed-safe; "--" when the
+// debug stream has not delivered a snapshot yet.
+function formatHaloDegrees(value: number | undefined): string {
+  if (value === undefined || Number.isNaN(value)) {
+    return "--";
+  }
+  return `${value.toFixed(1)}°`;
+}
+
 function resolveTheme(
   themeMode: ThemeMode,
   systemTheme: Exclude<ThemeMode, "system">,
@@ -3835,6 +4836,148 @@ function normalizePort(value: number) {
 function normalizeEdgeSwitchHotkeyInput(value: string) {
   const normalized = value.trim().toLowerCase().replace(/\s+/g, "");
   return normalized.length === 0 ? "alt+shift+k" : normalized;
+}
+
+/// Maps a halo hotkey recorder id to its FocusHaloSettings field.
+const haloHotkeyFieldKeys = {
+  emergencyStop: "emergencyStopHotkey",
+  undo: "undoHotkey",
+  recenter: "recenterHotkey",
+} as const satisfies Record<
+  "emergencyStop" | "undo" | "recenter",
+  keyof FocusHaloSettings
+>;
+
+/// One halo numeric settings row. Keeps a local draft so typing never fires
+/// a save per keystroke: in-range drafts commit on blur/Enter, out-of-range
+/// drafts are flagged (red border) and snap back to the persisted value. The
+/// backend clamps again on save_layout, so the committed value always lands
+/// inside the range even if the params table shifts.
+function HaloNumberField(props: {
+  label: string;
+  help: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(props.value));
+  const lastKnownValue = useRef(props.value);
+
+  // Resync the draft when the persisted value changes behind us (save-time
+  // clamping, reset-to-defaults, or a save from another window).
+  useEffect(() => {
+    if (lastKnownValue.current !== props.value) {
+      lastKnownValue.current = props.value;
+      setDraft(String(props.value));
+    }
+  }, [props.value]);
+
+  const parsed = Number(draft);
+  const valid =
+    draft.trim() !== "" &&
+    Number.isFinite(parsed) &&
+    parsed >= props.min &&
+    parsed <= props.max;
+
+  const commitDraft = () => {
+    if (valid && parsed !== props.value) {
+      lastKnownValue.current = parsed;
+      props.onCommit(parsed);
+    } else {
+      setDraft(String(props.value));
+    }
+  };
+
+  return (
+    <div className="settings-control-row">
+      <span>
+        {props.label}
+        <InfoTip label={props.label} text={props.help} />
+      </span>
+      <input
+        className="settings-number-input"
+        type="number"
+        min={props.min}
+        max={props.max}
+        step={props.step}
+        value={draft}
+        aria-invalid={valid ? undefined : "true"}
+        style={
+          valid
+            ? undefined
+            : {
+                borderColor: "rgba(248, 113, 113, 0.78)",
+                background: "rgba(127, 29, 29, 0.16)",
+              }
+        }
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commitDraft}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            (event.target as HTMLInputElement).blur();
+          }
+        }}
+      />
+    </div>
+  );
+}
+
+/// One halo comma-separated-list settings row (title/process blacklists).
+/// Same draft protocol as HaloNumberField: commits the parsed list on
+/// blur/Enter, otherwise snaps back to the persisted list.
+function HaloListField(props: {
+  label: string;
+  help: string;
+  placeholder: string;
+  value: string[];
+  onCommit: (value: string[]) => void;
+}) {
+  const joined = props.value.join(",");
+  const [draft, setDraft] = useState(joined);
+
+  useEffect(() => {
+    setDraft(joined);
+  }, [joined]);
+
+  const commitDraft = () => {
+    const parsed = draft
+      .split(",")
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+    const current = props.value;
+    const changed =
+      parsed.length !== current.length ||
+      parsed.some((part, index) => part !== current[index]);
+    if (changed) {
+      props.onCommit(parsed);
+    } else {
+      setDraft(joined);
+    }
+  };
+
+  return (
+    <div className="settings-control-row">
+      <span>
+        {props.label}
+        <InfoTip label={props.label} text={props.help} />
+      </span>
+      <input
+        className="settings-number-input"
+        type="text"
+        value={draft}
+        placeholder={props.placeholder}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commitDraft}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            (event.target as HTMLInputElement).blur();
+          }
+        }}
+      />
+    </div>
+  );
 }
 
 function renderHotkeyTags(displayHotkey: string, platform = "") {

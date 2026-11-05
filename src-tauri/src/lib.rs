@@ -27,6 +27,7 @@ mod clipboard_exchange;
 #[cfg(any(target_os = "windows", test))]
 mod drag_buffer;
 mod folder_transfer;
+pub mod halo;
 #[cfg(target_os = "windows")]
 pub mod headless_client;
 mod input;
@@ -127,6 +128,9 @@ const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
 const HELPER_PATH_ARG: &str = "--helper-path";
 const RUNTIME_STATE_EVENT: &str = "runtime-state-changed";
 const FILE_TRANSFER_PROGRESS_EVENT: &str = "file-transfer-progress";
+// FocusHalo P1 debug stream: one engine DebugSnapshot per emit, produced by
+// the 5 Hz pump thread spawned by halo_set_enabled.
+const HALO_DEBUG_EVENT: &str = "halo-debug";
 // Progress is emitted at most this often per file while sending (plus always on
 // completion) so a multi-GB transfer doesn't flood the webview with events.
 const FILE_TRANSFER_PROGRESS_INTERVAL_MS: u64 = 100;
@@ -257,6 +261,17 @@ impl Default for ScreenSwitchHotkeys {
     }
 }
 
+/// The three FocusHalo global hotkeys currently registered with the
+/// global-shortcut plugin. Values are canonical shortcut strings; an empty
+/// string means "not registered" ("disabled" or registration suppressed by
+/// recording/native-owner mode). Routing-only state, never serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct HaloShortcutSet {
+    emergency_stop: String,
+    undo: String,
+    recenter: String,
+}
+
 fn default_screen_switch_hotkey_left() -> String {
     "alt+left".into()
 }
@@ -319,6 +334,11 @@ struct LayoutState {
     edge_switch_hotkey: String,
     #[serde(default)]
     screen_switch_hotkeys: ScreenSwitchHotkeys,
+    /// Frontend-owned FocusHalo settings: save_layout keeps these payload-driven
+    /// (only sanitized once before they hit disk), unlike the backend-owned
+    /// pairing fields merged by merge_runtime_owned_layout_fields.
+    #[serde(default)]
+    focus_halo: halo::FocusHaloSettings,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -570,6 +590,18 @@ struct FileTransferProgress {
     error: Option<String>,
 }
 
+/// FocusHalo runtime status for the settings UI (`halo_get_status`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HaloStatus {
+    /// Tracking pipeline (camera + tracker + engine threads) is running.
+    running: bool,
+    /// The camera session started successfully.
+    camera_ok: bool,
+    /// Last enable failure (missing model, camera error, ...), if any.
+    reason: Option<String>,
+}
+
 // Carries what a per-file send needs to emit progress. Optional throughout the
 // send path so tests and any UI-less caller simply pass `None`.
 struct FileTransferProgressReporter<'a> {
@@ -673,7 +705,12 @@ struct AppRuntime {
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
+    halo_shortcuts: Mutex<HaloShortcutSet>,
     config_path: PathBuf,
+    /// P0 manual-test halo overlay; the P1 dwell engine will drive it later.
+    /// The overlay window is built lazily by the first show call, so a
+    /// disabled halo keeps the process thread-free.
+    halo: Mutex<halo::HaloRuntime>,
     #[cfg(target_os = "windows")]
     input_service_network_lease: Mutex<Option<std::fs::File>>,
 }
@@ -684,6 +721,7 @@ impl AppRuntime {
             .map(|saved_layout| normalize_saved_layout(saved_layout, detected_layout.clone()))
             .unwrap_or_else(|| detected_layout.clone());
         align_native_screen_ids(&mut detected_layout, &layout);
+        let halo_settings = layout.focus_halo.clone();
         let input_guard = SharedGuard::default();
         let notify_app = app_handle.clone();
         input_guard::set_notifier(
@@ -698,7 +736,7 @@ impl AppRuntime {
                 });
             }),
         );
-        Self {
+        let runtime = Self {
             app_handle,
             layout: Arc::new(Mutex::new(layout)),
             native_layout: Arc::new(Mutex::new(detected_layout.clone())),
@@ -730,10 +768,18 @@ impl AppRuntime {
             runtime_toggle_menu_item: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
+            halo_shortcuts: Mutex::new(HaloShortcutSet::default()),
             config_path,
+            halo: Mutex::new(halo::HaloRuntime::new()),
             #[cfg(target_os = "windows")]
             input_service_network_lease: Mutex::new(None),
+        };
+        // `layout` above already merged the on-disk config; seed the halo
+        // snapshot so the P0 test overlay follows the user's saved parameters.
+        if let Ok(mut halo) = runtime.halo.lock() {
+            halo.configure(halo_settings);
         }
+        runtime
     }
 
     fn snapshot(&self) -> AppStateSnapshot {
@@ -889,8 +935,28 @@ impl AppRuntime {
         let pairing_challenge_for_stream = Arc::clone(&self.pairing_challenge);
         let config_path_for_pairing = self.config_path.clone();
         let peers_for_pairing = Arc::clone(&self.peers);
+        let layout_for_halo_focus = Arc::clone(&self.layout);
+        let transport_packets_for_halo_focus = Arc::clone(&self.transport_packets);
+
+        // P4 cross-machine focus: install the receive hook once at transport
+        // startup. The hook is the only place that turns an authorized halo
+        // focus packet into UI work (window hit-test + passive highlight),
+        // because the input datagram chain has no AppHandle.
+        {
+            let app_handle_for_halo = self.app_handle.clone();
+            let _ = halo::focus_router::install_receive_hook(Box::new(move |packet| {
+                handle_remote_halo_focus(&app_handle_for_halo, packet);
+            }));
+        }
 
         let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
+            // Halo focus packets are display-only: a machine in controller
+            // mode (input_receive_enabled == false) must still show the
+            // remote highlight, so they are consumed before the receive gate.
+            if halo::focus_router::try_dispatch_received_focus(&layout_for_halo_focus, &payload) {
+                transport_packets_for_halo_focus.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if !input_receive_enabled.load(Ordering::Relaxed) {
                 return;
             }
@@ -1633,6 +1699,12 @@ impl AppRuntime {
     /// process is gone — instead of sending into a dead connection until its
     /// 10 s idle timeout.
     fn hand_off_network(&self) {
+        // Release the halo tracking pipeline first (camera + its threads) so
+        // an update relaunch finds the camera free. Bounded joins, so this
+        // cannot hang the hand-off.
+        if let Ok(mut halo) = self.halo.lock() {
+            halo.disable();
+        }
         self.stop_input();
         self.stop_clipboard();
         self.stop_discovery();
@@ -1719,6 +1791,10 @@ fn save_layout(
         saved_layout.input_protection = InputProtection::default();
         saved_layout.clipboard_on_demand = false;
         saved_layout.clipboard_paste_hotkey = default_clipboard_paste_hotkey();
+        // focus_halo is frontend-owned, so it travels with the incoming payload
+        // (no merge from `current`); a hand-edited snapshot must still be
+        // clamped back into range before it reaches disk or the overlay.
+        saved_layout.focus_halo = saved_layout.focus_halo.sanitized();
         validate_shared_hotkeys(&saved_layout)?;
         write_layout_to_disk(&state.config_path, &saved_layout)?;
         *stored_layout = saved_layout.clone();
@@ -1745,7 +1821,764 @@ fn save_layout(
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
     sync_clipboard_paste_shortcut(&state.app_handle)?;
+    sync_halo_shortcuts(&state.app_handle)?;
+    // Halo: an enabled-flag change starts/stops the tracking pipeline; the
+    // layout lock has been released above, so apply_halo_enabled can acquire
+    // the layout/native locks and the halo lock freely (it never nests them).
+    // A failed enable must not fail the already-persisted save; the reason is
+    // surfaced through halo_get_status instead.
+    let halo_enabled_changed =
+        previous_layout.focus_halo.enabled != saved_layout.focus_halo.enabled;
+    if halo_enabled_changed {
+        if let Err(error) = apply_halo_enabled(state.inner(), saved_layout.focus_halo.enabled) {
+            log::warn!(
+                "halo: failed to apply enabled={}: {error}",
+                saved_layout.focus_halo.enabled
+            );
+        }
+    } else if let Ok(mut halo) = state.halo.lock() {
+        if halo.is_running() {
+            // Parameters take effect immediately on save while tracking runs.
+            halo.set_settings(saved_layout.focus_halo.clone());
+        } else {
+            // Disabled: just refresh the snapshot the P0 test overlay reads.
+            halo.configure(saved_layout.focus_halo.clone());
+        }
+    }
     Ok(state.snapshot())
+}
+
+/// Native global origin for a layout screen, matching the semantics of
+/// input.rs `platform_native_screen`: macOS CG global coordinates already are
+/// points (identity), while Windows wants physical pixel origins.
+#[cfg(target_os = "windows")]
+fn halo_native_origin(screen: &Screen) -> (f64, f64) {
+    let scale = if screen.scale.is_finite() && screen.scale > 0.0 {
+        screen.scale
+    } else {
+        1.0
+    };
+    (screen.x as f64 * scale, screen.y as f64 * scale)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn halo_native_origin(screen: &Screen) -> (f64, f64) {
+    (screen.x as f64, screen.y as f64)
+}
+
+/// P0 manual test hook: draw one halo frame on a detected local screen at a
+/// screen-local logical point. The configure call first refreshes the
+/// diameter/opacity snapshot so this entry point follows the user's settings.
+#[tauri::command]
+fn halo_test_overlay_show(
+    state: tauri::State<'_, AppRuntime>,
+    screen_id: String,
+    x: f64,
+    y: f64,
+    visual: String,
+    progress: Option<f32>,
+    diameter: Option<f64>,
+) -> Result<(), String> {
+    let native_layout = state.native_layout();
+    let screen = native_layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .and_then(|device| device.screens.iter().find(|screen| screen.id == screen_id))
+        .ok_or_else(|| format!("screen {screen_id} not found on this machine"))?;
+    let (native_x, native_y) = halo_native_origin(screen);
+    let geometry = halo::OverlayScreenGeometry {
+        x: screen.x as f64,
+        y: screen.y as f64,
+        width: screen.width as f64,
+        height: screen.height as f64,
+        scale: screen.scale,
+        native_x,
+        native_y,
+    };
+    let visual = match visual.as_str() {
+        "idle" => halo::HaloVisual::Idle,
+        "candidate" => halo::HaloVisual::Candidate {
+            progress: progress.unwrap_or(0.5).clamp(0.0, 1.0),
+        },
+        "pulse" => halo::HaloVisual::SwitchPulse,
+        "suspended" => halo::HaloVisual::Suspended,
+        other => return Err(format!("unknown halo visual: {other}")),
+    };
+    // Follow the settings the frontend currently holds (user-edited diameter,
+    // opacity, ...) before drawing; the halo lock must not be held while the
+    // layout lock is taken, so snapshot the settings first.
+    let mut settings = state
+        .layout
+        .lock()
+        .map_err(|_| "layout state lock poisoned".to_string())?
+        .focus_halo
+        .clone();
+    // Debug-only diameter override so the overlay's hot-resize path can be
+    // exercised without a saved-settings round trip.
+    if let Some(diameter) = diameter {
+        settings.halo_diameter = diameter;
+    }
+    let mut halo = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    halo.configure(settings);
+    halo.set_screen(geometry);
+    halo.show_test_halo((x, y), visual);
+    Ok(())
+}
+
+#[tauri::command]
+fn halo_test_overlay_hide(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?
+        .hide();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FocusHalo P1: enable/disable the tracking pipeline and the calibration flow.
+//
+// Lock ordering contract (same as the P0 commands above): the halo lock may be
+// held for seconds (camera start, bounded thread joins), so it must NEVER be
+// held while acquiring the layout/native-layout locks, and vice versa. Every
+// helper below acquires one lock at a time, snapshots what it needs, and
+// releases before the next acquisition.
+// ---------------------------------------------------------------------------
+
+/// Resolve the overlay geometry for the tracking engine: the local device's
+/// primary screen (or its first screen as fallback), converted with the same
+/// origin rule as the P0 test overlay.
+fn halo_tracking_geometry(state: &AppRuntime) -> Result<halo::OverlayScreenGeometry, String> {
+    let native_layout = state.native_layout();
+    let device = native_layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .ok_or_else(|| "FocusHalo: no local device detected on this machine".to_string())?;
+    let screen = device
+        .screens
+        .iter()
+        .find(|screen| screen.is_primary)
+        .or_else(|| device.screens.first())
+        .ok_or_else(|| "FocusHalo: no local screen detected on this machine".to_string())?;
+    let (native_x, native_y) = halo_native_origin(screen);
+    Ok(halo::OverlayScreenGeometry {
+        x: screen.x as f64,
+        y: screen.y as f64,
+        width: screen.width as f64,
+        height: screen.height as f64,
+        scale: screen.scale,
+        native_x,
+        native_y,
+    })
+}
+
+/// All of this machine's screens as focus-display screens (P4 receive side):
+/// layout-board ids preserved so a remote landing `screen_id` can select the
+/// right overlay host screen.
+fn halo_focus_screens(layout: &LayoutState) -> Vec<halo::FocusScreen> {
+    layout
+        .devices
+        .iter()
+        .filter(|device| device.role == "local")
+        .flat_map(|device| device.screens.iter())
+        .map(|screen| {
+            let (native_x, native_y) = halo_native_origin(screen);
+            halo::FocusScreen {
+                id: screen.id.clone(),
+                geometry: halo::OverlayScreenGeometry {
+                    x: screen.x as f64,
+                    y: screen.y as f64,
+                    width: screen.width as f64,
+                    height: screen.height as f64,
+                    scale: screen.scale,
+                    native_x,
+                    native_y,
+                },
+            }
+        })
+        .collect()
+}
+
+/// P4 receive hook (installed at transport startup): apply one authorized
+/// remote halo focus event to this machine's passive display. Lock order
+/// follows the repo contract: the layout lock is taken alone for the screen
+/// snapshot and released before the halo lock; window enumeration and
+/// activation run after both locks are gone.
+fn handle_remote_halo_focus(app: &AppHandle, packet: &halo::HaloFocusPacket) {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return;
+    };
+    let focus_screens = match state.layout.lock() {
+        Ok(layout) => halo_focus_screens(&layout),
+        Err(_) => {
+            log::warn!(
+                "halo focus: layout lock poisoned; dropping packet from {}",
+                packet.source_device_id
+            );
+            return;
+        }
+    };
+    if focus_screens.is_empty() {
+        log::warn!("halo focus: no local screens detected; cannot display highlight");
+        return;
+    }
+    let geometries: Vec<halo::OverlayScreenGeometry> =
+        focus_screens.iter().map(|screen| screen.geometry).collect();
+    let mut halo = match state.halo.lock() {
+        Ok(halo) => halo,
+        Err(_) => {
+            log::warn!(
+                "halo focus: halo lock poisoned; dropping packet from {}",
+                packet.source_device_id
+            );
+            return;
+        }
+    };
+    match &packet.event {
+        halo::HaloFocusEvent::Clear => {
+            halo.clear_remote_highlight();
+            log::info!(
+                "halo focus: clear highlight (from {})",
+                packet.source_device_id
+            );
+        }
+        event => {
+            // A fresh window service per event: remote focus traffic is
+            // state-change-only plus a 1 Hz refresh, so the enumeration
+            // cost (a few ms) is negligible and no cache outlives the event.
+            let mut windows = halo::create_window_service(&geometries);
+            let mut activator = halo::create_activator();
+            let _outcome = halo::apply_focus_event(
+                event,
+                &mut halo,
+                &focus_screens,
+                &mut *windows,
+                &mut *activator,
+            );
+        }
+    }
+}
+
+/// Snapshot the sanitized settings from the stored layout (lock acquired and
+/// released alone; never nested with the halo lock).
+fn halo_settings_snapshot(state: &AppRuntime) -> halo::FocusHaloSettings {
+    state
+        .layout
+        .lock()
+        .map(|layout| layout.focus_halo.clone())
+        .unwrap_or_default()
+        .sanitized()
+}
+
+/// Shared implementation for `halo_set_enabled` and the `save_layout`
+/// enabled-changed hook. On enable this may block for seconds (camera start),
+/// which is why callers must invoke it outside any other lock.
+fn apply_halo_enabled(state: &AppRuntime, enabled: bool) -> Result<String, String> {
+    if !halo::overlay::overlay_supported() {
+        return Err(halo::overlay::overlay_unsupported_reason()
+            .unwrap_or("FocusHalo overlay is not supported on this platform")
+            .to_string());
+    }
+    let settings = halo_settings_snapshot(state);
+    let geometry = halo_tracking_geometry(state)?;
+    let mut runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    if enabled {
+        let calibration = settings.effective_calibration();
+        runtime.enable(settings, calibration, geometry)?;
+        drop(runtime);
+        spawn_halo_debug_pump(&state.app_handle);
+        Ok("running".into())
+    } else {
+        runtime.disable();
+        drop(runtime);
+        Ok("stopped".into())
+    }
+}
+
+#[tauri::command]
+fn halo_set_enabled(enabled: bool, state: tauri::State<'_, AppRuntime>) -> Result<String, String> {
+    apply_halo_enabled(state.inner(), enabled)
+}
+
+#[tauri::command]
+fn halo_get_status(state: tauri::State<'_, AppRuntime>) -> Result<HaloStatus, String> {
+    let runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    Ok(HaloStatus {
+        running: runtime.is_running(),
+        camera_ok: runtime.camera_ok(),
+        reason: runtime.status_reason(),
+    })
+}
+
+/// Read the latest raw head pose, optionally smoothed: 5 reads at 10 Hz with
+/// a short halo lock per read (the lock is never held across the sleeps).
+/// Fails when the tracker saw no face at all.
+fn sample_latest_pose(state: &AppRuntime, smoothed: bool) -> Result<(f64, f64), String> {
+    if !smoothed {
+        return state
+            .halo
+            .lock()
+            .map_err(|_| "halo runtime lock poisoned".to_string())?
+            .latest_pose()
+            .ok_or_else(|| "未检测到人脸".to_string());
+    }
+    let mut sum = (0.0_f64, 0.0_f64);
+    let mut count = 0_usize;
+    for _ in 0..5 {
+        if let Ok(runtime) = state.halo.lock() {
+            if let Some((yaw, pitch)) = runtime.latest_pose() {
+                sum.0 += yaw;
+                sum.1 += pitch;
+                count += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if count < 3 {
+        return Err("未检测到人脸".to_string());
+    }
+    Ok((sum.0 / count as f64, sum.1 / count as f64))
+}
+
+/// Mutate `focus_halo` in the stored layout and persist it to disk. Lock
+/// contract: layout lock acquired alone, released before any halo lock.
+fn update_layout_focus_halo<F>(state: &AppRuntime, mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut halo::FocusHaloSettings) -> Result<(), String>,
+{
+    let mut stored_layout = state
+        .layout
+        .lock()
+        .map_err(|_| "layout state lock poisoned".to_string())?;
+    let mut layout = stored_layout.clone();
+    mutate(&mut layout.focus_halo)?;
+    // Same normalization contract as save_layout before the write hits disk.
+    layout.focus_halo = layout.focus_halo.sanitized();
+    write_layout_to_disk(&state.config_path, &layout)?;
+    *stored_layout = layout;
+    Ok(())
+}
+
+/// Capture one calibration point. Order: center -> left -> right -> up ->
+/// down, then `finish`. Center is smoothed over 0.5 s; left/right record the
+/// absolute yaw reading; up/down record the pitch magnitude relative to the
+/// captured center. `finish` validates monotonicity and pushes the profile to
+/// a running engine.
+#[tauri::command]
+fn halo_capture_calibration_point(
+    point: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    let is_center = point == "center";
+    let pose = sample_latest_pose(state.inner(), is_center)?;
+
+    // The capture math must apply the same effective vertical flip the
+    // runtime mapping applies (camera position XOR the invert toggle); an
+    // inverted camera with the invert toggle ON otherwise captures a negative
+    // "up" extent that only surfaces at finish validation.
+    let flip_pitch = {
+        let focus_halo = halo_settings_snapshot(state.inner());
+        (focus_halo.camera_position == halo::params::CameraPosition::Bottom)
+            != focus_halo.invert_pitch
+    };
+    let margin = halo::mapping::CAPTURE_MIN_EXTENT_DEG;
+
+    match point.as_str() {
+        "center" | "left" | "right" | "up" | "down" => {
+            let point = point;
+            update_layout_focus_halo(state.inner(), |focus_halo| {
+                let base = focus_halo.calibration.clone().unwrap_or_default();
+                if point != "center" && focus_halo.calibration.is_none() {
+                    return Err("请先采集中心点".to_string());
+                }
+                let mut next = base;
+                match point.as_str() {
+                    "center" => {
+                        next.center_yaw = pose.0;
+                        next.center_pitch = pose.1;
+                    }
+                    "left" => next.left_yaw = pose.0,
+                    "right" => next.right_yaw = pose.0,
+                    "up" => {
+                        next.up_pitch =
+                            halo::mapping::pitch_extent(pose.1, next.center_pitch, flip_pitch);
+                    }
+                    "down" => {
+                        next.down_pitch =
+                            halo::mapping::pitch_extent(pose.1, next.center_pitch, !flip_pitch);
+                    }
+                    _ => unreachable!("matched above"),
+                }
+                focus_halo.calibration = Some(next.clone());
+                // Immediate per-step validation with the captured numbers, so a
+                // bad reading surfaces on its own step instead of failing the
+                // whole flow at finish.
+                match point.as_str() {
+                    "left" if next.left_yaw >= next.center_yaw - margin => Err(format!(
+                        "左转读数（{:.1}°）未低于中心（{:.1}°）：请转向左侧极限后重试，或回到第 1 步重新采集中心",
+                        next.left_yaw, next.center_yaw
+                    )),
+                    "right" if next.right_yaw <= next.center_yaw + margin => Err(format!(
+                        "右转读数（{:.1}°）未高于中心（{:.1}°）：请转向右侧极限后重试，或回到第 1 步重新采集中心",
+                        next.right_yaw, next.center_yaw
+                    )),
+                    "up" if next.up_pitch <= margin => Err(format!(
+                        "抬头幅度不足（实测 {:.1}°）：若刚才抬头时数值为负，请切换「上下方向对调」开关后重新采集本步",
+                        next.up_pitch
+                    )),
+                    "down" if next.down_pitch <= margin => Err(format!(
+                        "低头幅度不足（实测 {:.1}°）：若刚才低头时数值为正，请切换「上下方向对调」开关后重新采集本步",
+                        next.down_pitch
+                    )),
+                    _ => Ok(()),
+                }
+            })
+        }
+        "finish" => {
+            let calibration = {
+                let focus_halo = halo_settings_snapshot(state.inner());
+                focus_halo
+                    .calibration
+                    .ok_or_else(|| "尚未采集任何校准点".to_string())?
+            };
+            halo::mapping::validate_calibration(&calibration)?;
+            // Push the validated profile to a running engine (halo lock taken
+            // alone, after the layout snapshot above was released).
+            let mut runtime = state
+                .halo
+                .lock()
+                .map_err(|_| "halo runtime lock poisoned".to_string())?;
+            if runtime.is_running() {
+                runtime.set_calibration(calibration);
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown halo calibration point: {other}")),
+    }
+}
+
+/// Recenter: shift the whole calibration profile so the current (smoothed)
+/// head pose maps to screen center, persist it, and push it to a running
+/// engine. Works from the default profile when nothing was calibrated yet.
+#[tauri::command]
+fn halo_recenter(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    halo_recenter_impl(state.inner())
+}
+
+/// Shared recenter body, reused by both the `halo_recenter` command and the
+/// recenter global hotkey. Never hold other locks across this call: it takes
+/// the layout lock (`update_layout_focus_halo`), sleeps in
+/// `sample_latest_pose`, and finally takes the halo lock.
+fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
+    let pose = sample_latest_pose(state, true)?;
+    let mut calibration = None;
+    update_layout_focus_halo(state, |focus_halo| {
+        let shifted = halo::mapping::recenter_calibration(
+            &focus_halo.calibration.clone().unwrap_or_default(),
+            pose,
+        );
+        focus_halo.calibration = Some(shifted);
+        calibration = Some(shifted);
+        Ok(())
+    })?;
+    let calibration = calibration.ok_or_else(|| "failed to apply recenter".to_string())?;
+    let mut runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    if runtime.is_running() {
+        runtime.set_calibration(calibration);
+    }
+    Ok(())
+}
+
+/// Which halo control hotkey matched in `route_global_shortcut`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaloShortcutAction {
+    EmergencyStop,
+    UndoSwitch,
+    Recenter,
+}
+
+/// Run one halo hotkey action. Errors are logged, never propagated: a hotkey
+/// press must not surface a dialog (the caller cannot react to a global
+/// shortcut failure anyway).
+fn dispatch_halo_shortcut(state: &AppRuntime, action: HaloShortcutAction) {
+    match action {
+        HaloShortcutAction::EmergencyStop => {
+            // Emergency stop is a safety brake: respond even while the halo
+            // is disabled (HaloRuntime::emergency_stop no-ops then).
+            if let Ok(mut runtime) = state.halo.lock() {
+                runtime.emergency_stop();
+                log::info!("halo: emergency stop triggered by hotkey");
+            }
+        }
+        HaloShortcutAction::UndoSwitch => {
+            if let Ok(mut runtime) = state.halo.lock() {
+                runtime.undo_switch();
+                log::info!("halo: undo switch triggered by hotkey");
+            }
+        }
+        HaloShortcutAction::Recenter => {
+            // Recenter samples a smoothed pose (~0.5 s of bounded sleeps) and
+            // writes the layout; run it off the main thread so the shortcut
+            // handler never stalls the UI.
+            let app_handle = state.app_handle.clone();
+            std::thread::spawn(move || {
+                let state = app_handle.state::<AppRuntime>();
+                if let Err(error) = halo_recenter_impl(state.inner()) {
+                    log::warn!("halo: recenter hotkey failed: {error}");
+                } else {
+                    log::info!("halo: recenter triggered by hotkey");
+                }
+            });
+        }
+    }
+}
+
+/// Thin wrappers so the frontend buttons can drive the same actions as the
+/// global hotkeys (button-click fallback when a hotkey is not configured).
+#[tauri::command]
+fn halo_undo_switch(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    let mut runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    runtime.undo_switch();
+    log::info!("halo: undo switch triggered from UI");
+    Ok(())
+}
+
+#[tauri::command]
+fn halo_emergency_stop(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    let mut runtime = state
+        .halo
+        .lock()
+        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    runtime.emergency_stop();
+    log::info!("halo: emergency stop triggered from UI");
+    Ok(())
+}
+
+/// 5 Hz debug pump: drains the engine's telemetry channel and emits the
+/// newest snapshot on the `halo-debug` event. Exit conditions: the app
+/// runtime state is gone (teardown), the halo runtime is no longer running,
+/// or the debug channel disconnected. A single pump serves the whole process
+/// (`HALO_DEBUG_PUMP_ACTIVE` guards against duplicates): if a disable/enable
+/// cycle happens within one pump sleep, the existing pump simply keeps
+/// serving instead of two pumps racing on the same channel.
+static HALO_DEBUG_PUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn spawn_halo_debug_pump(app: &AppHandle) {
+    if HALO_DEBUG_PUMP_ACTIVE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let handle = app.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("halo-debug-pump".into())
+        .spawn(move || {
+            // P4 send side: the focus router + throttle live on this thread.
+            // The pump is the only consumer of engine telemetry, so the
+            // cross-machine decision state has a single owner and no locks.
+            let mut focus_forwarder = halo::FocusForwarder::new();
+            let mut focus_last_logged_kind = String::new();
+            loop {
+                // try_state returns None while the app is being torn down;
+                // holding the AppHandle clone does not block exit (the event
+                // loop ends the process regardless of background threads).
+                let Some(state) = handle.try_state::<AppRuntime>() else {
+                    break;
+                };
+                let snapshot = {
+                    let Ok(mut runtime) = state.halo.lock() else {
+                        break;
+                    };
+                    if !runtime.is_running() {
+                        break;
+                    }
+                    runtime.drain_debug().pop()
+                };
+                if let Some(snapshot) = snapshot {
+                    halo_focus_pump_tick(
+                        state.inner(),
+                        &snapshot,
+                        &mut focus_forwarder,
+                        &mut focus_last_logged_kind,
+                    );
+                    let _ = handle.emit(HALO_DEBUG_EVENT, snapshot);
+                }
+                drop(state);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            HALO_DEBUG_PUMP_ACTIVE.store(false, Ordering::SeqCst);
+        });
+    if spawn_result.is_err() {
+        HALO_DEBUG_PUMP_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Event kind of a halo focus event, for rate-aware logging.
+fn halo_focus_event_kind(event: &halo::HaloFocusEvent) -> &'static str {
+    match event {
+        halo::HaloFocusEvent::Edge { .. } => "edge",
+        halo::HaloFocusEvent::Candidate { .. } => "candidate",
+        halo::HaloFocusEvent::Activate { .. } => "activate",
+        halo::HaloFocusEvent::Clear => "clear",
+    }
+}
+
+/// P4 send side, driven from the debug pump (5 Hz): route one engine
+/// snapshot through the focus router + throttle and, when a state change
+/// survives, emit the halo focus packet to the aimed peer over the QUIC
+/// datagram transport. Errors are logged, never propagated: telemetry must
+/// not take the tracking pipeline down.
+fn halo_focus_pump_tick(
+    state: &AppRuntime,
+    snapshot: &halo::DebugSnapshot,
+    forwarder: &mut halo::FocusForwarder,
+    last_logged_kind: &mut String,
+) {
+    // Layout snapshot under try_lock only: the pump must never stall behind
+    // a busy layout writer (save/discovery hold it briefly).
+    let Ok(layout) = state.layout.try_lock() else {
+        return;
+    };
+    let Some(local) = layout.devices.iter().find(|device| device.role == "local") else {
+        return;
+    };
+    // The engine tracks the local primary screen (halo_tracking_geometry);
+    // its board rect is what the norm coordinates are relative to.
+    let Some(local_screen) = local
+        .screens
+        .iter()
+        .find(|screen| screen.is_primary)
+        .or_else(|| local.screens.first())
+    else {
+        return;
+    };
+    let local_board = halo::BoardScreen {
+        id: local_screen.id.clone(),
+        device_id: local.id.clone(),
+        x: local_screen.x as f64,
+        y: local_screen.y as f64,
+        width: local_screen.width as f64,
+        height: local_screen.height as f64,
+    };
+    let peer_screens: Vec<halo::BoardScreen> = layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local" && device.online)
+        .flat_map(|device| {
+            device.screens.iter().map(move |screen| halo::BoardScreen {
+                id: screen.id.clone(),
+                device_id: device.id.clone(),
+                x: screen.x as f64,
+                y: screen.y as f64,
+                width: screen.width as f64,
+                height: screen.height as f64,
+            })
+        })
+        .collect();
+    let observation = halo::Observation {
+        norm: (snapshot.norm_x, snapshot.norm_y),
+        phase: halo::FocusPhase::from_phase_str(snapshot.phase_str),
+        local_screen: local_board,
+        peer_screens: &peer_screens,
+    };
+    let Some((event, seq, target_device_id)) = forwarder.observe(&observation) else {
+        return;
+    };
+    // Resolve the target device and credentials while the layout guard is
+    // held, then drop it before any transport work.
+    let target = layout
+        .devices
+        .iter()
+        .find(|device| device.id == target_device_id && device.role != "local")
+        .cloned();
+    let source_device_id = local_peer_from_layout(&layout).id;
+    let cluster_id = layout.cluster_id.clone();
+    let pair_secret = layout.pair_secret.clone();
+    drop(layout);
+
+    let kind = halo_focus_event_kind(&event);
+    let Some(target) = target else {
+        log::warn!(
+            "halo focus: aimed device {target_device_id} vanished from layout; dropped {kind}"
+        );
+        return;
+    };
+    if cluster_id.trim().is_empty() || pair_secret.trim().is_empty() {
+        return; // unpaired: no credentials to authorize with, stay silent
+    }
+    if !target.online || target.transport_public_key.trim().is_empty() {
+        return; // peer offline/unkeyed: the next state change retries
+    }
+    let packet = halo::HaloFocusPacket::new(source_device_id, cluster_id, pair_secret, event, seq);
+    let payload = match packet.encode() {
+        Ok(payload) => payload,
+        Err(error) => {
+            log::warn!("halo focus: {error}");
+            return;
+        }
+    };
+    let Some(transport) = state.quic_transport_handle() else {
+        return;
+    };
+    // Target resolution mirrors send_secure_attention_control.
+    let peer = transport.peer(
+        format!(
+            "{}:{}",
+            target.host,
+            normalize_quic_port(target.transport_port, target.quic_port)
+        ),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    match transport.send_datagram(peer, payload) {
+        Ok(true) => {
+            if *last_logged_kind != kind {
+                log::info!(
+                    "halo focus: sent {kind} to {} (seq {seq}, point {:?})",
+                    target.name,
+                    match &packet.event {
+                        halo::HaloFocusEvent::Edge { x, y, .. }
+                        | halo::HaloFocusEvent::Candidate { x, y, .. }
+                        | halo::HaloFocusEvent::Activate { x, y, .. } => Some((*x, *y)),
+                        halo::HaloFocusEvent::Clear => None,
+                    }
+                );
+                *last_logged_kind = kind.into();
+            } else {
+                log::debug!(
+                    "halo focus: refreshed {kind} heartbeat to {} (seq {seq})",
+                    target.name
+                );
+            }
+        }
+        Ok(false) => {
+            log::debug!(
+                "halo focus: peer {} reconnecting; {kind} dropped",
+                target.name
+            );
+        }
+        Err(error) => {
+            log::warn!("halo focus: send {kind} to {} failed: {error}", target.name);
+        }
+    }
 }
 
 fn merge_runtime_owned_layout_fields(
@@ -2271,10 +3104,16 @@ fn validate_shared_hotkeys(layout: &LayoutState) -> Result<(), String> {
         &layout.screen_switch_hotkeys.right,
         &layout.screen_switch_hotkeys.up,
         &layout.screen_switch_hotkeys.down,
+        // Halo hotkeys join the same dedup pool: they conflict with each
+        // other and with every existing global hotkey. "disabled" values
+        // canonicalize to None and are therefore exempt.
+        &layout.focus_halo.emergency_stop_hotkey,
+        &layout.focus_halo.undo_hotkey,
+        &layout.focus_halo.recenter_hotkey,
     ] {
         if let Some(shortcut) = canonical_runtime_toggle_shortcut(value)? {
             if !seen.insert(shortcut) {
-                return Err("启停、粘贴和切屏快捷键不能重复。".into());
+                return Err("启停、粘贴、切屏和 FocusHalo 快捷键不能重复。".into());
             }
         }
     }
@@ -2361,6 +3200,81 @@ fn empty_screen_switch_hotkeys() -> ScreenSwitchHotkeys {
     }
 }
 
+fn empty_halo_shortcuts() -> HaloShortcutSet {
+    HaloShortcutSet::default()
+}
+
+/// Canonical (or empty) strings for the three halo hotkeys. Mirrors
+/// `screen_switch_shortcuts_for_layout`: a client role never registers halo
+/// hotkeys, and an unparsable saved value silently resolves to empty (the
+/// save-time `validate_shared_hotkeys` is what rejects bad input).
+fn halo_shortcuts_for_layout(layout: &LayoutState) -> HaloShortcutSet {
+    if layout.machine_role != "server" {
+        return empty_halo_shortcuts();
+    }
+
+    let focus_halo = &layout.focus_halo;
+    HaloShortcutSet {
+        emergency_stop: canonical_halo_hotkey(&focus_halo.emergency_stop_hotkey)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        undo: canonical_halo_hotkey(&focus_halo.undo_hotkey)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        recenter: canonical_halo_hotkey(&focus_halo.recenter_hotkey)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+    }
+}
+
+/// Register/unregister the three halo control hotkeys so they stay in sync
+/// with the saved layout. Mirrors `sync_screen_switch_shortcuts`: compares
+/// against the stored values and only touches the ones that changed. Unlike
+/// the direction hotkeys these stay registered regardless of the input guard
+/// or local-only mode — emergency stop is the halo safety brake and must keep
+/// responding (the engine itself no-ops when the halo is not running).
+fn sync_halo_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return Ok(());
+    };
+    let layout = state.layout_snapshot();
+    let next = if input::hotkey_recording() || input::owns_native_shortcuts() {
+        empty_halo_shortcuts()
+    } else {
+        halo_shortcuts_for_layout(&layout)
+    };
+
+    let mut current = state
+        .halo_shortcuts
+        .lock()
+        .map_err(|_| "halo shortcuts lock poisoned".to_string())?;
+
+    for (next_str, prev_str) in [
+        (&next.emergency_stop, &current.emergency_stop),
+        (&next.undo, &current.undo),
+        (&next.recenter, &current.recenter),
+    ] {
+        if next_str == prev_str {
+            continue;
+        }
+        if !prev_str.is_empty() {
+            if let Err(error) = app.global_shortcut().unregister(prev_str.as_str()) {
+                log::warn!("failed to unregister halo shortcut {prev_str}: {error}");
+            }
+        }
+        if !next_str.is_empty() {
+            if let Err(error) = app.global_shortcut().register(next_str.as_str()) {
+                log::warn!("failed to register halo shortcut {next_str}: {error}");
+            } else {
+                log::info!("registered halo shortcut: {next_str}");
+            }
+        }
+    }
+
+    *current = next;
+    Ok(())
+}
+
 /// Dispatch a pressed global shortcut to its action. The runtime-toggle
 /// shortcut starts/stops capture; the four direction shortcuts post a switch
 /// request that the capture loop consumes.
@@ -2415,6 +3329,41 @@ fn route_global_shortcut(
     }
     drop(toggle);
 
+    // Halo control hotkeys (emergency stop / undo switch / recenter). These
+    // sit before the input-paused guard on purpose: emergency stop is the
+    // halo safety brake and must keep working while input is paused or
+    // local-only, and every branch no-ops by itself when the halo runtime is
+    // disabled.
+    let halo = state
+        .halo_shortcuts
+        .lock()
+        .map_err(|_| "halo shortcuts lock poisoned".to_string())?;
+    let halo_action = [
+        (
+            halo.emergency_stop.as_str(),
+            HaloShortcutAction::EmergencyStop,
+        ),
+        (halo.undo.as_str(), HaloShortcutAction::UndoSwitch),
+        (halo.recenter.as_str(), HaloShortcutAction::Recenter),
+    ]
+    .into_iter()
+    .find_map(|(stored, action)| {
+        if stored.is_empty() {
+            return None;
+        }
+        stored
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .ok()
+            .filter(|parsed| parsed == shortcut)
+            .map(|_| action)
+    });
+    drop(halo);
+
+    if let Some(action) = halo_action {
+        dispatch_halo_shortcut(state.inner(), action);
+        return Ok(());
+    }
+
     if input_guard::is_paused(&state.input_guard)
         || state.layout_snapshot().input_protection.local_only
     {
@@ -2464,6 +3413,21 @@ fn route_global_shortcut(
 }
 
 fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, String> {
+    canonical_hotkey_with_label(value, "快捷启停")
+}
+
+/// FocusHalo hotkeys (emergency stop / undo / recenter) share the exact
+/// normalization, alias and parse rules as the quick start/stop shortcut so a
+/// recorded combo behaves identically across every hotkey field.
+fn canonical_halo_hotkey(value: &str) -> Result<Option<String>, String> {
+    canonical_hotkey_with_label(value, "FocusHalo")
+}
+
+/// Shared hotkey canonicalization. `label` is only used in the error strings
+/// so each feature reports its own name. Returns `None` for "disabled" (and
+/// its aliases), or the canonical `control/alt/shift/super+Key` string that
+/// the global-shortcut plugin accepts.
+fn canonical_hotkey_with_label(value: &str, label: &str) -> Result<Option<String>, String> {
     let normalized = normalize_edge_switch_hotkey(value);
     if matches!(normalized.as_str(), "disabled" | "disable" | "off" | "none") {
         return Ok(None);
@@ -2483,19 +3447,21 @@ fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, Stri
             "meta" | "cmd" | "command" | "win" | "windows" | "super" | "os" => meta = true,
             raw_key => {
                 if key.is_some() {
-                    return Err("快捷启停快捷键只能包含一个主按键。".into());
+                    return Err(format!("{label}快捷键只能包含一个主按键。"));
                 }
                 key = Some(
                     canonical_runtime_toggle_key(raw_key)
-                        .ok_or_else(|| format!("无法识别快捷启停快捷键按键：{raw_key}"))?,
+                        .ok_or_else(|| format!("无法识别{label}快捷键按键：{raw_key}"))?,
                 );
             }
         }
     }
 
-    let key = key.ok_or_else(|| "快捷启停快捷键缺少主按键。".to_string())?;
+    let key = key.ok_or_else(|| format!("{label}快捷键缺少主按键。"))?;
     if !(ctrl || alt || shift || meta) && !allows_single_runtime_toggle_key(&key) {
-        return Err("快捷启停快捷键需要使用组合键，或使用 F1-F24 / ScrollLock。".into());
+        return Err(format!(
+            "{label}快捷键需要使用组合键，或使用 F1-F24 / ScrollLock。"
+        ));
     }
 
     let mut parts = Vec::new();
@@ -2515,7 +3481,7 @@ fn canonical_runtime_toggle_shortcut(value: &str) -> Result<Option<String>, Stri
     let shortcut = parts.join("+");
     shortcut
         .parse::<tauri_plugin_global_shortcut::Shortcut>()
-        .map_err(|error| format!("无法注册快捷启停快捷键 {normalized}: {error}"))?;
+        .map_err(|error| format!("无法注册{label}快捷键 {normalized}: {error}"))?;
 
     Ok(Some(shortcut))
 }
@@ -4053,6 +5019,9 @@ pub fn run() {
             if let Err(error) = sync_screen_switch_shortcuts(app.handle()) {
                 log::warn!("failed to register screen switch shortcuts: {error}");
             }
+            if let Err(error) = sync_halo_shortcuts(app.handle()) {
+                log::warn!("failed to register halo shortcuts: {error}");
+            }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
             let _ = sync_clipboard_paste_shortcut(app.handle());
@@ -4064,6 +5033,14 @@ pub fn run() {
                 }});
             }));
             setup_single_instance_events(app.handle().clone());
+
+            // Dev builds show the main window at launch so overlay and capture
+            // work can be verified without hunting for the tray icon (release
+            // builds keep the tray-first behavior).
+            #[cfg(debug_assertions)]
+            if let Err(error) = show_main_window_handle(app.handle()) {
+                log::warn!("dev main-window auto-show failed: {error}");
+            }
 
             // Edge drag-drop (ShareMouse-style): the capture tap hands us drag
             // events as a local file drag crosses onto a controlled machine. A
@@ -4204,6 +5181,23 @@ pub fn run() {
                     });
                 }));
             }
+            // FocusHalo startup restore (P1 gap): a layout saved with
+            // focus_halo.enabled=true must come back up after an app restart,
+            // like the other eagerly started subsystems above. The layout was
+            // already loaded into AppRuntime by the constructor; a failed
+            // enable (camera permission not granted yet, missing model, no
+            // screen) must never break startup, so it only warns here and the
+            // reason surfaces through halo_get_status.
+            {
+                let state = app.state::<AppRuntime>();
+                let enabled = state.inner().layout_snapshot().focus_halo.enabled;
+                if enabled {
+                    if let Err(error) = apply_halo_enabled(state.inner(), true) {
+                        log::warn!("halo: startup restore failed: {error}");
+                    }
+                }
+            }
+
             if silent_launch {
                 hide_main_window_handle(app.handle())?;
             } else {
@@ -4250,7 +5244,15 @@ pub fn run() {
             start_window_drag,
             open_repository_url,
             open_releases_url,
-            is_portable_mode
+            is_portable_mode,
+            halo_test_overlay_show,
+            halo_test_overlay_hide,
+            halo_set_enabled,
+            halo_get_status,
+            halo_capture_calibration_point,
+            halo_recenter,
+            halo_undo_switch,
+            halo_emergency_stop
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4762,6 +5764,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        focus_halo: halo::FocusHaloSettings::default(),
         devices: vec![Device {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
@@ -4811,6 +5814,7 @@ fn detect_fallback_layout() -> LayoutState {
         modifier_map: default_modifier_map(),
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+        focus_halo: halo::FocusHaloSettings::default(),
     }
 }
 
@@ -5136,6 +6140,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         modifier_map: normalize_modifier_map(&saved_layout.modifier_map),
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
         screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
+        focus_halo: saved_layout.focus_halo.clone(),
     }
 }
 
@@ -5774,6 +6779,7 @@ fn set_hotkey_recording(
     sync_runtime_toggle_shortcut(&app)?;
     sync_screen_switch_shortcuts(&app)?;
     sync_clipboard_paste_shortcut(&app)?;
+    sync_halo_shortcuts(&app)?;
     if recording {
         input::begin_shortcut_recording();
     }
@@ -11496,6 +12502,7 @@ mod tests {
             modifier_map: default_modifier_map(),
             edge_switch_hotkey: default_edge_switch_hotkey(),
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
+            focus_halo: halo::FocusHaloSettings::default(),
         }
     }
 
@@ -11569,6 +12576,82 @@ mod tests {
     #[test]
     fn runtime_toggle_shortcut_rejects_single_letter_globals() {
         assert!(canonical_runtime_toggle_shortcut("k").is_err());
+    }
+
+    #[test]
+    fn halo_hotkey_canonicalization_matches_runtime_toggle_rules() {
+        // Halo hotkeys reuse the quick start/stop normalization: meta
+        // aliases fold to "super", function keys capitalize, "disabled"
+        // (and aliases) resolve to None.
+        assert_eq!(
+            canonical_halo_hotkey("command+9").expect("shortcut"),
+            Some("super+9".into())
+        );
+        assert_eq!(
+            canonical_halo_hotkey("meta+f8").expect("shortcut"),
+            Some("super+F8".into())
+        );
+        // A bare function key is allowed without modifiers.
+        assert_eq!(
+            canonical_halo_hotkey("f8").expect("shortcut"),
+            Some("F8".into())
+        );
+        assert_eq!(canonical_halo_hotkey("disabled").expect("disabled"), None);
+        assert_eq!(canonical_halo_hotkey("off").expect("alias"), None);
+        // Single letters still require a modifier, and unknown keys fail.
+        assert!(canonical_halo_hotkey("k").is_err());
+        assert!(canonical_halo_hotkey("ctrl+notakey").is_err());
+    }
+
+    #[test]
+    fn halo_hotkeys_reject_duplicates_within_and_across_features() {
+        // Two halo hotkeys colliding with each other.
+        let mut layout = test_layout();
+        layout.focus_halo.emergency_stop_hotkey = "alt+f9".into();
+        layout.focus_halo.undo_hotkey = "alt+f9".into();
+        assert!(validate_shared_hotkeys(&layout).is_err());
+
+        // A halo hotkey colliding with the quick start/stop shortcut.
+        let mut layout = test_layout();
+        layout.focus_halo.emergency_stop_hotkey = "alt+f9".into();
+        layout.edge_switch_hotkey = "alt+f9".into();
+        assert!(validate_shared_hotkeys(&layout).is_err());
+
+        // ... and with a screen-switch direction key.
+        let mut layout = test_layout();
+        layout.focus_halo.undo_hotkey = "alt+left".into();
+        assert!(validate_shared_hotkeys(&layout).is_err());
+
+        // Disabled values are exempt from the dedup: every halo hotkey off
+        // while the other defaults are active must pass.
+        let mut layout = test_layout();
+        layout.focus_halo.emergency_stop_hotkey = "disabled".into();
+        layout.focus_halo.undo_hotkey = "off".into();
+        layout.focus_halo.recenter_hotkey = "none".into();
+        assert!(validate_shared_hotkeys(&layout).is_ok());
+
+        // Distinct halo hotkeys coexist with the other defaults.
+        layout.focus_halo.emergency_stop_hotkey = "ctrl+shift+f9".into();
+        layout.focus_halo.undo_hotkey = "ctrl+shift+f10".into();
+        layout.focus_halo.recenter_hotkey = "ctrl+shift+f11".into();
+        assert!(validate_shared_hotkeys(&layout).is_ok());
+    }
+
+    #[test]
+    fn halo_shortcuts_for_layout_resolves_and_disables_for_client() {
+        let mut layout = test_layout();
+        layout.focus_halo.emergency_stop_hotkey = "command+f9".into();
+        layout.focus_halo.undo_hotkey = "disabled".into();
+        layout.focus_halo.recenter_hotkey = "alt+f11".into();
+
+        let shortcuts = halo_shortcuts_for_layout(&layout);
+        assert_eq!(shortcuts.emergency_stop, "super+F9");
+        assert_eq!(shortcuts.undo, "");
+        assert_eq!(shortcuts.recenter, "alt+F11");
+
+        // Client machines never register halo hotkeys.
+        layout.machine_role = "client".into();
+        assert_eq!(halo_shortcuts_for_layout(&layout), empty_halo_shortcuts());
     }
 
     #[test]

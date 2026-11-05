@@ -10,6 +10,7 @@ import type {
   RuntimeStatus,
 } from './runtime'
 import type { LayoutState } from './types'
+import type { HaloDebugSnapshot, HaloStatus } from './types'
 
 export interface AppUpdateInfo {
   version: string
@@ -412,6 +413,122 @@ export async function isPortableMode(): Promise<boolean> {
   }
 
   return invoke<boolean>('is_portable_mode')
+}
+
+export type HaloVisual = 'idle' | 'candidate' | 'pulse' | 'suspended'
+
+export interface HaloTestOverlayOptions {
+  screenId: string
+  /** Screen-local logical point (halo center). */
+  x: number
+  y: number
+  visual: HaloVisual
+  /** 0..1 progress arc, only used when visual === 'candidate'. */
+  progress?: number
+  /** Debug-only halo diameter override (logical px); exercises the hot-resize path. */
+  diameter?: number
+}
+
+// FocusHalo P0 debug entry: draw/hide one halo frame on a local screen.
+export async function haloTestOverlay(options: HaloTestOverlayOptions): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_test_overlay_show', {
+    screenId: options.screenId,
+    x: options.x,
+    y: options.y,
+    visual: options.visual,
+    progress: options.progress ?? null,
+    diameter: options.diameter ?? null,
+  })
+}
+
+export async function haloHideOverlay(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_test_overlay_hide')
+}
+
+// FocusHalo P1: tracking pipeline control + calibration flow.
+
+/** Calibration capture steps, in the order the backend expects. */
+export const HALO_CALIBRATION_POINTS = ['center', 'left', 'right', 'up', 'down'] as const
+export type HaloCalibrationPoint = (typeof HALO_CALIBRATION_POINTS)[number] | 'finish'
+
+/**
+ * Enable/disable the tracking pipeline. May take seconds (camera start);
+ * resolves with a backend status string or rejects with a user-facing reason.
+ * The caller persists the `enabled` flag afterwards via saveLayout.
+ */
+export async function haloSetEnabled(enabled: boolean): Promise<string> {
+  if (!isTauri()) {
+    return enabled ? 'running' : 'stopped'
+  }
+
+  return invoke<string>('halo_set_enabled', { enabled })
+}
+
+export async function haloGetStatus(): Promise<HaloStatus> {
+  if (!isTauri()) {
+    return { running: false, cameraOk: false, reason: null }
+  }
+
+  return invoke<HaloStatus>('halo_get_status')
+}
+
+export async function haloCaptureCalibrationPoint(point: HaloCalibrationPoint): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_capture_calibration_point', { point })
+}
+
+export async function haloRecenter(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_recenter')
+}
+
+// Button-click fallback for the undo-switch global hotkey.
+export async function haloUndoSwitch(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_undo_switch')
+}
+
+// Button-click fallback for the emergency-stop global hotkey.
+export async function haloEmergencyStop(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_emergency_stop')
+}
+
+/**
+ * Subscribe to the FocusHalo debug stream (5 Hz while tracking runs).
+ * Returns an unlisten function; resolves to a no-op outside the Tauri
+ * runtime. The listener is registered through a dynamic import so the
+ * browser preview never loads the event API eagerly.
+ */
+export async function listenHaloDebug(
+  callback: (snapshot: HaloDebugSnapshot) => void,
+): Promise<() => void> {
+  if (!isTauri()) {
+    return () => {}
+  }
+
+  const { listen } = await import('@tauri-apps/api/event')
+  return listen<HaloDebugSnapshot>('halo-debug', ({ payload }) => callback(payload))
 }
 
 export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
