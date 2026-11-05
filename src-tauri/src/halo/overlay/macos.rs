@@ -601,8 +601,18 @@ unsafe fn build_border_window(rect: NsRect) -> *mut c_void {
 /// path/frame updates leave the animation untouched.
 unsafe fn start_border_breathing(layer: *mut c_void) {
     let key_path = ns_string("opacity");
-    let alloc = send(cls(b"CABasicAnimation\0"), sel(b"alloc\0"));
-    let anim = send1(alloc, sel(b"initWithKeyPath:\0"), key_path);
+    // `alloc` + `initWithKeyPath:` was removed from the macOS 27 runtime
+    // (verified live: instancesRespond = false, and the app crashed with
+    // "-[CABasicAnimation initWithKeyPath:]: unrecognized selector"); the
+    // supported creation path is the `animationWithKeyPath:` class factory.
+    // It returns an autoreleased (+0) instance, so we never release `anim`
+    // ourselves: the layer retains it inside addAnimation:forKey: and the
+    // main-queue autorelease pool drains the remainder.
+    let anim = send1(
+        cls(b"CABasicAnimation\0"),
+        sel(b"animationWithKeyPath:\0"),
+        key_path,
+    );
     send1(key_path, sel(b"release\0"), std::ptr::null_mut());
     if anim.is_null() {
         return;
@@ -624,7 +634,6 @@ unsafe fn start_border_breathing(layer: *mut c_void) {
         anim,
         std::ptr::null_mut(),
     );
-    send1(anim, sel(b"release\0"), std::ptr::null_mut());
 }
 
 /// NSString for the few selector-key strings needed here. Uses alloc/initWith
