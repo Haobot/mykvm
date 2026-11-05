@@ -600,6 +600,9 @@ struct HaloStatus {
     camera_ok: bool,
     /// Last enable failure (missing model, camera error, ...), if any.
     reason: Option<String>,
+    /// Multi-screen calibration vs live display topology: `Some(matches)`
+    /// when a calibration is stored, `None` before the first calibration.
+    screen_topology_ok: Option<bool>,
 }
 
 // Carries what a per-file send needs to emit progress. Optional throughout the
@@ -711,6 +714,11 @@ struct AppRuntime {
     /// The overlay window is built lazily by the first show call, so a
     /// disabled halo keeps the process thread-free.
     halo: Mutex<halo::HaloRuntime>,
+    /// S2 multi-screen region calibration wizard: plan + captured corners +
+    /// the native badge layer. Cheap bookkeeping only (badge calls dispatch
+    /// to the main thread without blocking), so it never violates the
+    /// halo/layout lock-order contract below.
+    halo_screen_cal: Mutex<ScreenCalWizardState>,
     #[cfg(target_os = "windows")]
     input_service_network_lease: Mutex<Option<std::fs::File>>,
 }
@@ -771,6 +779,7 @@ impl AppRuntime {
             halo_shortcuts: Mutex::new(HaloShortcutSet::default()),
             config_path,
             halo: Mutex::new(halo::HaloRuntime::new()),
+            halo_screen_cal: Mutex::new(ScreenCalWizardState::default()),
             #[cfg(target_os = "windows")]
             input_service_network_lease: Mutex::new(None),
         };
@@ -2099,6 +2108,9 @@ fn apply_halo_enabled(state: &AppRuntime, enabled: bool) -> Result<String, Strin
     } else {
         runtime.disable();
         drop(runtime);
+        // A mid-wizard disable would leave the badge windows up with no
+        // tracker to sample from; tear the wizard down with the pipeline.
+        halo_screen_cal_cancel_impl(state);
         Ok("stopped".into())
     }
 }
@@ -2110,21 +2122,51 @@ fn halo_set_enabled(enabled: bool, state: tauri::State<'_, AppRuntime>) -> Resul
 
 #[tauri::command]
 fn halo_get_status(state: tauri::State<'_, AppRuntime>) -> Result<HaloStatus, String> {
-    let runtime = state
-        .halo
-        .lock()
-        .map_err(|_| "halo runtime lock poisoned".to_string())?;
+    let (running, camera_ok, reason) = {
+        let runtime = state
+            .halo
+            .lock()
+            .map_err(|_| "halo runtime lock poisoned".to_string())?;
+        (
+            runtime.is_running(),
+            runtime.camera_ok(),
+            runtime.status_reason(),
+        )
+    };
+    // Layout lock taken alone AFTER the halo lock was released (lock-order
+    // contract): a stored multi-screen calibration is checked against the
+    // live display topology so the UI can warn about a stale calibration.
+    let screen_topology_ok = {
+        let layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        screen_cal_topology_flag(&layout.focus_halo, local_layout_screens(&layout))
+    };
     Ok(HaloStatus {
-        running: runtime.is_running(),
-        camera_ok: runtime.camera_ok(),
-        reason: runtime.status_reason(),
+        running,
+        camera_ok,
+        reason,
+        screen_topology_ok,
     })
 }
 
-/// Read the latest raw head pose, optionally smoothed: 5 reads at 10 Hz with
-/// a short halo lock per read (the lock is never held across the sleeps).
-/// Fails when the tracker saw no face at all.
-fn sample_latest_pose(state: &AppRuntime, smoothed: bool) -> Result<(f64, f64), String> {
+/// This machine's screens from a stored layout (`None` device = no screens).
+fn local_layout_screens(layout: &LayoutState) -> &[Screen] {
+    static EMPTY: [Screen; 0] = [];
+    layout
+        .devices
+        .iter()
+        .find(|device| device.role == "local")
+        .map(|device| device.screens.as_slice())
+        .unwrap_or(&EMPTY)
+}
+
+/// Read the latest raw head pose plus face-center position, optionally
+/// smoothed: 5 reads at 10 Hz with a short halo lock per read (the lock is
+/// never held across the sleeps). Returns (yaw, pitch, u, v) averaged over
+/// the face-present reads; fails when the tracker saw no face at all.
+fn sample_latest_pose(state: &AppRuntime, smoothed: bool) -> Result<(f64, f64, f64, f64), String> {
     if !smoothed {
         return state
             .halo
@@ -2133,13 +2175,15 @@ fn sample_latest_pose(state: &AppRuntime, smoothed: bool) -> Result<(f64, f64), 
             .latest_pose()
             .ok_or_else(|| "未检测到人脸".to_string());
     }
-    let mut sum = (0.0_f64, 0.0_f64);
+    let mut sum = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
     let mut count = 0_usize;
     for _ in 0..5 {
         if let Ok(runtime) = state.halo.lock() {
-            if let Some((yaw, pitch)) = runtime.latest_pose() {
+            if let Some((yaw, pitch, u, v)) = runtime.latest_pose() {
                 sum.0 += yaw;
                 sum.1 += pitch;
+                sum.2 += u;
+                sum.3 += v;
                 count += 1;
             }
         }
@@ -2148,7 +2192,8 @@ fn sample_latest_pose(state: &AppRuntime, smoothed: bool) -> Result<(f64, f64), 
     if count < 3 {
         return Err("未检测到人脸".to_string());
     }
-    Ok((sum.0 / count as f64, sum.1 / count as f64))
+    let n = count as f64;
+    Ok((sum.0 / n, sum.1 / n, sum.2 / n, sum.3 / n))
 }
 
 /// Mutate `focus_halo` in the stored layout and persist it to disk. Lock
@@ -2281,7 +2326,8 @@ fn halo_recenter(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
 /// the layout lock (`update_layout_focus_halo`), sleeps in
 /// `sample_latest_pose`, and finally takes the halo lock.
 fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
-    let pose = sample_latest_pose(state, true)?;
+    let (yaw, pitch, _u, _v) = sample_latest_pose(state, true)?;
+    let pose = (yaw, pitch);
     let mut calibration = None;
     update_layout_focus_halo(state, |focus_halo| {
         let shifted = halo::mapping::recenter_calibration(
@@ -2301,6 +2347,672 @@ fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
         runtime.set_calibration(calibration);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FocusHalo S2: multi-screen region calibration wizard ("转头切屏" 多屏区域
+// 校准). Five commands drive a plan of this machine's screens; each screen's
+// four corners are captured as (yaw, pitch, u, v) pose points, validated
+// pairwise and then as a whole region (screen_map::validate_region), and the
+// finished ScreenCalibration is persisted into focus_halo. A native badge
+// layer (halo::BadgeLayer) marks every screen with its number and highlights
+// the corner being captured.
+//
+// Lock contract (same as the P1 calibration flow): sample_latest_pose sleeps
+// while taking the halo lock, so it must run OUTSIDE every other lock; the
+// layout lock is only ever taken alone (snapshot or update_layout_focus_halo);
+// the wizard lock is cheap bookkeeping and is never held across either of
+// them.
+// ---------------------------------------------------------------------------
+
+/// One screen in the wizard plan (board-x-then-y sorted, numbered 1..N).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HaloScreenCalPlanItem {
+    /// Index into the plan order; also the badge layer's screen index.
+    screen_index: usize,
+    screen_id: String,
+    /// 1-based display number shown in the badge layer.
+    label: usize,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// Capture progress for the wizard UI.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HaloScreenCalProgress {
+    accepted_screens: usize,
+    total_screens: usize,
+    corners_done: usize,
+}
+
+/// Per-screen pose-space extent for the finish summary.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HaloScreenCalExtent {
+    screen_index: usize,
+    screen_id: String,
+    label: usize,
+    /// Mean of the top/bottom yaw spans, degrees.
+    width_deg: f64,
+    /// Mean of the left/right pitch spans, degrees.
+    height_deg: f64,
+}
+
+/// Finish summary: what was captured and with which compensation settings.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HaloScreenCalSummary {
+    total_screens: usize,
+    captured_at_ms: u64,
+    ref_u: f64,
+    ref_v: f64,
+    trans_alpha_yaw: f64,
+    trans_alpha_pitch: f64,
+    extents: Vec<HaloScreenCalExtent>,
+}
+
+/// One committed wizard corner sample: which screen, which physical corner,
+/// and the post-flip pose point (see `screen_map::PosePoint`).
+#[derive(Debug, Clone, PartialEq)]
+struct ScreenCalCornerSample {
+    screen_index: usize,
+    corner: halo::BadgeCorner,
+    point: halo::screen_map::PosePoint,
+}
+
+/// Wizard state behind `AppRuntime::halo_screen_cal`. Badge is optional so a
+/// non-macOS build (no badge windows) still records the plan and corners.
+#[derive(Default)]
+struct ScreenCalWizardState {
+    plan: Vec<HaloScreenCalPlanItem>,
+    corners: Vec<ScreenCalCornerSample>,
+    /// Accepted regions in completion order (sorted to plan order at finish).
+    regions: Vec<halo::screen_map::ScreenRegion>,
+    /// Currently highlighted step, mirroring the last set_step call.
+    active: Option<(usize, halo::BadgeCorner)>,
+    badge: Option<halo::BadgeLayer>,
+}
+
+impl ScreenCalWizardState {
+    fn reset(&mut self) {
+        if let Some(badge) = self.badge.as_mut() {
+            badge.hide();
+        }
+        self.badge = None;
+        self.plan.clear();
+        self.corners.clear();
+        self.regions.clear();
+        self.active = None;
+    }
+
+    fn corners_for_screen(&self, screen_index: usize) -> Vec<&ScreenCalCornerSample> {
+        self.corners
+            .iter()
+            .filter(|sample| sample.screen_index == screen_index)
+            .collect()
+    }
+
+    fn find_corner(
+        &self,
+        screen_index: usize,
+        corner: halo::BadgeCorner,
+    ) -> Option<halo::screen_map::PosePoint> {
+        self.corners
+            .iter()
+            .find(|sample| sample.screen_index == screen_index && sample.corner == corner)
+            .map(|sample| sample.point.clone())
+    }
+}
+
+/// Build the wizard plan from this machine's screens: board-x-then-y sort,
+/// numbered 1..N, `screen_index` = index in that order.
+fn screen_cal_plan_from_screens(screens: &[Screen]) -> Vec<HaloScreenCalPlanItem> {
+    let mut sorted: Vec<&Screen> = screens.iter().collect();
+    sorted.sort_by(|a, b| (a.x, a.y).cmp(&(b.x, b.y)));
+    sorted
+        .iter()
+        .enumerate()
+        .map(|(index, screen)| HaloScreenCalPlanItem {
+            screen_index: index,
+            screen_id: screen.id.clone(),
+            label: index + 1,
+            x: screen.x,
+            y: screen.y,
+            width: screen.width,
+            height: screen.height,
+        })
+        .collect()
+}
+
+/// Apply the same effective vertical flip the runtime mapping uses
+/// (camera_position XOR invert toggle): stored pitch = -raw pitch when the
+/// flip is active. Pure so the capture tests can pin the convention.
+fn screen_cal_flip_pitch(pitch: f64, flip: bool) -> f64 {
+    if flip {
+        -pitch
+    } else {
+        pitch
+    }
+}
+
+/// This machine's screens as `screen_map::BoardRect`s (topology check input).
+fn screen_cal_board_rects(screens: &[Screen]) -> Vec<halo::screen_map::BoardRect> {
+    screens
+        .iter()
+        .map(|screen| halo::screen_map::BoardRect {
+            screen_id: screen.id.clone(),
+            x: screen.x as f64,
+            y: screen.y as f64,
+            width: screen.width as f64,
+            height: screen.height as f64,
+        })
+        .collect()
+}
+
+/// Whether the stored multi-screen calibration still matches the live layout:
+/// `Some(matches)` when a calibration exists, `None` otherwise (halo_get_status).
+fn screen_cal_topology_flag(
+    focus_halo: &halo::FocusHaloSettings,
+    screens: &[Screen],
+) -> Option<bool> {
+    let calibration = focus_halo.screen_calibration.as_ref()?;
+    Some(halo::screen_map::topology_matches(
+        calibration,
+        &screen_cal_board_rects(screens),
+    ))
+}
+
+/// Parse the wizard's corner parameter (`"tl"|"tr"|"br"|"bl"`).
+fn screen_cal_parse_corner(value: &str) -> Result<halo::BadgeCorner, String> {
+    match value {
+        "tl" => Ok(halo::BadgeCorner::Tl),
+        "tr" => Ok(halo::BadgeCorner::Tr),
+        "br" => Ok(halo::BadgeCorner::Br),
+        "bl" => Ok(halo::BadgeCorner::Bl),
+        other => Err(format!("unknown screen calibration corner: {other}")),
+    }
+}
+
+/// One pairwise side check: `left` corner's yaw must sit at least
+/// MIN_REGION_EXTENT_DEG to the left of the freshly captured `right` yaw
+/// (None partner = the other corner of this side is not captured yet, so the
+/// pair cannot be judged — its own capture step checks it later).
+fn screen_cal_check_yaw_side(
+    low_label: &str,
+    low: Option<f64>,
+    high_label: &str,
+    high: f64,
+) -> Result<(), String> {
+    let Some(low) = low else {
+        return Ok(());
+    };
+    if high <= low {
+        return Err(format!(
+            "角序不符（实测 {low_label} yaw {low:.1}° vs {high_label} {high:.1}°）：请按 左上→右上→右下→左下 顺序注视屏幕物理角重新采集本步"
+        ));
+    }
+    let span = high - low;
+    if span < halo::screen_map::MIN_REGION_EXTENT_DEG {
+        return Err(format!(
+            "本屏幅度过小（{low_label}/{high_label} 左右差仅 {span:.1}°，不足 {:.1}°）：请把头转向更外侧的屏幕物理角后重试",
+            halo::screen_map::MIN_REGION_EXTENT_DEG
+        ));
+    }
+    Ok(())
+}
+
+/// The vertical counterpart: `top` pitch must sit at least
+/// MIN_REGION_EXTENT_DEG above the freshly captured `bottom` pitch.
+fn screen_cal_check_pitch_side(
+    top: Option<f64>,
+    top_label: &str,
+    bottom: f64,
+    bottom_label: &str,
+) -> Result<(), String> {
+    let Some(top) = top else {
+        return Ok(());
+    };
+    if top <= bottom {
+        return Err(format!(
+            "角序不符（实测 {top_label} pitch {top:.1}° vs {bottom_label} {bottom:.1}°）：请按 左上→右上→右下→左下 顺序注视屏幕物理角重新采集本步"
+        ));
+    }
+    let span = top - bottom;
+    if span < halo::screen_map::MIN_REGION_EXTENT_DEG {
+        return Err(format!(
+            "本屏幅度过小（{top_label}/{bottom_label} 上下差仅 {span:.1}°，不足 {:.1}°）：请把头转向更外侧的屏幕物理角后重试",
+            halo::screen_map::MIN_REGION_EXTENT_DEG
+        ));
+    }
+    Ok(())
+}
+
+/// Instant per-corner validation within one screen: each pairwise side is
+/// judged the moment its second corner lands, with the measured numbers in
+/// the message. The fresh corner is always the RIGHT (yaw) or BOTTOM (pitch)
+/// member of each pair, matching the 左上→右上→右下→左下 capture order;
+/// corners whose partners are missing pass untouched.
+fn screen_cal_check_corner(
+    corner: halo::BadgeCorner,
+    fresh: &halo::screen_map::PosePoint,
+    peers: &ScreenCalWizardState,
+    screen_index: usize,
+) -> Result<(), String> {
+    let yaw_pair = |partner: halo::BadgeCorner, low_label: &str, high_label: &str| {
+        let low = peers
+            .find_corner(screen_index, partner)
+            .map(|point| point.yaw);
+        screen_cal_check_yaw_side(low_label, low, high_label, fresh.yaw)
+    };
+    let pitch_pair = |partner: halo::BadgeCorner, top_label: &str, bottom_label: &str| {
+        let top = peers
+            .find_corner(screen_index, partner)
+            .map(|point| point.pitch);
+        screen_cal_check_pitch_side(top, top_label, fresh.pitch, bottom_label)
+    };
+    match corner {
+        halo::BadgeCorner::Tl => Ok(()),
+        halo::BadgeCorner::Tr => yaw_pair(halo::BadgeCorner::Tl, "左上", "右上"),
+        halo::BadgeCorner::Bl => pitch_pair(halo::BadgeCorner::Tl, "左上", "左下"),
+        halo::BadgeCorner::Br => {
+            // Two sides land together at the last corner: the bottom yaw pair
+            // (bl vs br) and the right pitch pair (tr vs br).
+            yaw_pair(halo::BadgeCorner::Bl, "左下", "右下")?;
+            pitch_pair(halo::BadgeCorner::Tr, "右上", "右下")
+        }
+    }
+}
+
+/// Human-readable Chinese message for a rejected region, carrying the
+/// measured numbers of the failed quad.
+fn screen_cal_region_error_message(
+    region: &halo::screen_map::ScreenRegion,
+    error: &halo::screen_map::RegionError,
+) -> String {
+    match error {
+        halo::screen_map::RegionError::NonConvex => {
+            "四角姿态共线或自交，请按 左上→右上→右下→左下 顺序注视屏幕物理角重新采集本屏".to_string()
+        }
+        halo::screen_map::RegionError::CornerOrder => format!(
+            "角序不符（实测 左上 yaw {:.1}° vs 右上 {:.1}°）：请按 左上→右上→右下→左下 顺序注视屏幕物理角重新采集本屏",
+            region.tl.yaw, region.tr.yaw
+        ),
+        halo::screen_map::RegionError::TooSmall => {
+            let width = region.tr.yaw - region.tl.yaw;
+            let height = region.tl.pitch - region.bl.pitch;
+            format!(
+                "本屏幅度过小（宽 {width:.1}° 高 {height:.1}°）：请把头转向更外侧的屏幕物理角后重新采集本屏"
+            )
+        }
+        halo::screen_map::RegionError::Overlap { other, ratio } => format!(
+            "与屏幕 {} 区域重叠 {:.0}%，请勿重复校准同一块屏",
+            other + 1,
+            ratio * 100.0
+        ),
+    }
+}
+
+/// Assemble the wizard's ScreenRegion for a completed screen from its four
+/// committed corner samples.
+fn screen_cal_region_from_samples(
+    item: &HaloScreenCalPlanItem,
+    samples: &[&ScreenCalCornerSample],
+) -> Option<halo::screen_map::ScreenRegion> {
+    let pick = |corner: halo::BadgeCorner| {
+        samples
+            .iter()
+            .find(|sample| sample.corner == corner)
+            .map(|sample| sample.point.clone())
+    };
+    Some(halo::screen_map::ScreenRegion {
+        screen_id: item.screen_id.clone(),
+        board: halo::screen_map::BoardRect {
+            screen_id: item.screen_id.clone(),
+            x: item.x as f64,
+            y: item.y as f64,
+            width: item.width as f64,
+            height: item.height as f64,
+        },
+        tl: pick(halo::BadgeCorner::Tl)?,
+        tr: pick(halo::BadgeCorner::Tr)?,
+        br: pick(halo::BadgeCorner::Br)?,
+        bl: pick(halo::BadgeCorner::Bl)?,
+    })
+}
+
+/// Current progress snapshot over the wizard state.
+fn screen_cal_progress(state: &ScreenCalWizardState) -> HaloScreenCalProgress {
+    HaloScreenCalProgress {
+        accepted_screens: state.regions.len(),
+        total_screens: state.plan.len(),
+        corners_done: state.corners.len(),
+    }
+}
+
+#[tauri::command]
+fn halo_screen_cal_begin(
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<Vec<HaloScreenCalPlanItem>, String> {
+    // 1. Layout snapshot (layout lock taken alone).
+    let (plan, badge_screens) = {
+        let layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        let screens = layout
+            .devices
+            .iter()
+            .find(|device| device.role == "local")
+            .map(|device| device.screens.clone())
+            .unwrap_or_default();
+        if screens.is_empty() {
+            return Err("未检测到本机屏幕，无法开始多屏校准".to_string());
+        }
+        let plan = screen_cal_plan_from_screens(&screens);
+        let badge_screens = plan
+            .iter()
+            .zip(screens.iter())
+            .map(|(item, screen)| {
+                let (native_x, native_y) = halo_native_origin(screen);
+                halo::BadgeScreen {
+                    geometry: halo::OverlayScreenGeometry {
+                        x: screen.x as f64,
+                        y: screen.y as f64,
+                        width: screen.width as f64,
+                        height: screen.height as f64,
+                        scale: screen.scale,
+                        native_x,
+                        native_y,
+                    },
+                    label: item.label.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        (plan, badge_screens)
+    };
+    // 2. Tracking must be running (halo lock taken alone, after layout).
+    {
+        let runtime = state
+            .halo
+            .lock()
+            .map_err(|_| "halo runtime lock poisoned".to_string())?;
+        if !runtime.is_running() {
+            return Err("请先开启 FocusHalo 跟踪".to_string());
+        }
+    }
+    // 3. Reset + show badges (wizard lock; badge calls only dispatch).
+    let mut wizard = state
+        .halo_screen_cal
+        .lock()
+        .map_err(|_| "halo screen calibration lock poisoned".to_string())?;
+    wizard.reset();
+    let mut badge = halo::BadgeLayer::new();
+    badge.show(&badge_screens);
+    wizard.badge = Some(badge);
+    wizard.plan = plan.clone();
+    Ok(plan)
+}
+
+#[tauri::command]
+fn halo_screen_cal_set_step(
+    screen_index: usize,
+    corner: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    let corner = screen_cal_parse_corner(&corner)?;
+    let mut wizard = state
+        .halo_screen_cal
+        .lock()
+        .map_err(|_| "halo screen calibration lock poisoned".to_string())?;
+    if wizard.plan.is_empty() {
+        return Err("请先开始多屏校准".to_string());
+    }
+    if screen_index >= wizard.plan.len() {
+        return Err(format!(
+            "屏幕编号超出当前校准计划（共 {} 块屏幕）",
+            wizard.plan.len()
+        ));
+    }
+    if let Some(badge) = wizard.badge.as_mut() {
+        badge.set_active(screen_index, corner);
+    }
+    wizard.active = Some((screen_index, corner));
+    Ok(())
+}
+
+#[tauri::command]
+fn halo_screen_cal_capture(
+    screen_index: usize,
+    corner: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<HaloScreenCalProgress, String> {
+    halo_screen_cal_capture_impl(state.inner(), screen_index, &corner)
+}
+
+/// Shared capture body (command + testable seam). Order: smoothed pose
+/// sample (halo lock + sleeps, outside every other lock) -> stored-pitch flip
+/// (layout lock alone) -> wizard bookkeeping and validation.
+fn halo_screen_cal_capture_impl(
+    state: &AppRuntime,
+    screen_index: usize,
+    corner: &str,
+) -> Result<HaloScreenCalProgress, String> {
+    let corner = screen_cal_parse_corner(corner)?;
+    let (yaw, raw_pitch, u, v) = sample_latest_pose(state, true)?;
+    let flip_pitch = {
+        let focus_halo = halo_settings_snapshot(state);
+        (focus_halo.camera_position == halo::params::CameraPosition::Bottom)
+            != focus_halo.invert_pitch
+    };
+    let point = halo::screen_map::PosePoint {
+        yaw,
+        pitch: screen_cal_flip_pitch(raw_pitch, flip_pitch),
+        u,
+        v,
+    };
+
+    let mut wizard = state
+        .halo_screen_cal
+        .lock()
+        .map_err(|_| "halo screen calibration lock poisoned".to_string())?;
+    if wizard.plan.is_empty() {
+        return Err("请先开始多屏校准".to_string());
+    }
+    if screen_index >= wizard.plan.len() {
+        return Err(format!(
+            "屏幕编号超出当前校准计划（共 {} 块屏幕）",
+            wizard.plan.len()
+        ));
+    }
+
+    // Instant pairwise checks within this screen; a failed corner is not
+    // committed, so the retry simply overwrites nothing and re-checks.
+    screen_cal_check_corner(corner, &point, &wizard, screen_index)?;
+
+    // Commit the sample (a retry of the same corner replaces the old value).
+    if let Some(slot) = wizard
+        .corners
+        .iter()
+        .position(|sample| sample.screen_index == screen_index && sample.corner == corner)
+    {
+        wizard.corners[slot] = ScreenCalCornerSample {
+            screen_index,
+            corner,
+            point: point.clone(),
+        };
+    } else {
+        wizard.corners.push(ScreenCalCornerSample {
+            screen_index,
+            corner,
+            point: point.clone(),
+        });
+    }
+
+    // All four corners present: validate the whole region against the
+    // already-accepted screens.
+    let samples = wizard.corners_for_screen(screen_index);
+    let complete = [
+        halo::BadgeCorner::Tl,
+        halo::BadgeCorner::Tr,
+        halo::BadgeCorner::Br,
+        halo::BadgeCorner::Bl,
+    ]
+    .iter()
+    .all(|corner| samples.iter().any(|sample| sample.corner == *corner));
+    if complete {
+        let item = wizard.plan[screen_index].clone();
+        let region = screen_cal_region_from_samples(&item, &samples)
+            .ok_or_else(|| "校准角数据不完整，请重新采集本屏".to_string())?;
+        if let Err(error) = halo::screen_map::validate_region(&region, &wizard.regions) {
+            // Failed validation does not commit the region; the committed
+            // corners stay so only the offending corner needs re-capture.
+            return Err(screen_cal_region_error_message(&region, &error));
+        }
+        wizard.regions.push(region);
+        if let Some(badge) = wizard.badge.as_mut() {
+            badge.clear_active();
+        }
+        wizard.active = None;
+    }
+    Ok(screen_cal_progress(&wizard))
+}
+
+#[tauri::command]
+fn halo_screen_cal_finish(
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<HaloScreenCalSummary, String> {
+    halo_screen_cal_finish_impl(state.inner())
+}
+
+/// Shared finish body: assemble + persist the calibration, hide the badges,
+/// and clear the wizard.
+fn halo_screen_cal_finish_impl(state: &AppRuntime) -> Result<HaloScreenCalSummary, String> {
+    // 1. Wizard snapshot (wizard lock alone).
+    let (plan, mut regions, corner_count) = {
+        let wizard = state
+            .halo_screen_cal
+            .lock()
+            .map_err(|_| "halo screen calibration lock poisoned".to_string())?;
+        if wizard.plan.is_empty() {
+            return Err("请先开始多屏校准".to_string());
+        }
+        let missing = wizard.plan.len() - wizard.regions.len();
+        if missing > 0 {
+            return Err(format!(
+                "还有 {missing} 块屏幕未完成校准（已完成 {} / {}）",
+                wizard.regions.len(),
+                wizard.plan.len()
+            ));
+        }
+        (
+            wizard.plan.clone(),
+            wizard.regions.clone(),
+            wizard.corners.len(),
+        )
+    };
+    // Regions are pushed in completion order; reorder to plan order so the
+    // persisted indices stay stable regardless of capture order.
+    regions.sort_by(|a, b| {
+        let index = |id: &str| plan.iter().position(|item| item.screen_id == id);
+        index(&a.screen_id)
+            .unwrap_or(usize::MAX)
+            .cmp(&index(&b.screen_id).unwrap_or(usize::MAX))
+    });
+
+    // 2. Settings snapshot (layout lock alone): trans alpha + reference face
+    //    position averaged over every committed corner sample.
+    let settings = halo_settings_snapshot(state);
+    let (mut sum_u, mut sum_v) = (0.0_f64, 0.0_f64);
+    {
+        let wizard = state
+            .halo_screen_cal
+            .lock()
+            .map_err(|_| "halo screen calibration lock poisoned".to_string())?;
+        for sample in &wizard.corners {
+            sum_u += sample.point.u;
+            sum_v += sample.point.v;
+        }
+    }
+    let count = corner_count.max(1) as f64;
+    let calibration = halo::screen_map::ScreenCalibration {
+        version: 1,
+        captured_at_ms: now_ms(),
+        regions,
+        ref_u: sum_u / count,
+        ref_v: sum_v / count,
+        trans_alpha_yaw: settings.trans_alpha_yaw,
+        trans_alpha_pitch: settings.trans_alpha_pitch,
+    };
+
+    // 3. Persist (layout lock alone via update_layout_focus_halo).
+    let extents: Vec<HaloScreenCalExtent> = calibration
+        .regions
+        .iter()
+        .enumerate()
+        .map(|(index, region)| {
+            let item = plan
+                .iter()
+                .find(|item| item.screen_id == region.screen_id)
+                .cloned()
+                .unwrap_or_else(|| HaloScreenCalPlanItem {
+                    screen_index: index,
+                    screen_id: region.screen_id.clone(),
+                    label: index + 1,
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                });
+            HaloScreenCalExtent {
+                screen_index: item.screen_index,
+                screen_id: region.screen_id.clone(),
+                label: item.label,
+                width_deg: ((region.tr.yaw - region.tl.yaw) + (region.br.yaw - region.bl.yaw))
+                    / 2.0,
+                height_deg: ((region.tl.pitch - region.bl.pitch)
+                    + (region.tr.pitch - region.br.pitch))
+                    / 2.0,
+            }
+        })
+        .collect();
+    let summary = HaloScreenCalSummary {
+        total_screens: calibration.regions.len(),
+        captured_at_ms: calibration.captured_at_ms,
+        ref_u: calibration.ref_u,
+        ref_v: calibration.ref_v,
+        trans_alpha_yaw: calibration.trans_alpha_yaw,
+        trans_alpha_pitch: calibration.trans_alpha_pitch,
+        extents,
+    };
+    update_layout_focus_halo(state, |focus_halo| {
+        focus_halo.screen_calibration = Some(calibration.clone());
+        Ok(())
+    })?;
+
+    // 4. Teardown the wizard (wizard lock alone; badge hide dispatches).
+    if let Ok(mut wizard) = state.halo_screen_cal.lock() {
+        wizard.reset();
+    }
+    Ok(summary)
+}
+
+#[tauri::command]
+fn halo_screen_cal_cancel(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    halo_screen_cal_cancel_impl(state.inner());
+    Ok(())
+}
+
+/// Shared cancel body (cancel command, app exit, tracking disable): hide the
+/// badge windows and clear the wizard state. Never fails: a poisoned lock
+/// only means the badges may linger, which the next begin/reset fixes.
+fn halo_screen_cal_cancel_impl(state: &AppRuntime) {
+    if let Ok(mut wizard) = state.halo_screen_cal.lock() {
+        wizard.reset();
+    }
 }
 
 /// Which halo control hotkey matched in `route_global_shortcut`.
@@ -5252,7 +5964,12 @@ pub fn run() {
             halo_capture_calibration_point,
             halo_recenter,
             halo_undo_switch,
-            halo_emergency_stop
+            halo_emergency_stop,
+            halo_screen_cal_begin,
+            halo_screen_cal_set_step,
+            halo_screen_cal_capture,
+            halo_screen_cal_finish,
+            halo_screen_cal_cancel
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -5266,6 +5983,9 @@ pub fn run() {
             tauri::RunEvent::Exit => {
                 if let Some(state) = app.try_state::<AppRuntime>() {
                     state.hand_off_network();
+                    // The badge layer must never outlive the process: hide
+                    // the calibration badges on the way out.
+                    halo_screen_cal_cancel_impl(state.inner());
                 }
             }
             #[cfg(target_os = "macos")]
@@ -16200,5 +16920,338 @@ mod tests {
             &mut grace_until,
         );
         assert!(!skipped, "正常间隔不应触发 guard 信号");
+    }
+
+    // ------------------------------------------------------------------
+    // S2 multi-screen region calibration wizard (pure helpers)
+    // ------------------------------------------------------------------
+
+    fn wizard_screen(id: &str, x: i32, y: i32) -> Screen {
+        Screen {
+            id: id.into(),
+            device_id: "local-device".into(),
+            name: id.into(),
+            x,
+            y,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            is_primary: x == 0 && y == 0,
+        }
+    }
+
+    fn pose(yaw: f64, pitch: f64) -> halo::screen_map::PosePoint {
+        halo::screen_map::PosePoint {
+            yaw,
+            pitch,
+            u: 0.5,
+            v: 0.5,
+        }
+    }
+
+    fn wizard_with_corner(
+        screen_index: usize,
+        corner: halo::BadgeCorner,
+        point: halo::screen_map::PosePoint,
+    ) -> ScreenCalWizardState {
+        let mut wizard = ScreenCalWizardState::default();
+        wizard.plan = vec![HaloScreenCalPlanItem {
+            screen_index: 0,
+            screen_id: "screen-0".into(),
+            label: 1,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        wizard.corners.push(ScreenCalCornerSample {
+            screen_index,
+            corner,
+            point,
+        });
+        wizard
+    }
+
+    #[test]
+    fn screen_cal_plan_sorts_by_board_x_then_y_and_numbers_screens() {
+        let screens = vec![
+            wizard_screen("right", 1920, 0),
+            wizard_screen("below-left", 0, 1080),
+            wizard_screen("left", 0, 0),
+            wizard_screen("above-right", 1920, -540),
+        ];
+        let plan = screen_cal_plan_from_screens(&screens);
+        let order: Vec<(&str, usize)> = plan
+            .iter()
+            .map(|item| (item.screen_id.as_str(), item.label))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("left", 1),
+                ("below-left", 2),
+                ("above-right", 3),
+                ("right", 4),
+            ],
+            "board x ascending, ties broken by y"
+        );
+        assert_eq!(plan[1].screen_index, 1);
+        assert_eq!(plan[1].y, 1080, "below-left is the second x=0 screen");
+        assert_eq!(plan[2].x, 1920);
+        assert_eq!(plan[2].y, -540);
+    }
+
+    #[test]
+    fn screen_cal_flip_matches_camera_position_xor_invert_toggle() {
+        // The capture flow applies (camera_position == Bottom) XOR invert_pitch;
+        // pin the exact same convention here.
+        let flip =
+            (halo::params::CameraPosition::Bottom != halo::params::CameraPosition::Top) != false;
+        assert!(flip, "bottom camera flips");
+        assert_eq!(screen_cal_flip_pitch(7.0, true), -7.0);
+        assert_eq!(screen_cal_flip_pitch(-3.0, true), 3.0);
+        assert_eq!(screen_cal_flip_pitch(7.0, false), 7.0);
+    }
+
+    #[test]
+    fn screen_cal_pairwise_checks_pass_in_capture_order() {
+        let plan_quad = [
+            pose(-12.0, 8.0),  // tl
+            pose(12.0, 7.0),   // tr
+            pose(10.0, -7.0),  // br
+            pose(-10.0, -6.0), // bl
+        ];
+        let corners = [
+            halo::BadgeCorner::Tl,
+            halo::BadgeCorner::Tr,
+            halo::BadgeCorner::Br,
+            halo::BadgeCorner::Bl,
+        ];
+        // Replay the wizard flow corner by corner; every step must pass.
+        let mut wizard = ScreenCalWizardState::default();
+        wizard.plan = vec![HaloScreenCalPlanItem {
+            screen_index: 0,
+            screen_id: "screen-0".into(),
+            label: 1,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        for (corner, point) in corners.iter().zip(plan_quad.iter()) {
+            screen_cal_check_corner(*corner, point, &wizard, 0)
+                .unwrap_or_else(|error| panic!("{corner:?} step rejected: {error}"));
+            wizard.corners.push(ScreenCalCornerSample {
+                screen_index: 0,
+                corner: *corner,
+                point: point.clone(),
+            });
+        }
+    }
+
+    #[test]
+    fn screen_cal_pairwise_checks_reject_wrong_corner_order() {
+        // tl captured at yaw -5; a "right" corner captured further LEFT must
+        // fail the top side check.
+        let wizard = wizard_with_corner(0, halo::BadgeCorner::Tl, pose(-5.0, 8.0));
+        let error = screen_cal_check_corner(halo::BadgeCorner::Tr, &pose(-8.0, 7.0), &wizard, 0)
+            .expect_err("right corner left of the left corner must fail");
+        assert!(error.contains("角序不符"), "got: {error}");
+        assert!(
+            error.contains("左上") && error.contains("右上"),
+            "got: {error}"
+        );
+
+        // A "bottom" corner captured ABOVE the top-left corner must fail the
+        // left side pitch check.
+        let error = screen_cal_check_corner(halo::BadgeCorner::Bl, &pose(-5.0, 9.5), &wizard, 0)
+            .expect_err("bottom corner above the top corner must fail");
+        assert!(error.contains("角序不符"), "got: {error}");
+    }
+
+    #[test]
+    fn screen_cal_pairwise_checks_reject_tiny_extents() {
+        // Order is correct but the yaw span is below MIN_REGION_EXTENT_DEG.
+        let wizard = wizard_with_corner(0, halo::BadgeCorner::Tl, pose(-1.2, 8.0));
+        let error = screen_cal_check_corner(halo::BadgeCorner::Tr, &pose(-0.6, 7.0), &wizard, 0)
+            .expect_err("0.6° span must fail the extent gate");
+        assert!(error.contains("幅度过小"), "got: {error}");
+        // Vertical counterpart.
+        let error = screen_cal_check_corner(halo::BadgeCorner::Bl, &pose(-1.2, 7.6), &wizard, 0)
+            .expect_err("0.4° pitch span must fail");
+        assert!(error.contains("幅度过小"), "got: {error}");
+    }
+
+    #[test]
+    fn screen_cal_last_corner_checks_both_remaining_sides() {
+        // tl, tr, bl captured; br fails the right side (tr pitch vs br pitch).
+        let mut wizard = ScreenCalWizardState::default();
+        wizard.plan = vec![HaloScreenCalPlanItem {
+            screen_index: 0,
+            screen_id: "screen-0".into(),
+            label: 1,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        for (corner, point) in [
+            (halo::BadgeCorner::Tl, pose(-12.0, 8.0)),
+            (halo::BadgeCorner::Tr, pose(12.0, 7.0)),
+            (halo::BadgeCorner::Bl, pose(-12.0, -8.0)),
+        ] {
+            wizard.corners.push(ScreenCalCornerSample {
+                screen_index: 0,
+                corner,
+                point,
+            });
+        }
+        let error = screen_cal_check_corner(halo::BadgeCorner::Br, &pose(10.0, 9.0), &wizard, 0)
+            .expect_err("br above tr must fail the right side");
+        assert!(error.contains("角序不符"), "got: {error}");
+        // Correct br passes both sides.
+        screen_cal_check_corner(halo::BadgeCorner::Br, &pose(10.0, -7.0), &wizard, 0)
+            .expect("valid br must pass");
+    }
+
+    #[test]
+    fn screen_cal_region_error_messages_cover_every_variant() {
+        use halo::screen_map::{BoardRect, RegionError, ScreenRegion};
+        let region = halo::screen_map::ScreenRegion {
+            screen_id: "screen-0".into(),
+            board: BoardRect {
+                screen_id: "screen-0".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            tl: pose(-12.0, 8.0),
+            tr: pose(-11.0, 7.5),
+            br: pose(-11.5, -7.0),
+            bl: pose(-12.5, -6.0),
+        };
+        let message = screen_cal_region_error_message(&region, &RegionError::NonConvex);
+        assert_eq!(
+            message,
+            "四角姿态共线或自交，请按 左上→右上→右下→左下 顺序注视屏幕物理角重新采集本屏"
+        );
+        let message = screen_cal_region_error_message(&region, &RegionError::CornerOrder);
+        assert!(
+            message.contains("角序不符") && message.contains("-12.0") && message.contains("-11.0"),
+            "corner-order message carries measured yaws: {message}"
+        );
+        let message = screen_cal_region_error_message(&region, &RegionError::TooSmall);
+        assert!(
+            message.contains("幅度过小") && message.contains("1.0°") && message.contains("14.0°"),
+            "too-small message carries measured extents: {message}"
+        );
+        let message = screen_cal_region_error_message(
+            &region,
+            &RegionError::Overlap {
+                other: 1,
+                ratio: 0.42,
+            },
+        );
+        assert_eq!(
+            message, "与屏幕 2 区域重叠 42%，请勿重复校准同一块屏",
+            "overlap message names the 1-based screen and rounded ratio"
+        );
+    }
+
+    #[test]
+    fn screen_cal_region_assembly_and_progress_track_wizard_state() {
+        let plan = vec![HaloScreenCalPlanItem {
+            screen_index: 0,
+            screen_id: "screen-0".into(),
+            label: 1,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }];
+        let committed: Vec<ScreenCalCornerSample> = [
+            (halo::BadgeCorner::Tl, pose(-12.0, 8.0)),
+            (halo::BadgeCorner::Tr, pose(12.0, 7.0)),
+            (halo::BadgeCorner::Br, pose(10.0, -7.0)),
+            (halo::BadgeCorner::Bl, pose(-10.0, -6.0)),
+        ]
+        .iter()
+        .map(|(corner, point)| ScreenCalCornerSample {
+            screen_index: 0,
+            corner: *corner,
+            point: point.clone(),
+        })
+        .collect();
+        let samples: Vec<&ScreenCalCornerSample> = committed.iter().collect();
+        let region = screen_cal_region_from_samples(&plan[0], &samples)
+            .expect("four corners assemble into a region");
+        assert_eq!(region.screen_id, "screen-0");
+        assert_eq!(region.board.width, 1920.0);
+        assert_eq!(
+            halo::screen_map::validate_region(&region, &[]),
+            Ok(()),
+            "the assembled quad is a valid region"
+        );
+        // Incomplete corners cannot assemble.
+        assert!(screen_cal_region_from_samples(&plan[0], &samples[..3]).is_none());
+
+        let mut wizard = ScreenCalWizardState::default();
+        wizard.plan = plan;
+        let progress = screen_cal_progress(&wizard);
+        assert_eq!(
+            progress,
+            HaloScreenCalProgress {
+                accepted_screens: 0,
+                total_screens: 1,
+                corners_done: 0
+            }
+        );
+    }
+
+    #[test]
+    fn screen_cal_topology_flag_reflects_layout_changes() {
+        let mut settings = halo::FocusHaloSettings::default();
+        // No calibration yet -> null (not "mismatched").
+        assert_eq!(screen_cal_topology_flag(&settings, &[]), None);
+
+        let screens = vec![wizard_screen("screen-0", 0, 0)];
+        settings.screen_calibration = Some(halo::screen_map::ScreenCalibration {
+            regions: vec![halo::screen_map::ScreenRegion {
+                screen_id: "screen-0".into(),
+                board: halo::screen_map::BoardRect {
+                    screen_id: "screen-0".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                tl: pose(-12.0, 8.0),
+                tr: pose(12.0, 7.0),
+                br: pose(10.0, -7.0),
+                bl: pose(-10.0, -6.0),
+            }],
+            ..halo::screen_map::ScreenCalibration::default()
+        });
+        assert_eq!(
+            screen_cal_topology_flag(&settings, &screens),
+            Some(true),
+            "identical layout still matches"
+        );
+        let moved = vec![wizard_screen("screen-0", 40, 0)];
+        assert_eq!(
+            screen_cal_topology_flag(&settings, &moved),
+            Some(false),
+            "moved screen breaks the topology"
+        );
+        let extra = vec![
+            wizard_screen("screen-0", 0, 0),
+            wizard_screen("screen-1", 1920, 0),
+        ];
+        assert_eq!(
+            screen_cal_topology_flag(&settings, &extra),
+            Some(false),
+            "screen count change breaks the topology"
+        );
     }
 }
