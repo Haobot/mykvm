@@ -10,7 +10,7 @@ const MIN_HALF_RANGE: f64 = 1e-3;
 /// Degree margin required between the captured center and the left/right
 /// extremes (and for the up/down magnitudes) so float noise from a lazy
 /// capture cannot pass as a monotonic calibration.
-const CAPTURE_MIN_EXTENT_DEG: f64 = 0.05;
+pub const CAPTURE_MIN_EXTENT_DEG: f64 = 0.05;
 
 /// Per-user head pose calibration, in degrees, matching the 6DRepNet Euler
 /// convention used by `crate::halo::tracker` (positive pitch = looking up).
@@ -165,6 +165,21 @@ pub fn validate_calibration(cal: &CalibrationProfile) -> Result<(), String> {
     Ok(())
 }
 
+/// Signed pitch extent for a calibration extreme, applying the same
+/// effective vertical flip the runtime mapping uses (camera below the screen
+/// XOR the user-facing invert toggle). Calibration capture MUST go through
+/// this helper so captured magnitudes stay positive exactly when the on-screen
+/// halo moves the right way — otherwise an inverted camera plus the invert
+/// toggle yields a negative "up" capture that only fails at finish.
+pub fn pitch_extent(reading: f64, center: f64, flip: bool) -> f64 {
+    let delta = reading - center;
+    if flip {
+        -delta
+    } else {
+        delta
+    }
+}
+
 /// Shift a captured profile so the current head pose maps to screen center:
 /// every absolute yaw/pitch reading moves by the same offset; the up/down
 /// magnitudes are relative and stay untouched. This is the "recenter" flow.
@@ -260,6 +275,17 @@ mod tests {
         let bottom = map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, true, false).1;
         assert_eq!(top, 0.0);
         assert_eq!(bottom, 1.0);
+    }
+
+    #[test]
+    fn pitch_extent_applies_capture_flip() {
+        // Normal camera: looking up past center gives a positive extent.
+        assert!((pitch_extent(8.0, 1.0, false) - 7.0).abs() < 1e-9);
+        // Inverted camera reading (looking up reads BELOW center): the same
+        // effective flip the mapping uses turns it into a positive extent.
+        assert!((pitch_extent(-6.0, 1.0, true) - 7.0).abs() < 1e-9);
+        // Down capture passes the inverted flag.
+        assert!((pitch_extent(-6.0, 1.0, false) - (-7.0)).abs() < 1e-9);
     }
 
     #[test]

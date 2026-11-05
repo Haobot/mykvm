@@ -2109,6 +2109,17 @@ fn halo_capture_calibration_point(
     let is_center = point == "center";
     let pose = sample_latest_pose(state.inner(), is_center)?;
 
+    // The capture math must apply the same effective vertical flip the
+    // runtime mapping applies (camera position XOR the invert toggle); an
+    // inverted camera with the invert toggle ON otherwise captures a negative
+    // "up" extent that only surfaces at finish validation.
+    let flip_pitch = {
+        let focus_halo = halo_settings_snapshot(state.inner());
+        (focus_halo.camera_position == halo::params::CameraPosition::Bottom)
+            != focus_halo.invert_pitch
+    };
+    let margin = halo::mapping::CAPTURE_MIN_EXTENT_DEG;
+
     match point.as_str() {
         "center" | "left" | "right" | "up" | "down" => {
             let point = point;
@@ -2125,12 +2136,39 @@ fn halo_capture_calibration_point(
                     }
                     "left" => next.left_yaw = pose.0,
                     "right" => next.right_yaw = pose.0,
-                    "up" => next.up_pitch = pose.1 - next.center_pitch,
-                    "down" => next.down_pitch = next.center_pitch - pose.1,
+                    "up" => {
+                        next.up_pitch =
+                            halo::mapping::pitch_extent(pose.1, next.center_pitch, flip_pitch);
+                    }
+                    "down" => {
+                        next.down_pitch =
+                            halo::mapping::pitch_extent(pose.1, next.center_pitch, !flip_pitch);
+                    }
                     _ => unreachable!("matched above"),
                 }
-                focus_halo.calibration = Some(next);
-                Ok(())
+                focus_halo.calibration = Some(next.clone());
+                // Immediate per-step validation with the captured numbers, so a
+                // bad reading surfaces on its own step instead of failing the
+                // whole flow at finish.
+                match point.as_str() {
+                    "left" if next.left_yaw >= next.center_yaw - margin => Err(format!(
+                        "左转读数（{:.1}°）未低于中心（{:.1}°）：请转向左侧极限后重试，或回到第 1 步重新采集中心",
+                        next.left_yaw, next.center_yaw
+                    )),
+                    "right" if next.right_yaw <= next.center_yaw + margin => Err(format!(
+                        "右转读数（{:.1}°）未高于中心（{:.1}°）：请转向右侧极限后重试，或回到第 1 步重新采集中心",
+                        next.right_yaw, next.center_yaw
+                    )),
+                    "up" if next.up_pitch <= margin => Err(format!(
+                        "抬头幅度不足（实测 {:.1}°）：若刚才抬头时数值为负，请切换「上下方向对调」开关后重新采集本步",
+                        next.up_pitch
+                    )),
+                    "down" if next.down_pitch <= margin => Err(format!(
+                        "低头幅度不足（实测 {:.1}°）：若刚才低头时数值为正，请切换「上下方向对调」开关后重新采集本步",
+                        next.down_pitch
+                    )),
+                    _ => Ok(()),
+                }
             })
         }
         "finish" => {

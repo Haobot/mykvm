@@ -4611,6 +4611,15 @@ function App() {
                       : ui.settings.haloPhaseSuspendedFace}
                   </span>
                 </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.haloLiveReadout}</span>
+                  <span className="muted-copy">
+                    {ui.settings.haloPitchLabel}{" "}
+                    {haloDebug ? (haloDebug.rawPitch ?? 0).toFixed(1) : "–"}° ·{" "}
+                    {ui.settings.haloYawLabel}{" "}
+                    {haloDebug ? (haloDebug.rawYaw ?? 0).toFixed(1) : "–"}°
+                  </span>
+                </div>
                 {haloCalibError ? (
                   <p className="muted-copy diagnostic-message">{haloCalibError}</p>
                 ) : null}
