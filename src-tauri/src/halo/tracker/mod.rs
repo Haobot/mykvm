@@ -72,11 +72,17 @@ fn model_dir_candidates() -> Vec<PathBuf> {
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         candidates.push(Path::new(&manifest).join("resources").join("halo-models"));
     }
-    // Packaged app: models next to the executable.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            // Packaged app: models next to the executable.
             candidates.push(dir.join("resources").join("halo-models"));
             candidates.push(dir.join("halo-models"));
+            // macOS bundle layout: the executable sits in Contents/MacOS
+            // while tauri's bundle.resources land under Contents/Resources
+            // (both with and without the resources/ path prefix depending
+            // on how the glob was declared).
+            candidates.push(dir.join("../Resources/resources/halo-models"));
+            candidates.push(dir.join("../Resources/halo-models"));
         }
     }
     // Last resort: working-directory relative (manual runs).
