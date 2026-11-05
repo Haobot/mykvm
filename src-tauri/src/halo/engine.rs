@@ -983,6 +983,8 @@ fn handle_command(
     match cmd {
         EngineCommand::Shutdown => true,
         EngineCommand::SetSettings(settings) => {
+            let show_halo = settings.show_halo;
+            let ring_flip = state.settings.show_halo != show_halo;
             state.settings = settings.sanitized();
             probe.set_keyboard_suspends(state.settings.keyboard_suspends);
             // The multi-screen calibration travels inside the settings
@@ -990,6 +992,12 @@ fn handle_command(
             // sync (a `SetScreenCalibration` command exists for callers that
             // only want to move the calibration).
             state.screen_cal = state.settings.screen_calibration.clone();
+            if ring_flip {
+                // Ring visibility is a pure overlay concern: apply it right
+                // here (the command path owns the overlay for exactly this
+                // kind of immediate effect) instead of waiting a tick.
+                overlay.set_ring_visible(state.settings.show_halo);
+            }
             false
         }
         EngineCommand::SetCalibration(calibration) => {
@@ -1081,6 +1089,7 @@ fn run_loop(
 ) {
     overlay.set_screen(state.screen);
     probe.set_keyboard_suspends(state.settings.keyboard_suspends);
+    overlay.set_ring_visible(state.settings.show_halo);
     // S3: the overlay is re-hosted only when the tracked screen actually
     // changes (region switch or a SetScreen command) — deduplication by
     // geometry equality keeps unchanged ticks at zero set_screen calls.
@@ -1338,18 +1347,40 @@ mod tests {
     /// backends (the real ones need platform windows).
     fn drive(state: &mut EngineState, cmd: EngineCommand, now_ms: u64) {
         let mut probe = crate::halo::input_probe::NullProbe;
-        let mut overlay = NoopOverlay;
+        let mut overlay = NoopOverlay::new();
         handle_command(state, cmd, now_ms, &mut overlay, &mut probe);
     }
 
-    /// Minimal OverlayBackend for command tests.
-    struct NoopOverlay;
+    /// `drive` that also hands back the overlay's ring-visibility calls.
+    fn drive_recording(state: &mut EngineState, cmd: EngineCommand, now_ms: u64) -> Vec<bool> {
+        let mut probe = crate::halo::input_probe::NullProbe;
+        let mut overlay = NoopOverlay::new();
+        handle_command(state, cmd, now_ms, &mut overlay, &mut probe);
+        overlay.ring_calls
+    }
+
+    /// Minimal OverlayBackend for command tests; records ring-visibility
+    /// flips so the SetSettings forwarding is observable.
+    struct NoopOverlay {
+        ring_calls: Vec<bool>,
+    }
+
+    impl NoopOverlay {
+        fn new() -> Self {
+            NoopOverlay {
+                ring_calls: Vec::new(),
+            }
+        }
+    }
 
     impl OverlayBackend for NoopOverlay {
         fn show(&mut self) {}
         fn hide(&mut self) {}
         fn set_screen(&mut self, _geometry: OverlayScreenGeometry) {}
         fn update(&mut self, _local: (f64, f64), _frame: &HaloFrame) {}
+        fn set_ring_visible(&mut self, visible: bool) {
+            self.ring_calls.push(visible);
+        }
     }
 
     fn sample(ts_ms: u64, face: bool, yaw: f64, pitch: f64) -> HeadSample {
@@ -1923,6 +1954,34 @@ mod tests {
             *calls.lock().unwrap(),
             vec![9, 9],
             "second switch activated"
+        );
+    }
+
+    #[test]
+    fn set_settings_flips_ring_visibility_only_on_change() {
+        let mut s = test_state();
+        // Flip to hidden: one immediate overlay call.
+        let mut settings = FocusHaloSettings::default();
+        settings.show_halo = false;
+        assert_eq!(
+            drive_recording(&mut s, EngineCommand::SetSettings(settings.clone()), 100),
+            vec![false]
+        );
+        // Same value again: no call (dedup).
+        assert!(drive_recording(&mut s, EngineCommand::SetSettings(settings), 200).is_empty());
+        // Unrelated settings churn with the same visibility: still silent.
+        let mut churn = FocusHaloSettings::default();
+        churn.show_halo = false;
+        churn.halo_opacity = 0.8;
+        assert!(drive_recording(&mut s, EngineCommand::SetSettings(churn), 300).is_empty());
+        // Flip back to shown: one call.
+        assert_eq!(
+            drive_recording(
+                &mut s,
+                EngineCommand::SetSettings(FocusHaloSettings::default()),
+                400
+            ),
+            vec![true]
         );
     }
 

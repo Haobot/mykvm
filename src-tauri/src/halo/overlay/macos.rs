@@ -64,6 +64,11 @@ const BORDER_BREATH_SECONDS: f64 = 1.2;
 // NSWindow / layer pointers (as usize), created lazily on the main thread.
 static WINDOW: AtomicUsize = AtomicUsize::new(0);
 static RING_LAYER: AtomicUsize = AtomicUsize::new(0);
+/// User preference: whether the ring window should be on screen at all.
+/// Read by `create_and_show`/`ring_order_front_or_out` on the main queue so
+/// a rebuilt window (diameter change) respects the setting without any
+/// struct state to sync across threads.
+static RING_VISIBLE: AtomicBool = AtomicBool::new(true);
 static ARC_LAYER: AtomicUsize = AtomicUsize::new(0);
 // Border window and its stroke layer (same lazy main-thread pattern).
 static BORDER_WINDOW: AtomicUsize = AtomicUsize::new(0);
@@ -237,6 +242,9 @@ pub struct MacOSOverlay {
     active: bool,
     /// Whether a border is currently wanted (mirrors the last set_border).
     border_visible: bool,
+    /// Mirror of RING_VISIBLE at construction (the static is the source of
+    /// truth; this field only dedupes redundant set_ring_visible calls).
+    ring_visible: bool,
     geometry: Option<OverlayScreenGeometry>,
     /// Cached `CGDisplay::main()` height for the y flip; refreshed on
     /// set_screen because the primary display can change.
@@ -247,10 +255,12 @@ impl MacOSOverlay {
     pub fn new(settings: &FocusHaloSettings) -> Self {
         let settings = settings.sanitized();
         ARC_ENABLED.store(settings.show_progress, Ordering::Relaxed);
+        let ring_visible = RING_VISIBLE.load(Ordering::Relaxed);
         MacOSOverlay {
             diameter: settings.halo_diameter,
             active: false,
             border_visible: false,
+            ring_visible,
             geometry: None,
             primary_height: None,
         }
@@ -297,6 +307,15 @@ impl OverlayBackend for MacOSOverlay {
     fn set_screen(&mut self, geometry: OverlayScreenGeometry) {
         self.geometry = Some(geometry);
         self.primary_height = None;
+    }
+
+    fn set_ring_visible(&mut self, visible: bool) {
+        if self.ring_visible == visible {
+            return;
+        }
+        self.ring_visible = visible;
+        RING_VISIBLE.store(visible, Ordering::Relaxed);
+        on_main(ring_order_front_or_out, std::ptr::null_mut());
     }
 
     fn update(&mut self, local: (f64, f64), frame: &HaloFrame) {
@@ -405,7 +424,27 @@ extern "C" fn create_and_show(ctx: *mut c_void) {
             resize_window(window, *diameter);
             BUILT_DIAMETER.store(diameter.to_bits() as usize, Ordering::Relaxed);
         }
-        send(window, sel(b"orderFrontRegardless\0"));
+        if RING_VISIBLE.load(Ordering::Relaxed) {
+            send(window, sel(b"orderFrontRegardless\0"));
+        }
+    }
+}
+
+/// Apply [`RING_VISIBLE`] to the (possibly not-yet-created) ring window:
+/// order front when visible; order out when hidden. `create_and_show` skips
+/// the order-front for hidden rings, and this covers the toggle changing on
+/// an already-created window.
+extern "C" fn ring_order_front_or_out(_ctx: *mut c_void) {
+    let window = WINDOW.load(Ordering::Relaxed) as *mut c_void;
+    if window.is_null() {
+        return;
+    }
+    unsafe {
+        if RING_VISIBLE.load(Ordering::Relaxed) {
+            send(window, sel(b"orderFrontRegardless\0"));
+        } else {
+            send1(window, sel(b"orderOut:\0"), std::ptr::null_mut());
+        }
     }
 }
 

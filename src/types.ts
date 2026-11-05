@@ -100,6 +100,7 @@ export interface FocusHaloSettings {
   calibration?: HaloCalibration | null
   /** 转头切屏 master switch (S1 schema stability; consumed in S2+). */
   screenWarpEnabled?: boolean
+  showHalo?: boolean
   /** New-region hysteresis window in ms. */
   regionSettleMs?: number
   /** Dilatation factor around a region centroid (1.0 = no tolerance). */

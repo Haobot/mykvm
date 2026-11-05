@@ -79,6 +79,10 @@ pub trait OverlayBackend: Send {
     /// around that board-space rectangle, `None` hides it. Default no-op so
     /// minimal backends (NoopBackend) stay unchanged.
     fn set_border(&mut self, _border: Option<BorderFrame>) {}
+    /// Show/hide the halo RING only (user preference; tracking and switching
+    /// keep running). Border/highlight visuals are unaffected. Default no-op
+    /// for minimal backends.
+    fn set_ring_visible(&mut self, _visible: bool) {}
     /// Whether a border is currently wanted by the backend (test hook).
     fn border_visible(&self) -> bool {
         false

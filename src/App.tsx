@@ -4147,6 +4147,37 @@ function App() {
                 ) : null}
                 <div className="settings-control-row">
                   <span>
+                    {ui.settings.haloShowRing}
+                    <InfoTip
+                      label={ui.settings.haloShowRing}
+                      text={ui.settings.haloShowRingTip}
+                    />
+                  </span>
+                  <div
+                    className="segmented-control"
+                    role="group"
+                    aria-label={ui.settings.haloShowRing}
+                  >
+                    <button
+                      type="button"
+                      className={haloSettings.showHalo ? "active" : ""}
+                      aria-pressed={haloSettings.showHalo ?? true}
+                      onClick={() => setFocusHaloSetting("showHalo", true)}
+                    >
+                      {ui.common.show}
+                    </button>
+                    <button
+                      type="button"
+                      className={!haloSettings.showHalo ? "active" : ""}
+                      aria-pressed={!(haloSettings.showHalo ?? true)}
+                      onClick={() => setFocusHaloSetting("showHalo", false)}
+                    >
+                      {ui.common.hide}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
                     {ui.settings.haloScreenWarp}
                     <InfoTip
                       label={ui.settings.haloScreenWarp}

@@ -58,6 +58,12 @@ impl Default for CameraPosition {
 pub struct FocusHaloSettings {
     #[serde(default = "d_enabled")]
     pub enabled: bool,
+    /// Show the halo RING visual. Turning it off keeps the whole pipeline
+    /// (tracking, dwell switching, screen warp) running — only the ring
+    /// drawing is hidden, so "control without the visual" is a first-class
+    /// mode rather than disabling FocusHalo.
+    #[serde(default = "d_show_halo")]
+    pub show_halo: bool,
     #[serde(default = "d_dwell_ms")]
     pub dwell_ms: u32,
     #[serde(default = "d_settle_ms")]
@@ -137,6 +143,9 @@ pub struct FocusHaloSettings {
 fn d_enabled() -> bool {
     false
 }
+fn d_show_halo() -> bool {
+    true
+}
 fn d_dwell_ms() -> u32 {
     900
 }
@@ -199,6 +208,7 @@ impl Default for FocusHaloSettings {
     fn default() -> Self {
         FocusHaloSettings {
             enabled: d_enabled(),
+            show_halo: d_show_halo(),
             dwell_ms: d_dwell_ms(),
             settle_ms: d_settle_ms(),
             enter_speed: d_enter_speed(),
@@ -237,6 +247,7 @@ impl FocusHaloSettings {
     pub fn sanitized(&self) -> Self {
         FocusHaloSettings {
             enabled: self.enabled,
+            show_halo: self.show_halo,
             dwell_ms: self.dwell_ms.clamp(DWELL_MS.0, DWELL_MS.1),
             settle_ms: self.settle_ms.clamp(SETTLE_MS.0, SETTLE_MS.1),
             enter_speed: self.enter_speed.clamp(ENTER_SPEED.0, ENTER_SPEED.1),
@@ -291,6 +302,7 @@ mod tests {
     fn defaults_match_spec() {
         let s = FocusHaloSettings::default();
         assert!(!s.enabled);
+        assert!(s.show_halo);
         assert_eq!(s.dwell_ms, 900);
         assert_eq!(s.settle_ms, 150);
         assert_eq!(s.enter_speed, 0.15);
@@ -387,6 +399,7 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         for key in [
             "enabled",
+            "showHalo",
             "dwellMs",
             "settleMs",
             "enterSpeed",
