@@ -2036,6 +2036,35 @@ fn halo_focus_screens(layout: &LayoutState) -> Vec<halo::FocusScreen> {
         .collect()
 }
 
+/// Receiving needs both coordinate systems: the arranged board origin selects
+/// windows, while the live native topology supplies the OS cursor/overlay
+/// origin, logical dimensions and DPI. Board coordinates are not native
+/// desktop coordinates, even though both are local to this machine.
+fn halo_focus_screens_with_native_geometry(
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+) -> Vec<halo::FocusScreen> {
+    let mut screens = halo_focus_screens(layout);
+    for focus in &mut screens {
+        let Some(native) = native_layout
+            .devices
+            .iter()
+            .filter(|device| device.role == "local")
+            .flat_map(|device| device.screens.iter())
+            .find(|screen| screen.id == focus.id)
+        else {
+            continue;
+        };
+        let (native_x, native_y) = halo_native_origin(native);
+        focus.geometry.width = native.width as f64;
+        focus.geometry.height = native.height as f64;
+        focus.geometry.scale = native.scale;
+        focus.geometry.native_x = native_x;
+        focus.geometry.native_y = native_y;
+    }
+    screens
+}
+
 /// All of this machine's screens as engine `ScreenEntry`s (S3): the same
 /// enumeration as [`halo_focus_screens`], minus the P4 `FocusScreen` wrapper.
 fn halo_screen_entries(layout: &LayoutState) -> Vec<halo::ScreenEntry> {
@@ -2057,8 +2086,9 @@ fn handle_remote_halo_focus(app: &AppHandle, packet: &halo::HaloFocusPacket) {
     let Some(state) = app.try_state::<AppRuntime>() else {
         return;
     };
+    let native_layout = state.native_layout();
     let focus_screens = match state.layout.lock() {
-        Ok(layout) => halo_focus_screens(&layout),
+        Ok(layout) => halo_focus_screens_with_native_geometry(&layout, &native_layout),
         Err(_) => {
             log::warn!(
                 "halo focus: layout lock poisoned; dropping packet from {}",
@@ -13741,6 +13771,46 @@ mod tests {
             unchanged,
             &mut Vec::new()
         ));
+    }
+
+    #[test]
+    fn halo_receive_geometry_separates_native_and_board_origins() {
+        let mut arranged = test_layout();
+        let mut board_one = test_screen("local-device");
+        board_one.id = "local-display-1".into();
+        board_one.x = -2188;
+        board_one.y = 420;
+        board_one.width = 1536;
+        board_one.height = 960;
+        let mut board_two = board_one.clone();
+        board_two.id = "local-display-2".into();
+        board_two.x = -2480;
+        board_two.y = -2160;
+        board_two.width = 1920;
+        board_two.height = 1280;
+        arranged.devices[0].screens = vec![board_one.clone(), board_two.clone()];
+
+        let mut native = test_layout();
+        let mut native_one = board_one;
+        native_one.x = 0;
+        native_one.y = 0;
+        let mut native_two = board_two;
+        native_two.x = 0;
+        native_two.y = -1024;
+        native_two.scale = 1.25;
+        let native_two_origin = halo_native_origin(&native_two);
+        // Native enumeration order must not leak into the id-based merge.
+        native.devices[0].screens = vec![native_two, native_one];
+
+        let screens = halo_focus_screens_with_native_geometry(&arranged, &native);
+        let one = screens[0].geometry;
+        assert_eq!((one.x, one.y), (-2188.0, 420.0));
+        assert_eq!((one.native_x, one.native_y), (0.0, 0.0));
+        assert_eq!((one.width, one.height, one.scale), (1536.0, 960.0, 1.0));
+        let two = screens[1].geometry;
+        assert_eq!((two.x, two.y), (-2480.0, -2160.0));
+        assert_eq!((two.native_x, two.native_y), native_two_origin);
+        assert_eq!((two.width, two.height, two.scale), (1920.0, 1280.0, 1.25));
     }
 
     #[test]
