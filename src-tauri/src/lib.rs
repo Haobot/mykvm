@@ -22,6 +22,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
+mod agent_channel;
 mod clipboard;
 mod clipboard_exchange;
 #[cfg(any(target_os = "windows", test))]
