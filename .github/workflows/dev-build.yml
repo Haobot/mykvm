@@ -25,11 +25,18 @@ jobs:
       - name: Install Rust stable
         run: rustup default stable
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Install dependencies
         run: npm ci
 
       - name: Build Windows NSIS bundle
-        run: npm run tauri -- build --ci -b nsis
+        # createUpdaterArtifacts=false: dev builds must not try to sign the
+        # updater package (no TAURI_SIGNING_PRIVATE_KEY outside releases).
+        run: npm run tauri -- build --ci -b nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
