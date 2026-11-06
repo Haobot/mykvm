@@ -38,7 +38,6 @@ import {
   haloCaptureCalibrationPoint,
   haloEmergencyStop,
   haloGetStatus,
-  haloHideOverlay,
   haloRecenter,
   haloScreenCalBegin,
   haloScreenCalCancel,
@@ -47,13 +46,13 @@ import {
   haloScreenCalLean,
   haloScreenCalSetStep,
   haloSetEnabled,
-  haloTestOverlay,
   haloUndoSwitch,
   hideMainWindow,
   installInputService,
   installAppUpdate,
   isAutostartEnabled,
   isPortableMode,
+  haloDebugLog,
   loadAppState,
   listenHaloDebug,
   minimizeMainWindow,
@@ -89,7 +88,6 @@ import type {
   AppUpdateInfo,
   HaloScreenCalPlanItem,
   HaloScreenCalProgress,
-  HaloVisual,
 } from "./desktopApi";
 import {
   SCREEN_CAL_CORNER_ORDER,
@@ -248,9 +246,6 @@ type UpdateStatus =
   | "error";
 type InputServiceAction = "install" | "uninstall";
 
-// FocusHalo P0 debug card: the backend's halo_test_overlay_show visual names.
-const HALO_VISUAL_OPTIONS = ["idle", "candidate", "pulse", "suspended"] as const;
-
 // FocusHalo calibration flow: five capture steps, sent to the backend in this
 // order; "finish" is sent after the last one and validated there.
 const HALO_CALIBRATION_STEPS = [
@@ -391,13 +386,6 @@ function App() {
     "left" | "right" | "up" | "down" | null
   >(null);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("layout");
-  // FocusHalo P0 debug card state: component-local, never persisted.
-  const [haloScreenId, setHaloScreenId] = useState("");
-  const [haloX, setHaloX] = useState("");
-  const [haloY, setHaloY] = useState("");
-  const [haloVisual, setHaloVisual] = useState<HaloVisual>("idle");
-  const [haloProgress, setHaloProgress] = useState(50);
-  const [haloDiameter, setHaloDiameter] = useState("160");
   // FocusHalo P1 state: runtime status, calibration wizard, and the live
   // debug snapshot from the backend's 5 Hz `halo-debug` pump.
   const [haloStatus, setHaloStatus] = useState<HaloStatus | null>(null);
@@ -1333,11 +1321,15 @@ function App() {
   }
 
   async function persistLayout(nextLayout: LayoutState) {
+    void haloDebugLog("persist:start");
     setIsSaving(true);
     try {
       const persistedSnapshot = await saveLayout(nextLayout);
+      void haloDebugLog("persist:ok");
       setSnapshot(persistedSnapshot);
     } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      void haloDebugLog("persist:err " + detail);
       setErrorMessage(
         error instanceof Error ? error.message : ui.errors.saveLayout,
       );
@@ -2758,49 +2750,9 @@ function App() {
   const serverFileTransferTargetIds = new Set(
     serverFileTransferTargets.map((device) => device.id),
   );
-  // FocusHalo P0 debug card data: this machine's detected screens, with the
-  // inputs defaulting to the selected screen's center.
-  const haloScreens =
-    displayLayout.devices.find((device) => device.role === "local")?.screens ??
-    [];
   // FocusHalo settings card: fall back to the defaults when an older
   // snapshot omits focusHalo entirely (same contract as handleHaloEnabled).
   const haloSettings = layout.focusHalo ?? defaultLayout.focusHalo!;
-  const selectedHaloScreen =
-    haloScreens.find((screen) => screen.id === haloScreenId) ??
-    haloScreens[0] ??
-    null;
-  // The backend takes screen-LOCAL logical points, so the defaults are the
-  // selected screen's own center — not its layout-board position.
-  const haloDefaultX = selectedHaloScreen
-    ? Math.round(selectedHaloScreen.width / 2)
-    : 0;
-  const haloDefaultY = selectedHaloScreen
-    ? Math.round(selectedHaloScreen.height / 2)
-    : 0;
-
-  function selectHaloScreen(screenId: string) {
-    setHaloScreenId(screenId);
-    const screen = haloScreens.find((entry) => entry.id === screenId);
-    if (screen) {
-      setHaloX(String(Math.round(screen.width / 2)));
-      setHaloY(String(Math.round(screen.height / 2)));
-    }
-  }
-
-  function showHaloTestOverlay() {
-    if (!selectedHaloScreen) {
-      return;
-    }
-    void haloTestOverlay({
-      screenId: selectedHaloScreen.id,
-      x: Number(haloX) || haloDefaultX,
-      y: Number(haloY) || haloDefaultY,
-      visual: haloVisual,
-      progress: haloProgress / 100,
-      diameter: Number(haloDiameter) || 160,
-    });
-  }
 
   function haloErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -4160,17 +4112,23 @@ function App() {
                   >
                     <button
                       type="button"
-                      className={haloSettings.showHalo ? "active" : ""}
+                      className={(haloSettings.showHalo ?? true) ? "active" : ""}
                       aria-pressed={haloSettings.showHalo ?? true}
-                      onClick={() => setFocusHaloSetting("showHalo", true)}
+                      onClick={() => {
+                        void haloDebugLog("ring toggle: show");
+                        setFocusHaloSetting("showHalo", true);
+                      }}
                     >
                       {ui.common.show}
                     </button>
                     <button
                       type="button"
-                      className={!haloSettings.showHalo ? "active" : ""}
+                      className={!(haloSettings.showHalo ?? true) ? "active" : ""}
                       aria-pressed={!(haloSettings.showHalo ?? true)}
-                      onClick={() => setFocusHaloSetting("showHalo", false)}
+                      onClick={() => {
+                        void haloDebugLog("ring toggle: hide");
+                        setFocusHaloSetting("showHalo", false);
+                      }}
                     >
                       {ui.common.hide}
                     </button>
@@ -4977,109 +4935,8 @@ function App() {
                         {ui.settings.haloLiveSourceCamera}
                       </span>
                     </div>
-                    <p className="muted-copy">{ui.settings.haloDebugManualHint}</p>
                   </>
                 ) : null}
-                <div className="settings-control-row">
-                  <span>{ui.settings.haloDebugScreen}</span>
-                  <select
-                    className="settings-number-input"
-                    value={selectedHaloScreen?.id ?? ""}
-                    onChange={(event) => selectHaloScreen(event.target.value)}
-                  >
-                    {haloScreens.map((screen) => (
-                      <option key={screen.id} value={screen.id}>
-                        {screen.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="settings-control-row">
-                  <span>{ui.settings.haloDebugX}</span>
-                  <input
-                    className="settings-number-input"
-                    type="number"
-                    value={haloX}
-                    placeholder={String(haloDefaultX)}
-                    onChange={(event) => setHaloX(event.target.value)}
-                  />
-                </div>
-                <div className="settings-control-row">
-                  <span>{ui.settings.haloDebugY}</span>
-                  <input
-                    className="settings-number-input"
-                    type="number"
-                    value={haloY}
-                    placeholder={String(haloDefaultY)}
-                    onChange={(event) => setHaloY(event.target.value)}
-                  />
-                </div>
-                <div className="settings-control-row">
-                  <span>{ui.settings.haloDebugVisual}</span>
-                  <select
-                    className="settings-number-input"
-                    value={haloVisual}
-                    onChange={(event) =>
-                      setHaloVisual(event.target.value as HaloVisual)
-                    }
-                  >
-                    {HALO_VISUAL_OPTIONS.map((visual) => (
-                      <option key={visual} value={visual}>
-                        {visual === "idle"
-                          ? ui.settings.haloDebugVisualIdle
-                          : visual === "candidate"
-                            ? ui.settings.haloDebugVisualCandidate
-                            : visual === "pulse"
-                              ? ui.settings.haloDebugVisualPulse
-                              : ui.settings.haloDebugVisualSuspended}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                {haloVisual === "candidate" ? (
-                  <div className="settings-control-row">
-                    <span>{ui.settings.haloDebugProgress}</span>
-                    <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      value={haloProgress}
-                      onChange={(event) =>
-                        setHaloProgress(Number(event.target.value))
-                      }
-                    />
-                  </div>
-                ) : null}
-                <div className="settings-control-row">
-                  <span>{ui.settings.haloDebugDiameter}</span>
-                  <input
-                    className="settings-number-input"
-                    type="number"
-                    min="140"
-                    max="180"
-                    value={haloDiameter}
-                    placeholder="160"
-                    onChange={(event) => setHaloDiameter(event.target.value)}
-                  />
-                </div>
-                <div className="inline-actions">
-                  <button
-                    type="button"
-                    className="primary-button compact-button"
-                    onClick={showHaloTestOverlay}
-                    disabled={!selectedHaloScreen || !isTauri() || haloStatus?.running}
-                  >
-                    {ui.settings.haloDebugShow}
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-button compact-button"
-                    onClick={() => void haloHideOverlay()}
-                    disabled={!isTauri()}
-                  >
-                    {ui.settings.haloDebugHide}
-                  </button>
-                </div>
               </section>
             </div>
           </div>

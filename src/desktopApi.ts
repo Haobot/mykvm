@@ -113,6 +113,13 @@ export async function saveLayout(layout: LayoutState): Promise<AppStateSnapshot>
   return invoke<AppStateSnapshot>('save_layout', { layout })
 }
 
+export async function haloDebugLog(message: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+  await invoke('halo_debug_log', { message })
+}
+
 export async function resetPairing(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
     return {
@@ -413,44 +420,6 @@ export async function isPortableMode(): Promise<boolean> {
   }
 
   return invoke<boolean>('is_portable_mode')
-}
-
-export type HaloVisual = 'idle' | 'candidate' | 'pulse' | 'suspended'
-
-export interface HaloTestOverlayOptions {
-  screenId: string
-  /** Screen-local logical point (halo center). */
-  x: number
-  y: number
-  visual: HaloVisual
-  /** 0..1 progress arc, only used when visual === 'candidate'. */
-  progress?: number
-  /** Debug-only halo diameter override (logical px); exercises the hot-resize path. */
-  diameter?: number
-}
-
-// FocusHalo P0 debug entry: draw/hide one halo frame on a local screen.
-export async function haloTestOverlay(options: HaloTestOverlayOptions): Promise<void> {
-  if (!isTauri()) {
-    return
-  }
-
-  await invoke('halo_test_overlay_show', {
-    screenId: options.screenId,
-    x: options.x,
-    y: options.y,
-    visual: options.visual,
-    progress: options.progress ?? null,
-    diameter: options.diameter ?? null,
-  })
-}
-
-export async function haloHideOverlay(): Promise<void> {
-  if (!isTauri()) {
-    return
-  }
-
-  await invoke('halo_test_overlay_hide')
 }
 
 // FocusHalo P1: tracking pipeline control + calibration flow.

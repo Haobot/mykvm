@@ -1790,6 +1790,7 @@ fn save_layout(
     layout: LayoutState,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<AppStateSnapshot, String> {
+    log::info!("save_layout: begin");
     let (previous_layout, saved_layout) = {
         let mut stored_layout = state
             .layout
@@ -1804,8 +1805,15 @@ fn save_layout(
         // (no merge from `current`); a hand-edited snapshot must still be
         // clamped back into range before it reaches disk or the overlay.
         saved_layout.focus_halo = saved_layout.focus_halo.sanitized();
-        validate_shared_hotkeys(&saved_layout)?;
-        write_layout_to_disk(&state.config_path, &saved_layout)?;
+        if let Err(error) = validate_shared_hotkeys(&saved_layout) {
+            log::warn!("save_layout: hotkey validation rejected the save: {error}");
+            return Err(error);
+        }
+        if let Err(error) = write_layout_to_disk(&state.config_path, &saved_layout) {
+            log::warn!("save_layout: disk write failed: {error}");
+            return Err(error);
+        }
+        log::info!("save_layout: layout.json written");
         *stored_layout = saved_layout.clone();
         (previous_layout, saved_layout)
     };
@@ -1941,6 +1949,14 @@ fn halo_test_overlay_show(
     halo.set_screen(geometry);
     halo.show_test_halo((x, y), visual);
     Ok(())
+}
+
+/// Frontend breadcrumb bridge: the settings UI logs its click/save pipeline
+/// milestones so a "control does nothing" report can be diagnosed from
+/// mykvm.log alone (no webview console in release builds).
+#[tauri::command]
+fn halo_debug_log(message: String) {
+    log::info!("frontend: {message}");
 }
 
 #[tauri::command]
@@ -6510,6 +6526,7 @@ pub fn run() {
             halo_set_enabled,
             halo_get_status,
             halo_capture_calibration_point,
+            halo_debug_log,
             halo_recenter,
             halo_undo_switch,
             halo_emergency_stop,
