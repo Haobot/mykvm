@@ -23,7 +23,9 @@
 //! overlay machinery for the halo but has no badge path yet — `BadgeLayer`
 //! degrades to an inert no-op there (TODO, see win32.rs).
 
+#[cfg(target_os = "macos")]
 use std::ffi::c_void;
+#[cfg(target_os = "macos")]
 use std::sync::Mutex;
 
 use crate::halo::overlay::OverlayScreenGeometry;
@@ -48,6 +50,7 @@ extern "C" {
 
 /// NSWindow setFrame:display: (NSRect, BOOL); re-applied in the reveal step
 /// to force a window-server surface update.
+#[cfg(target_os = "macos")]
 unsafe fn set_frame_display(obj: *mut c_void, rect: NsRect, display: bool) {
     let f: extern "C" fn(*mut c_void, *mut c_void, NsRect, bool) =
         std::mem::transmute(objc_msgSend as *const ());
@@ -181,6 +184,7 @@ pub fn bracket_geometry(width: f64, height: f64, inset: f64, arm: f64) -> [Brack
 /// Frame of the number label so its single text line centers on the screen
 /// middle. CATextLayer draws from the top of its bounds, so the layer is
 /// sized to exactly one line box and positioned at (center - line/2).
+#[cfg(target_os = "macos")]
 pub(crate) fn label_frame(width: f64, height: f64, font_size: f64) -> NsRect {
     let line_height = font_size * BADGE_LINE_HEIGHT_FACTOR;
     let label_width = (width * 0.5).max(line_height * 3.0);
@@ -195,6 +199,7 @@ pub(crate) fn label_frame(width: f64, height: f64, font_size: f64) -> NsRect {
 /// CG global (top-left origin) screen rect -> NS window frame (bottom-left
 /// origin), same flip anchor as macos.rs: `ns_y = primary_height - cg_y -
 /// size`.
+#[cfg(target_os = "macos")]
 pub(crate) fn badge_ns_frame(geometry: &OverlayScreenGeometry, primary_height: f64) -> NsRect {
     NsRect {
         x: geometry.native_x,
@@ -213,6 +218,7 @@ pub(crate) fn badge_ns_frame(geometry: &OverlayScreenGeometry, primary_height: f
 /// Per shown screen: window pointer, its NS frame, label layer, and the four
 /// corner bracket layers in [Tl, Tr, Br, Bl] order.
 #[derive(Clone, Copy)]
+#[cfg(target_os = "macos")]
 struct BadgeWindow {
     window: usize,
     frame: NsRect,
@@ -221,12 +227,15 @@ struct BadgeWindow {
 }
 
 #[derive(Default)]
+#[cfg(target_os = "macos")]
 struct BadgeWindowState {
     screens: Vec<BadgeWindow>,
 }
 
+#[cfg(target_os = "macos")]
 static BADGE_STATE: Mutex<Option<BadgeWindowState>> = Mutex::new(None);
 
+#[cfg(target_os = "macos")]
 fn with_badge_state<T>(f: impl FnOnce(&mut BadgeWindowState) -> T) -> Option<T> {
     let mut guard = BADGE_STATE
         .lock()
@@ -236,15 +245,18 @@ fn with_badge_state<T>(f: impl FnOnce(&mut BadgeWindowState) -> T) -> Option<T> 
 
 /// Payloads for the dispatch callbacks below; each callback takes ownership
 /// via `Box::from_raw`.
+#[cfg(target_os = "macos")]
 struct ShowPayload {
     screens: Vec<BadgeScreen>,
 }
+#[cfg(target_os = "macos")]
 struct ActivePayload {
     screen_index: usize,
     corner: Option<BadgeCorner>,
 }
 
 /// Build every badge window (contents hidden) and order them front.
+#[cfg(target_os = "macos")]
 extern "C" fn badge_show(ctx: *mut c_void) {
     let payload = unsafe { Box::from_raw(ctx as *mut ShowPayload) };
     unsafe {
@@ -314,6 +326,7 @@ extern "C" fn badge_show(ctx: *mut c_void) {
 /// is ordered front without a subsequent frame touch never composites its
 /// layer-backed subviews (verified live: the candidate border built in one
 /// block shows nothing; the ring, which is moved after ordering, renders).
+#[cfg(target_os = "macos")]
 extern "C" fn badge_reveal(_ctx: *mut c_void) {
     let Some(screens) = with_badge_state(|state| state.screens.clone()) else {
         return;
@@ -355,6 +368,7 @@ extern "C" fn badge_reveal(_ctx: *mut c_void) {
 /// zero bounds would clip the path away. Created hidden; `badge_reveal`
 /// flips visibility. Path is handed to the strong `setPath:` property (+1
 /// transferred); color ownership likewise.
+#[cfg(target_os = "macos")]
 unsafe fn make_bracket_layer(arms: &BracketArms, screen: NsRect, scale: f64) -> *mut c_void {
     let alloc = send(cls(b"CAShapeLayer\0"), sel(b"alloc\0"));
     let layer = send(alloc, sel(b"init\0"));
@@ -391,6 +405,7 @@ unsafe fn make_bracket_layer(arms: &BracketArms, screen: NsRect, scale: f64) -> 
 /// (revealed with the rest). The string is built with alloc/initWith so the
 /// layer's strong string property owns it and this code never touches the
 /// autorelease pool for it.
+#[cfg(target_os = "macos")]
 unsafe fn make_label_layer(label: &str, frame: NsRect, scale: f64) -> *mut c_void {
     let alloc = send(cls(b"CATextLayer\0"), sel(b"alloc\0"));
     let layer = send(alloc, sel(b"init\0"));
@@ -434,6 +449,7 @@ unsafe fn make_label_layer(label: &str, frame: NsRect, scale: f64) -> *mut c_voi
 /// Autoreleased NSString for the few selector-key strings needed here; the
 /// main-queue autorelease pool drains it (same reasoning as the animation
 /// factory in macos.rs).
+#[cfg(target_os = "macos")]
 unsafe fn ns_string_autoreleased(value: &str) -> *mut c_void {
     let mut bytes = value.as_bytes().to_vec();
     bytes.push(0);
@@ -444,6 +460,7 @@ unsafe fn ns_string_autoreleased(value: &str) -> *mut c_void {
     )
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn badge_set_active(ctx: *mut c_void) {
     let payload = unsafe { Box::from_raw(ctx as *mut ActivePayload) };
     let corners = with_badge_state(|state| {
@@ -501,6 +518,7 @@ extern "C" fn badge_set_active(ctx: *mut c_void) {
 /// `animationWithKeyPath:` class factory — `alloc` + `initWithKeyPath:` was
 /// removed from the macOS 27 runtime and crashes (see macos.rs
 /// `start_border_breathing` for the verified pattern).
+#[cfg(target_os = "macos")]
 unsafe fn start_badge_breathing(layer: *mut c_void) {
     let key_path = ns_string_autoreleased("opacity");
     let anim = send1(
@@ -531,6 +549,7 @@ unsafe fn start_badge_breathing(layer: *mut c_void) {
 }
 
 /// Owned (+1) NSNumber for the animation endpoints; caller releases.
+#[cfg(target_os = "macos")]
 unsafe fn ns_number_owned(value: f64) -> *mut c_void {
     let alloc = send(cls(b"NSNumber\0"), sel(b"alloc\0"));
     let f: extern "C" fn(*mut c_void, *mut c_void, f64) -> *mut c_void =
@@ -538,6 +557,7 @@ unsafe fn ns_number_owned(value: f64) -> *mut c_void {
     f(alloc, sel(b"initWithDouble:\0"), value)
 }
 
+#[cfg(target_os = "macos")]
 extern "C" fn badge_hide(_ctx: *mut c_void) {
     if let Some(screens) = with_badge_state(|state| std::mem::take(&mut state.screens)) {
         unsafe {
@@ -602,6 +622,10 @@ impl BadgeLayer {
                 corner: Some(corner),
             }));
             on_main(badge_set_active, payload as *mut c_void);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (screen_index, corner);
         }
     }
 
@@ -698,6 +722,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn label_frame_centers_one_line_box_on_the_screen() {
         let frame = label_frame(1920.0, 1080.0, BADGE_FONT_SIZE);
         let line = BADGE_FONT_SIZE * BADGE_LINE_HEIGHT_FACTOR;
@@ -711,6 +736,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn ns_frame_flips_y_and_keeps_the_full_screen_rect() {
         let g = OverlayScreenGeometry {
             x: 1920.0,
