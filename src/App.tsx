@@ -5464,10 +5464,14 @@ function HaloListField(props: {
 }) {
   const joined = props.value.join(",");
   const [draft, setDraft] = useState(joined);
-
-  useEffect(() => {
+  // Reset the draft during render (not in an effect) when the persisted
+  // list changes from outside — the React "adjust state when a prop
+  // changes" pattern; the re-render is cheap and no cascading effect runs.
+  const [prevJoined, setPrevJoined] = useState(joined);
+  if (joined !== prevJoined) {
+    setPrevJoined(joined);
     setDraft(joined);
-  }, [joined]);
+  }
 
   const commitDraft = () => {
     const parsed = draft
