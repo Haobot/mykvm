@@ -657,9 +657,10 @@ mod tests {
             halo_window_origin(&geometry(2.0), (0.0, 0.0), 160.0),
             (-60, 40)
         );
+        // native (100,200) + local (500,400)×1 − physical 160/2 = (520,520).
         assert_eq!(
             halo_window_origin(&geometry(1.0), (500.0, 400.0), 160.0),
-            (500, 460)
+            (520, 520)
         );
     }
 

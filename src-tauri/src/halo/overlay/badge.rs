@@ -33,7 +33,8 @@ use crate::halo::overlay::OverlayScreenGeometry;
 #[cfg(target_os = "macos")]
 use super::macos::{
     cg_color, cls, make_click_through_window, on_main, sel, send, send1, send2, send_f64, set_bool,
-    set_f64, set_rect, NsRect,
+    set_f64, set_rect, CGPathAddLineToPoint, CGPathCreateMutable, CGPathMoveToPoint, CGPathRelease,
+    NsRect,
 };
 
 // Same extern surface as macos.rs: the objc runtime entries plus the three
@@ -42,10 +43,6 @@ use super::macos::{
 #[cfg(target_os = "macos")]
 extern "C" {
     fn objc_msgSend();
-    fn CGPathCreateMutable() -> *mut c_void;
-    fn CGPathMoveToPoint(path: *mut c_void, transform: *const c_void, x: f64, y: f64);
-    fn CGPathAddLineToPoint(path: *mut c_void, transform: *const c_void, x: f64, y: f64);
-    fn CGPathRelease(path: *mut c_void);
 }
 
 /// NSWindow setFrame:display: (NSRect, BOOL); re-applied in the reveal step

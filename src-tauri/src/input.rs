@@ -3,11 +3,13 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +17,11 @@ use crate::{
     quic_transport,
     shared_input::{
         button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton,
-        LEFT_BUTTON_MASK,
     },
     Device, LayoutState, NativeStageStatus, Screen,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::shared_input::LEFT_BUTTON_MASK;
 
 const INPUT_PROTOCOL: &str = "mykvm.input.v1";
 const INPUT_CONTROL_PROTOCOL: &str = "mykvm.input-control.v1";
@@ -61,6 +64,7 @@ const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = 50;
 /// arriving (tap disabled mid-enter, no movement yet) the re-assert stays off
 /// and macOS's silent re-associate leaves the local cursor following the mouse
 /// while remote control is live — the "two cursors move at once" symptom.
+#[cfg(target_os = "macos")]
 const PENDING_DECOUPLE_TIMEOUT_MS: u64 = 1_000;
 #[cfg(target_os = "macos")]
 const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
@@ -2228,7 +2232,6 @@ fn start_platform_capture(
     _stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     _main_window_visible: Arc<AtomicBool>,
-    _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     _input_events: Arc<AtomicU64>,
     _switch_request: Arc<Mutex<Option<SwitchDirection>>>,

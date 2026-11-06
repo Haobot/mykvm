@@ -123,7 +123,9 @@ const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const AUTOSTART_ARG: &str = "--mykvm-autostart";
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
+#[cfg(target_os = "windows")]
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
+#[cfg(target_os = "windows")]
 const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
 const HELPER_PATH_ARG: &str = "--helper-path";
 const RUNTIME_STATE_EVENT: &str = "runtime-state-changed";
@@ -2798,7 +2800,7 @@ fn screen_cal_topology_flag(
         .iter()
         .map(|region| region.screen_id.as_str())
         .collect();
-    let mut regions: Vec<halo::screen_map::ScreenRegion> = calibration
+    let regions: Vec<halo::screen_map::ScreenRegion> = calibration
         .regions
         .iter()
         .filter(|region| !offline_peer_screens.contains(region.screen_id.as_str()))
@@ -17798,7 +17800,7 @@ mod tests {
 
     #[test]
     fn screen_cal_region_error_messages_cover_every_variant() {
-        use halo::screen_map::{BoardRect, RegionError, ScreenRegion};
+        use halo::screen_map::{BoardRect, RegionError};
         let region = halo::screen_map::ScreenRegion {
             screen_id: "screen-0".into(),
             board: BoardRect {

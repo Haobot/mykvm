@@ -126,11 +126,10 @@ pub fn create_overlay(settings: &FocusHaloSettings) -> Box<dyn OverlayBackend> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
 mod tests {
     use super::*;
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn supported_platforms_report_support() {
         assert!(overlay_supported());
