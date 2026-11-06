@@ -523,8 +523,45 @@ pub(crate) fn step(
     // speed_norm comes from the servo velocity (screen-width units per
     // second, vertical scaled by aspect) — feeds enterSpeed.
     let tuning = ServoTuning::from_smooth_ms(state.settings.smooth_ms as f64);
-    let target_x = state.norm.0 * state.screen.width;
-    let target_y = state.norm.1 * state.screen.height;
+    // While the held region belongs to a peer screen there is no local screen
+    // entry to host the halo ("keeping the current screen"): rendering the
+    // region-relative norm through the LOCAL screen's geometry projects the
+    // ring off the local edges (observed sliding below the bottom edge, so
+    // the halo "disappeared" until the servo crawled back). Instead the local
+    // ring parks at the local-screen edge nearest the peer region's board
+    // center — always visible, pointing where the halo logically went — and
+    // the local dwell machine is suspended so the parked edge point cannot
+    // start a candidate on a local window the user is not looking at.
+    let remote_region_active = state
+        .active_region
+        .zip(state.screen_cal.as_ref())
+        .map(|(idx, cal)| {
+            let screen_id = &cal.regions[idx].screen_id;
+            !state
+                .screens
+                .iter()
+                .any(|entry| &entry.screen_id == screen_id)
+        })
+        .unwrap_or(false);
+    let (target_x, target_y) = if remote_region_active {
+        let region = &state.screen_cal.as_ref().expect("checked above").regions
+            [state.active_region.expect("checked above")];
+        let peer_center_board = (
+            region.board.x + region.board.width / 2.0,
+            region.board.y + region.board.height / 2.0,
+        );
+        let park_board = (
+            peer_center_board
+                .0
+                .clamp(state.screen.x, state.screen.x + state.screen.width),
+            peer_center_board
+                .1
+                .clamp(state.screen.y, state.screen.y + state.screen.height),
+        );
+        (park_board.0 - state.screen.x, park_board.1 - state.screen.y)
+    } else {
+        (state.norm.0 * state.screen.width, state.norm.1 * state.screen.height)
+    };
     let local = (
         state.servo_x.step(target_x, tick_dt, &tuning),
         state.servo_y.step(target_y, tick_dt, &tuning),
@@ -592,7 +629,7 @@ pub(crate) fn step(
                 speed_norm: state.speed_norm,
                 hit: hit.as_ref(),
                 foreground_id: None,
-                suspend: phase != EnginePhase::Idle || emergency,
+                suspend: phase != EnginePhase::Idle || emergency || remote_region_active,
             };
             let (phase_out, event) = advance(&mut state.dwell, &input, &cfg);
             (phase_out, hit_frame, event)
@@ -2552,6 +2589,42 @@ mod tests {
             warps.warp_count(),
             1,
             "the remote undo performs no local warp"
+        );
+    }
+
+    #[test]
+    fn remote_region_parks_the_local_ring_at_the_shared_edge() {
+        // Like the real rig, the peer region's board rect sits beside the
+        // local screen: while the head holds the remote region the local
+        // ring parks at the local edge nearest the peer board center instead
+        // of projecting the region-relative norm through the local screen
+        // (which slid the ring off the local bottom edge — the "halo
+        // disappeared while looking at the peer" symptom).
+        let (mut s, _warps) = s4_state(true);
+        if let Some(cal) = s.screen_cal.as_mut() {
+            cal.regions[1].board.x = 1000.0;
+            cal.regions[1].board.y = 0.0;
+        }
+        // Acquire local s1, then jump to and hold the remote s2.
+        step(&mut s, Some(s3_sample(0, -6.0)), 0, false);
+        let (t1, _) = s3_hold_until(&mut s, 33, -6.0, 5.0, 1000, true);
+        s3_hold_until(&mut s, t1 + 33, -6.0, 5.0, t1 + 700, false);
+        let t2 = s3_jump(&mut s, t1 + 733, 6.0, 5.0);
+        s3_hold_until(&mut s, t2 + 33, 6.0, 5.0, t2 + 700, true);
+        // Let the servo converge on the park target, then read the rendered
+        // local point: the peer center (1500, 250) clamps onto the local
+        // screen's right edge at (1000, 250).
+        let (t3, _) = s3_hold_until(&mut s, t2 + 733, 6.0, 5.0, t2 + 2400, false);
+        let (_, local, _) = step(&mut s, Some(s3_sample(t3 + 33, 6.0)), t3 + 33, false);
+        assert!(
+            (local.0 - 1000.0).abs() < 5.0,
+            "parked on the shared edge, got x={}",
+            local.0
+        );
+        assert!(
+            (local.1 - 250.0).abs() < 5.0,
+            "parked at the peer center height, got y={}",
+            local.1
         );
     }
 }
