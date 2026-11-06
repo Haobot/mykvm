@@ -8,7 +8,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{mpsc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -65,8 +68,17 @@ pub(crate) struct AgentChannelPacket {
     pub status: Option<String>,
 }
 
+/// send_agent_request 的成功返回：response 的 status 与 payload。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentResponse {
+    pub status: String,
+    pub payload: Value,
+}
+
 /// 一条已注册请求的等待句柄：响应到达（或取消/超时）时经此通道完成等待者。
-pub(crate) type PendingReplyRx = mpsc::Receiver<Result<Value, String>>;
+/// 完成原语用 std mpsc（与仓库既有网络等待风格一致，如
+/// quic_transport 的 send_stream_expect_ack recv_timeout；tokio oneshot 无先例）。
+pub(crate) type PendingReplyRx = mpsc::Receiver<Result<AgentResponse, String>>;
 
 /// request_id ↔ 等待者 的挂起表。生产路径用 [`global_pending_table`]，
 /// 单元测试构造独立实例（避免进程级全局状态串线）。
@@ -77,7 +89,7 @@ pub(crate) struct AgentPendingTable {
 struct PendingEntry {
     created_at: Instant,
     timeout: Duration,
-    reply: mpsc::SyncSender<Result<Value, String>>,
+    reply: mpsc::SyncSender<Result<AgentResponse, String>>,
 }
 
 impl Default for AgentPendingTable {
@@ -96,29 +108,71 @@ impl AgentPendingTable {
     /// 注册等待者并返回接收端。调用方随后发出 request；响应到达后由
     /// [`AgentPendingTable::resolve`] 完成此 receiver。
     pub(crate) fn register(&self, request_id: String, timeout: Duration) -> PendingReplyRx {
-        todo!("红灯阶段：pending 注册未实现")
+        self.reap_expired();
+        let (tx, rx) = mpsc::sync_channel(1);
+        if let Ok(mut entries) = self.entries.lock() {
+            // 同一 request_id 重复注册（理论不应发生，防御性处理）：覆盖旧条目，
+            // 旧等待者的 sender 被 drop，其 recv 端断连报错——不会收到串线结果。
+            entries.insert(
+                request_id,
+                PendingEntry {
+                    created_at: Instant::now(),
+                    timeout,
+                    reply: tx,
+                },
+            );
+        }
+        rx
     }
 
     /// 按 request_id 完成等待者并移除条目。返回 false = 表中查无此 id
     /// （超时已回收/重复响应/重放），调用方应拒绝该包。
-    pub(crate) fn resolve(&self, request_id: &str, result: Result<Value, String>) -> bool {
-        todo!("红灯阶段：pending 完成未实现")
+    pub(crate) fn resolve(&self, request_id: &str, result: Result<AgentResponse, String>) -> bool {
+        self.reap_expired();
+        let entry = self
+            .entries
+            .lock()
+            .ok()
+            .and_then(|mut entries| entries.remove(request_id));
+        match entry {
+            Some(entry) => entry.reply.send(result).is_ok(),
+            None => false,
+        }
     }
 
     /// 主动移除挂起请求（kind=cancel / 发送失败清理）。
     pub(crate) fn cancel(&self, request_id: &str) -> bool {
-        todo!("红灯阶段：pending 取消未实现")
+        match self.entries.lock() {
+            Ok(mut entries) => entries.remove(request_id).is_some(),
+            Err(_) => false,
+        }
+    }
+
+    /// 回收过期条目：迟到的响应不再完成等待者（防重放，RFC §8 对策四）。
+    /// 无后台线程，在 register/resolve 入口顺带执行。
+    fn reap_expired(&self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.retain(|_, entry| entry.created_at.elapsed() < entry.timeout);
+        }
     }
 }
 
 /// 生产路径的全局挂起表。进程级单例；测试不要用它（构造独立实例）。
 pub(crate) fn global_pending_table() -> &'static AgentPendingTable {
-    todo!("红灯阶段：全局表未实现")
+    static TABLE: OnceLock<AgentPendingTable> = OnceLock::new();
+    TABLE.get_or_init(AgentPendingTable::new)
 }
+
+/// request_id 的进程内单调计数部分。
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// 生成 request_id：进程内单调计数 + 随机 nonce（防重放/防碰撞）。
 pub(crate) fn new_request_id() -> String {
-    todo!("红灯阶段：request_id 生成未实现")
+    format!(
+        "{}-{}",
+        REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+        crate::random_hex(8)
+    )
 }
 
 /// 鉴权（照抄 lib.rs clipboard_packet_authorized 的模式）：
@@ -128,7 +182,36 @@ pub(crate) fn agent_packet_authorized(
     layout: &crate::LayoutState,
     packet: &AgentChannelPacket,
 ) -> bool {
-    todo!("红灯阶段：鉴权未实现")
+    if layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || !crate::consttime_eq(packet.pair_secret.as_bytes(), layout.pair_secret.as_bytes())
+    {
+        return false;
+    }
+
+    if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
+        // 与 input/clipboard 一致：按证书钉扎的稳定 transport key 优先匹配，
+        // device_id 兜底（id 会随 LAN IP 漂移），最后放行 legacy "local-device"。
+        let key = packet.origin_transport_public_key.trim();
+        return layout.paired_controllers.iter().any(|controller| {
+            (!key.is_empty() && controller.transport_public_key == key)
+                || controller.id == packet.origin_id
+        }) || (layout.paired_controllers.len() == 1
+            && packet.origin_id == "local-device"
+            && !key.is_empty());
+    }
+
+    true
+}
+
+/// 本机历代 device id 的稳定前缀 `peer-{hostname}-`（语义与 input.rs
+/// local_peer_host_prefix 一致；该函数是 input 私有的，这里用 crate 根的
+/// hostname/sanitize 重新推导，避免改动 input.rs）。
+fn local_peer_host_prefix() -> Option<String> {
+    let host = crate::hostname()?;
+    let normalized = crate::sanitize_peer_id_part(&host);
+    (!normalized.is_empty()).then(|| format!("peer-{normalized}-"))
 }
 
 /// 路由消歧（语义复用 input.rs packet_targets_local）：空 target = 广播；
@@ -140,10 +223,26 @@ pub(crate) fn agent_packet_targets_local(
     packet: &AgentChannelPacket,
     local_peer_id: &str,
 ) -> bool {
-    todo!("红灯阶段：路由未实现")
+    if packet.target_id.trim().is_empty() {
+        return true;
+    }
+    if packet.target_id == local_peer_id {
+        return true;
+    }
+    if let Some(prefix) = local_peer_host_prefix() {
+        if packet.target_id.starts_with(&prefix) {
+            return true;
+        }
+    }
+    layout
+        .devices
+        .iter()
+        .any(|device| device.role == "local" && device.id == packet.target_id)
 }
 
 /// 向对端发出 agent request 并等待对应 response（两段式，阻塞至超时）。
+/// 流程：先注册 pending 再发包（防响应先到无处安放）→ 流发送（自带 ack 确认
+/// 到达对端 handler）→ 等待 response 完成等待者。任何失败路径都清理 pending。
 /// P0 仅供测试与后续 Tauri 命令接线使用。
 pub(crate) fn send_agent_request(
     transport: &crate::quic_transport::TransportHandle,
@@ -151,28 +250,46 @@ pub(crate) fn send_agent_request(
     layout: &crate::LayoutState,
     local_peer_id: &str,
     local_transport_public_key: &str,
+    target_device_id: &str,
     capability: &str,
     payload: Value,
     timeout: Duration,
 ) -> Result<AgentResponse, String> {
-    let _ = (
-        transport,
-        peer,
-        layout,
-        local_peer_id,
-        local_transport_public_key,
-        capability,
-        payload,
-        timeout,
-    );
-    todo!("红灯阶段：两段式请求未实现")
-}
+    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        return Err("当前设备尚未完成配对，无法使用 Agent 通道。".into());
+    }
 
-/// send_agent_request 的成功返回：response 的 status 与 payload。
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct AgentResponse {
-    pub status: String,
-    pub payload: Value,
+    let request_id = new_request_id();
+    let rx = global_pending_table().register(request_id.clone(), timeout);
+
+    let packet = AgentChannelPacket {
+        protocol: AGENT_PROTOCOL.into(),
+        kind: AGENT_KIND_REQUEST.into(),
+        request_id: request_id.clone(),
+        origin_id: local_peer_id.into(),
+        origin_transport_public_key: local_transport_public_key.into(),
+        target_id: target_device_id.into(),
+        cluster_id: layout.cluster_id.clone(),
+        pair_secret: layout.pair_secret.clone(),
+        capability: capability.into(),
+        payload,
+        status: None,
+    };
+    let encoded = crate::encode_wire_packet(&packet)?;
+
+    // 流发送的 ack 只说明对端 handler 收下了包（≤6s）；结果本身等 response。
+    if let Err(error) = transport.send_stream_expect_ack(peer.clone(), encoded) {
+        global_pending_table().cancel(&request_id);
+        return Err(format!("agent 请求发送失败: {error}"));
+    }
+
+    match rx.recv_timeout(timeout + Duration::from_secs(1)) {
+        Ok(result) => result,
+        Err(_) => {
+            global_pending_table().cancel(&request_id);
+            Err(format!("agent 请求超时（{timeout:?}）: 未收到响应"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +299,14 @@ mod tests {
 
     const TEST_CLUSTER: &str = "cluster-test";
     const TEST_SECRET: &str = "secret-test";
+
+    /// 构造 status=ok 的响应结果（pending 表测试用）。
+    fn ok_response(payload: Value) -> Result<AgentResponse, String> {
+        Ok(AgentResponse {
+            status: "ok".into(),
+            payload,
+        })
+    }
 
     /// 精简 layout 构造：只填鉴权/路由涉及的语义字段，其余用安全默认值。
     fn test_agent_layout(machine_role: &str, controllers: Vec<PairedController>) -> LayoutState {
@@ -427,20 +552,22 @@ mod tests {
         let table = AgentPendingTable::new();
         let rx = table.register("req-1".into(), Duration::from_secs(1));
         assert!(
-            table.resolve("req-1", Ok(serde_json::json!({ "echo": true }))),
+            table.resolve("req-1", ok_response(serde_json::json!({ "echo": true })),),
             "已注册的 request_id 必须能被响应完成"
         );
         let result = rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("等待者必须被唤醒");
-        assert_eq!(result.unwrap(), serde_json::json!({ "echo": true }));
+            .expect("等待者必须被唤醒")
+            .expect("结果本身必须是 Ok");
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.payload, serde_json::json!({ "echo": true }));
     }
 
     #[test]
     fn resolve_unknown_request_id_is_rejected() {
         let table = AgentPendingTable::new();
         assert!(
-            !table.resolve("ghost", Ok(serde_json::json!(null))),
+            !table.resolve("ghost", ok_response(Value::Null)),
             "查无此 id（超时回收/重放）的响应必须被拒绝"
         );
     }
@@ -451,7 +578,7 @@ mod tests {
         let _rx = table.register("req-2".into(), Duration::from_millis(30));
         std::thread::sleep(Duration::from_millis(80));
         assert!(
-            !table.resolve("req-2", Ok(serde_json::json!(null))),
+            !table.resolve("req-2", ok_response(Value::Null)),
             "过期条目回收后，迟到响应必须被拒绝"
         );
     }
@@ -462,14 +589,15 @@ mod tests {
         let first = table.register("req-3".into(), Duration::from_secs(2));
         let second = table.register("req-3".into(), Duration::from_secs(2));
         assert!(
-            table.resolve("req-3", Ok(serde_json::json!("second"))),
+            table.resolve("req-3", ok_response(serde_json::json!("second"))),
             "重复注册后响应完成的是最新等待者"
         );
+        let result = second
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            second
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .unwrap(),
+            result.payload,
             serde_json::json!("second"),
             "第二个等待者收到结果"
         );
