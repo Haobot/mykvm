@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use super::activator::{ActivationOutcome, WindowActivator};
 use super::overlay::BorderFrame;
 use super::protocol::{decode_halo_focus_packet, FocusSender, HaloFocusEvent, HaloFocusPacket};
-use super::warp::{self, CursorWarper};
-use super::windows_layer::WindowService;
+use super::warp::CursorWarper;
+use super::windows_layer::{safe_scale, WindowService};
 use super::{HaloRuntime, OverlayScreenGeometry};
 use crate::LayoutState;
 
@@ -265,21 +265,28 @@ impl FocusRouter {
             });
         };
         let (x, y) = landing_point(&observation.local_screen, neighbor, side, observation.norm);
+        // Wire semantics: the event carries the landing point in the PEER
+        // screen's own logical coordinates (origin = that screen's top-left
+        // corner), not board coordinates — each machine localizes the shared
+        // layout board differently, so board values are meaningless to the
+        // receiver. Internal tracking above stays in board space; only the
+        // wire fields convert.
+        let local = (x - neighbor.x, y - neighbor.y);
         let event = match observation.phase {
             FocusPhase::Switched => HaloFocusEvent::Activate {
                 screen_id: neighbor.id.clone(),
-                x,
-                y,
+                x: local.0,
+                y: local.1,
             },
             FocusPhase::Candidate => HaloFocusEvent::Candidate {
                 screen_id: neighbor.id.clone(),
-                x,
-                y,
+                x: local.0,
+                y: local.1,
             },
             FocusPhase::Idle => HaloFocusEvent::Edge {
                 screen_id: neighbor.id.clone(),
-                x,
-                y,
+                x: local.0,
+                y: local.1,
             },
         };
         self.state.active_target = Some(neighbor.device_id.clone());
@@ -443,9 +450,11 @@ pub(crate) fn try_dispatch_received_focus(
 /// the target screen, hit-test the landing point, drive the halo overlay
 /// border and (for Activate) the window activator. A `Land` additionally
 /// warps this machine's own cursor to the landing point first (S4 takeover:
-/// the sender's engine committed a region on one of our screens). Shared by
-/// the app hook and the `halo_manual focus-receive` rig, so both exercise
-/// identical behavior.
+/// the sender's engine committed a region on one of our screens). The wire
+/// point is screen-local logical (origin = the target screen's top-left);
+/// everything below converts it through the selected screen's geometry.
+/// Shared by the app hook and the `halo_manual focus-receive` rig, so both
+/// exercise identical behavior.
 pub fn apply_focus_event(
     event: &HaloFocusEvent,
     runtime: &mut HaloRuntime,
@@ -467,7 +476,7 @@ pub fn apply_focus_event(
             detail: String::new(),
         };
     };
-    let Some(geometry) = select_screen(screens, screen_id, (x, y)) else {
+    let Some(geometry) = select_screen(screens, screen_id) else {
         log::warn!("halo focus: landing screen {screen_id} not found locally; ignoring");
         return FocusDisplayOutcome {
             kind,
@@ -478,32 +487,40 @@ pub fn apply_focus_event(
         };
     };
     // S4 Land: move this machine's own cursor onto the landing point before
-    // the focus work below. Board -> native through the local screen list
-    // (the same conversion the engine's local warps use). Best-effort: a
-    // failed warp logs and continues — window activation and the highlight
-    // still land where the sender aimed.
+    // the focus work below. Screen-local -> native through the selected
+    // screen's geometry (`native = native_origin + local * scale`), clamped
+    // into the screen so a stale id's out-of-range point still lands on a
+    // real pixel of the chosen screen instead of a wild desktop coordinate
+    // (the guarantee board_to_native's projection used to provide).
+    // Best-effort: a failed warp logs and continues — window activation and
+    // the highlight still land where the sender aimed.
     let mut detail_prefix = String::new();
     if matches!(event, HaloFocusEvent::Land { .. }) {
-        let tuples: Vec<(String, OverlayScreenGeometry)> = screens
-            .iter()
-            .map(|screen| (screen.id.clone(), screen.geometry))
-            .collect();
-        match warp::board_to_native(&tuples, x, y) {
-            Some((native_x, native_y)) => {
-                let moved = warper.warp(native_x, native_y);
-                detail_prefix = format!("warped=({native_x},{native_y}) moved={moved} ");
-                log::info!("halo focus: land warp to ({native_x}, {native_y}) accepted={moved}");
-            }
-            None => {
-                detail_prefix = "warp skipped (no usable screen) ".into();
-                log::warn!("halo focus: land warp skipped: no usable screen for ({x},{y})");
-            }
+        if geometry.width > 0.0 && geometry.height > 0.0 {
+            let scale = safe_scale(geometry.scale);
+            let local_x = x.clamp(0.0, geometry.width);
+            let local_y = y.clamp(0.0, geometry.height);
+            let native_x = geometry.native_x + local_x * scale;
+            let native_y = geometry.native_y + local_y * scale;
+            let moved = warper.warp(native_x, native_y);
+            detail_prefix = format!("warped=({native_x},{native_y}) moved={moved} ");
+            log::info!("halo focus: land warp to ({native_x}, {native_y}) accepted={moved}");
+        } else {
+            detail_prefix = "warp skipped (no usable screen) ".into();
+            log::warn!("halo focus: land warp skipped: no usable screen for ({x},{y})");
         }
     }
-    let hit = match windows.hit_test(x, y) {
+    // Window enumeration and hit_test live in THIS machine's own layout-board
+    // logical space (macOS CG global points pass through with an identity
+    // board mapping; Windows native pixels are converted per screen at
+    // enumerate time), so the wire's screen-local point is converted through
+    // the selected screen's board origin.
+    let board_x = geometry.x + x;
+    let board_y = geometry.y + y;
+    let hit = match windows.hit_test(board_x, board_y) {
         Ok(hit) => hit,
         Err(error) => {
-            log::warn!("halo focus: hit-test failed at ({x},{y}): {error}");
+            log::warn!("halo focus: hit-test failed at board ({board_x},{board_y}): {error}");
             runtime.clear_remote_highlight();
             return FocusDisplayOutcome {
                 kind,
@@ -518,7 +535,9 @@ pub fn apply_focus_event(
         // Nothing under the point: clear any stale highlight so the border
         // cannot keep pointing at a window that already moved away.
         runtime.clear_remote_highlight();
-        log::info!("halo focus: {kind} at ({x},{y}) hit no window; highlight cleared");
+        log::info!(
+            "halo focus: {kind} at screen-local ({x},{y}) on {screen_id} hit no window; highlight cleared"
+        );
         return FocusDisplayOutcome {
             kind,
             window_title: None,
@@ -551,7 +570,7 @@ pub fn apply_focus_event(
         ));
     }
     log::info!(
-        "halo focus: {kind} at ({x},{y}) screen={screen_id} highlight={highlighted} window={:?} activated={activated} {detail}",
+        "halo focus: {kind} at screen-local ({x},{y}) screen={screen_id} highlight={highlighted} window={:?} activated={activated} {detail}",
         window.title
     );
     FocusDisplayOutcome {
@@ -590,14 +609,13 @@ fn activation_detail(activation: &ActivationOutcome) -> String {
     )
 }
 
-/// Pick the overlay host screen for the landing point: the screen whose id
-/// matches the event first, then whichever screen contains the point, then
-/// the first screen as a last resort (single-screen rigs).
-fn select_screen(
-    screens: &[FocusScreen],
-    screen_id: &str,
-    point: (f64, f64),
-) -> Option<OverlayScreenGeometry> {
+/// Pick the overlay host screen for a landing event: the screen whose id
+/// matches the event exactly, then a suffix-normalized match, then the first
+/// screen as a last resort (single-screen rigs). The old board-containment
+/// fallback is gone on purpose: wire points are screen-local, so a point no
+/// longer identifies a screen. The last-resort fallback warns so a silently
+/// mis-aimed event stays visible in the logs.
+fn select_screen(screens: &[FocusScreen], screen_id: &str) -> Option<OverlayScreenGeometry> {
     if screens.is_empty() {
         return None;
     }
@@ -605,21 +623,35 @@ fn select_screen(
         .iter()
         .find(|screen| screen.id == screen_id)
         .or_else(|| {
-            screens.iter().find(|screen| {
-                let geometry = screen.geometry;
-                point.0 >= geometry.x
-                    && point.0 <= geometry.x + geometry.width
-                    && point.1 >= geometry.y
-                    && point.1 <= geometry.y + geometry.height
-            })
+            normalized_screen_id(screen_id)
+                .and_then(|normalized| screens.iter().find(|screen| screen.id == normalized))
         })
         .map(|screen| screen.geometry)
-        .or_else(|| screens.first().map(|screen| screen.geometry))
+        .or_else(|| {
+            log::warn!(
+                "halo focus: landing screen {screen_id} matched no local screen; falling back to the first screen"
+            );
+            screens.first().map(|screen| screen.geometry)
+        })
+}
+
+/// Normalize an inbound screen id against this machine's own naming: the
+/// sender sees our screens as "{device-id}-local-display-N" (its layout
+/// prefixes them with our device id) while we name them "local-display-N".
+/// `rsplit_once` keys on the LAST "-local-display-" separator, so a device id
+/// that itself contains hyphens ("peer-my-host-10.0.0.9-local-display-2")
+/// still resolves to the trailing display suffix. Ids without the marker
+/// need no normalization.
+fn normalized_screen_id(screen_id: &str) -> Option<String> {
+    let (_, suffix) = screen_id.rsplit_once("-local-display-")?;
+    (!suffix.is_empty()).then(|| format!("local-display-{suffix}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::halo::windows_layer::hit_test_windows;
+    use crate::halo::{warp::WarpRecorder, WindowInfo};
 
     fn screen(id: &str, device: &str, x: f64, y: f64, w: f64, h: f64) -> BoardScreen {
         BoardScreen {
@@ -685,9 +717,10 @@ mod tests {
         match emission.event {
             HaloFocusEvent::Edge { screen_id, x, y } => {
                 assert_eq!(screen_id, "peer-s");
-                // 5% of the peer's width in from its right edge.
-                assert!((x - (-1200.0 + 1200.0 * 0.95)).abs() < 1e-9);
-                // Cross axis: local.y + 0.5 * local height.
+                // Peer-screen-local: 5% of the peer's width in from its
+                // right edge (board -60 minus the peer's board origin).
+                assert!((x - (1200.0 * 0.95)).abs() < 1e-9);
+                // Cross axis: (local.y + 0.5 * local height) - peer.y.
                 assert!((y - 250.0).abs() < 1e-9);
             }
             other => panic!("expected Edge, got {other:?}"),
@@ -711,7 +744,9 @@ mod tests {
         assert_eq!(emission.target_device_id, "dev-t");
         match emission.event {
             HaloFocusEvent::Edge { y, .. } => {
-                assert!((y - (-400.0 + 400.0 * 0.95)).abs() < 1e-9)
+                // Peer-screen-local y: 5% of the peer's height in from its
+                // bottom edge (board -20 minus the peer's board origin).
+                assert!((y - (400.0 * 0.95)).abs() < 1e-9)
             }
             other => panic!("expected Edge, got {other:?}"),
         }
@@ -720,6 +755,39 @@ mod tests {
             .observe(&obs((0.5, 0.97), FocusPhase::Idle, &[bottom_peer]))
             .expect("bottom neighbor");
         assert_eq!(emission.target_device_id, "dev-b");
+    }
+
+    #[test]
+    fn forwarder_events_carry_peer_screen_local_coordinates() {
+        // Both axes offset: a peer sitting right of AND below the local
+        // screen. The wire x/y must be that peer screen's own logical
+        // coordinates (origin at its top-left), not board coordinates —
+        // the two machines' boards are not synchronized.
+        let peer = screen("peer-s", "dev-peer", 15624.0, 5120.0, 3840.0, 2160.0);
+        // Adjacency for the router's board math: local must actually touch
+        // the peer, so shift the peer flush right of the local screen for
+        // the observation itself.
+        let peers = vec![screen("peer-s", "dev-peer", 1000.0, 0.0, 800.0, 500.0)];
+        let mut router = FocusRouter::new();
+        let emission = router
+            .observe(&obs((0.95, 0.5), FocusPhase::Idle, &peers))
+            .expect("right neighbor");
+        match emission.event {
+            HaloFocusEvent::Edge { x, y, .. } => {
+                // Board (1040, 250) minus the peer board origin (1000, 0).
+                assert!((x - (800.0 * 0.05)).abs() < 1e-9, "local x {x}");
+                assert!((y - 250.0).abs() < 1e-9, "local y {y}");
+                assert!(x >= 0.0 && x <= 800.0 && y >= 0.0 && y <= 500.0);
+            }
+            other => panic!("expected Edge, got {other:?}"),
+        }
+        // The far-offset board above stays valid input: with the peer
+        // non-adjacent the router emits nothing (no neighbor), proving the
+        // conversion is anchored to the neighbor's own origin, not the board.
+        let mut router = FocusRouter::new();
+        assert!(router
+            .observe(&obs((0.95, 0.5), FocusPhase::Idle, &[peer]))
+            .is_none());
     }
 
     #[test]
@@ -825,5 +893,215 @@ mod tests {
         assert!(router
             .observe(&obs((0.04, 0.5), FocusPhase::Idle, &[almost]))
             .is_none());
+    }
+
+    // ----- receive side: screen selection + screen-local point handling -----
+
+    fn geometry(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        scale: f64,
+        native_x: f64,
+        native_y: f64,
+    ) -> OverlayScreenGeometry {
+        OverlayScreenGeometry {
+            x,
+            y,
+            width,
+            height,
+            scale,
+            native_x,
+            native_y,
+        }
+    }
+
+    fn focus_screen(id: &str, geometry: OverlayScreenGeometry) -> FocusScreen {
+        FocusScreen {
+            id: id.into(),
+            geometry,
+        }
+    }
+
+    fn window(id: u64, frame: (f64, f64, f64, f64)) -> WindowInfo {
+        WindowInfo {
+            id,
+            title: "w".into(),
+            process: "app".into(),
+            frame,
+            is_foreground: true,
+        }
+    }
+
+    /// Window-layer double: records every hit-test point (pinning the
+    /// board-space conversion) and answers with the configured list through
+    /// the real pure hit-test.
+    struct FakeWindows {
+        windows: Vec<WindowInfo>,
+        hit_points: Vec<(f64, f64)>,
+    }
+
+    impl FakeWindows {
+        fn with_window(frame: (f64, f64, f64, f64)) -> Self {
+            FakeWindows {
+                windows: vec![window(7, frame)],
+                hit_points: Vec::new(),
+            }
+        }
+
+        fn hit_points(&self) -> &[(f64, f64)] {
+            &self.hit_points
+        }
+    }
+
+    impl WindowService for FakeWindows {
+        fn enumerate(&mut self) -> Result<Vec<WindowInfo>, String> {
+            Ok(self.windows.clone())
+        }
+
+        fn hit_test(&mut self, x: f64, y: f64) -> Result<Option<WindowInfo>, String> {
+            self.hit_points.push((x, y));
+            Ok(hit_test_windows(&self.windows, x, y))
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
+    /// Activator double: records the activated window ids.
+    struct FakeActivator {
+        activated: Vec<u64>,
+    }
+
+    impl WindowActivator for FakeActivator {
+        fn activate(&mut self, window_id: u64) -> ActivationOutcome {
+            self.activated.push(window_id);
+            ActivationOutcome {
+                activated: true,
+                fell_back: false,
+                detail: "fake".into(),
+            }
+        }
+    }
+
+    fn receiver_screens() -> Vec<FocusScreen> {
+        // This machine's own screens in its own board space: display-2 sits
+        // right of display-1 at a 2x DPI with a non-zero native origin.
+        vec![
+            focus_screen(
+                "local-display-1",
+                geometry(0.0, 0.0, 1000.0, 500.0, 1.0, 0.0, 0.0),
+            ),
+            focus_screen(
+                "local-display-2",
+                geometry(1000.0, 0.0, 800.0, 500.0, 2.0, 2000.0, 0.0),
+            ),
+        ]
+    }
+
+    #[test]
+    fn normalized_screen_id_strips_the_device_prefix() {
+        // The sender prefixes our screen ids with our device id
+        // (peer-{hostname}-{ip}); a hyphenated hostname must not confuse the
+        // extraction (rsplit_once keys on the last marker).
+        assert_eq!(
+            normalized_screen_id("peer-my-host-10.0.0.9-local-display-2").as_deref(),
+            Some("local-display-2")
+        );
+        // An id with no marker carries nothing to strip: it resolves through
+        // the exact-match step instead (an already-local id, or a foreign
+        // naming scheme that then falls back with a warning).
+        assert_eq!(normalized_screen_id("local-display-1"), None);
+        assert_eq!(normalized_screen_id("screen-9"), None);
+        // A marker with nothing after it produces no needle.
+        assert_eq!(normalized_screen_id("peer-x-local-display-"), None);
+    }
+
+    #[test]
+    fn select_screen_matches_exact_then_suffix_then_warns_to_first() {
+        let screens = receiver_screens();
+        // Exact id match.
+        assert_eq!(
+            select_screen(&screens, "local-display-2").map(|g| g.x),
+            Some(1000.0)
+        );
+        // Suffix-normalized match: the sender's view of our display-2.
+        assert_eq!(
+            select_screen(&screens, "peer-my-host-10.0.0.9-local-display-2").map(|g| g.x),
+            Some(1000.0)
+        );
+        // Unmatched ids fall back to the first screen (the warn path —
+        // logged, never silent).
+        assert_eq!(select_screen(&screens, "screen-9").map(|g| g.x), Some(0.0));
+        // Empty screen list stays None.
+        assert!(select_screen(&[], "local-display-1").is_none());
+    }
+
+    #[test]
+    fn land_warps_screen_local_to_native_and_hit_tests_in_board_space() {
+        // The inbound id is the sender's name for our display-2 (device
+        // prefix + hyphenated host); the point is screen-local logical.
+        let event = HaloFocusEvent::Land {
+            screen_id: "peer-my-host-10.0.0.9-local-display-2".into(),
+            x: 40.0,
+            y: 200.0,
+        };
+        let mut runtime = HaloRuntime::new();
+        let mut windows = FakeWindows::with_window((1000.0, 150.0, 300.0, 100.0));
+        let mut activator = FakeActivator {
+            activated: Vec::new(),
+        };
+        let recorder = WarpRecorder::new(true);
+        let mut warper: Box<dyn CursorWarper> = Box::new(recorder.clone());
+        let outcome = apply_focus_event(
+            &event,
+            &mut runtime,
+            &receiver_screens(),
+            &mut windows,
+            &mut activator,
+            warper.as_mut(),
+        );
+        // Land warp: native = native_origin + local * scale on the selected
+        // screen (display-2: native (2000,0), 2x) -> (2080, 400).
+        assert_eq!(recorder.calls(), vec![(2080.0, 400.0)]);
+        // hit_test ran in this machine's board space (display-2's board
+        // origin (1000,0) added back onto the local point).
+        assert_eq!(windows.hit_points(), &[(1040.0, 200.0)]);
+        assert!(
+            outcome.activated,
+            "land activates the window under the point"
+        );
+        assert_eq!(outcome.window_title.as_deref(), Some("w"));
+        assert_eq!(activator.activated, vec![7]);
+        assert!(outcome.detail.contains("warped=(2080,400)"));
+        runtime.clear_remote_highlight();
+    }
+
+    #[test]
+    fn land_clamps_out_of_range_local_points_into_the_screen() {
+        let event = HaloFocusEvent::Land {
+            screen_id: "local-display-2".into(),
+            x: -50.0,
+            y: 600.0,
+        };
+        let mut runtime = HaloRuntime::new();
+        let mut windows = FakeWindows::with_window((1000.0, 150.0, 300.0, 100.0));
+        let mut activator = FakeActivator {
+            activated: Vec::new(),
+        };
+        let recorder = WarpRecorder::new(true);
+        let mut warper: Box<dyn CursorWarper> = Box::new(recorder.clone());
+        let _outcome = apply_focus_event(
+            &event,
+            &mut runtime,
+            &receiver_screens(),
+            &mut windows,
+            &mut activator,
+            warper.as_mut(),
+        );
+        // Out-of-range local coords clamp into the selected screen before
+        // the scale conversion: (-50,600) -> (0,500) -> native (2000,1000).
+        assert_eq!(recorder.calls(), vec![(2000.0, 1000.0)]);
+        runtime.clear_remote_highlight();
     }
 }

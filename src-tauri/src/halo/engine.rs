@@ -309,6 +309,10 @@ pub(crate) struct EngineState {
     /// snapshot (`remote_switch`). Set by the region-commit remote path and
     /// by the undo path when the previous screen is not local.
     pending_remote_switch: Option<RemoteSwitch>,
+    /// S3: screen id of the last "region screen not in the engine screen
+    /// list" condition, so the info log fires only when the unresolved id
+    /// changes instead of every tick (the held region re-evaluates at 30 Hz).
+    last_unresolved_region_screen: Option<String>,
 }
 
 impl EngineState {
@@ -346,6 +350,7 @@ impl EngineState {
             last_uv: (0.5, 0.5),
             warper: config.warper,
             pending_remote_switch: None,
+            last_unresolved_region_screen: None,
         }
     }
 
@@ -707,7 +712,11 @@ pub(crate) fn step(
 /// S3: switch the engine's tracked screen to the held region's screen entry
 /// (matched by screen id). A missing entry keeps the current screen — the
 /// screen list and the calibration can briefly disagree during a topology
-/// change — and logs once per commit so misconfiguration is visible.
+/// change, or permanently while a region aims at another machine's screen —
+/// and logs at info level when the unresolved id CHANGES (the held region
+/// re-evaluates every tick, so an unchanged condition must not flood the
+/// log; repeats stay at debug). Resolving the entry resets the record so a
+/// recurrence logs again.
 fn switch_engine_screen_for_region(state: &mut EngineState, idx: usize) {
     let Some(cal) = state.screen_cal.as_ref() else {
         return;
@@ -723,11 +732,19 @@ fn switch_engine_screen_for_region(state: &mut EngineState, idx: usize) {
             if state.screen != geometry {
                 state.screen = geometry;
             }
+            state.last_unresolved_region_screen = None;
         }
         None => {
-            log::info!(
-                "halo: region screen {screen_id} not in the engine screen list; keeping the current screen"
-            );
+            if state.last_unresolved_region_screen.as_deref() == Some(screen_id.as_str()) {
+                log::debug!(
+                    "halo: region screen {screen_id} not in the engine screen list; keeping the current screen"
+                );
+            } else {
+                log::info!(
+                    "halo: region screen {screen_id} not in the engine screen list; keeping the current screen"
+                );
+            }
+            state.last_unresolved_region_screen = Some(screen_id);
         }
     }
 }

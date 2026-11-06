@@ -24,16 +24,19 @@ pub const RESEND_SUPPRESS: Duration = Duration::from_millis(150);
 /// slower heartbeat: the receiver auto-clears its highlight after 5 s, so an
 /// unchanged state (a long dwell) must be refreshed to stay visible.
 pub const UNCHANGED_REFRESH: Duration = Duration::from_secs(1);
-/// Coordinate quantum (layout-board logical pixels) for the "same event"
-/// comparison: a halo parked on a window jitters by a few pixels, and those
-/// micro-moves must not count as state changes.
+/// Coordinate quantum (logical pixels) for the "same event" comparison: a
+/// halo parked on a window jitters by a few pixels, and those micro-moves
+/// must not count as state changes.
 pub const COORD_QUANTUM: f64 = 5.0;
 
 /// One focus event directed at a peer screen. `screen_id` is the target
-/// screen's id from the shared layout board; `x`/`y` are the landing point in
-/// layout-board logical coordinates (the shared coordinate space every
-/// machine's screens are announced into), so the receiver can hit-test the
-/// point against its own windows directly.
+/// screen's id from the sender's layout board (the receiver suffix-normalizes
+/// it against its own screen ids); `x`/`y` are the landing point in the
+/// TARGET screen's own logical coordinates (origin = that screen's top-left
+/// corner, unit = logical pixels). Layout boards are localized per machine
+/// and not synchronized across peers, so board coordinates would be
+/// meaningless to the receiver; screen-local points convert through the
+/// selected screen's geometry on both ends.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum HaloFocusEvent {
@@ -51,12 +54,13 @@ pub enum HaloFocusEvent {
     Activate { screen_id: String, x: f64, y: f64 },
     /// S4 cross-machine takeover landing: the sender's head-turn engine
     /// committed a region whose screen belongs to the receiver. The receiver
-    /// warps its own cursor to (x, y) (board coordinates) and activates the
-    /// window under the point — an `Activate` plus a pointer warp, marking
-    /// the moment control intent moved to this machine. Input still flows
-    /// through the normal controller path afterwards (see the pump-side
-    /// dispatch notes in lib.rs); Land only places the peer's cursor and
-    /// focus where the user's head already is.
+    /// warps its own cursor to (x, y) (screen-local logical coordinates,
+    /// converted to native through the selected screen's geometry) and
+    /// activates the window under the point — an `Activate` plus a pointer
+    /// warp, marking the moment control intent moved to this machine. Input
+    /// still flows through the normal controller path afterwards (see the
+    /// pump-side dispatch notes in lib.rs); Land only places the peer's
+    /// cursor and focus where the user's head already is.
     #[serde(rename_all = "camelCase")]
     Land { screen_id: String, x: f64, y: f64 },
     /// The halo left the edge (or the sender's pipeline stopped): the peer

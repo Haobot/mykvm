@@ -3736,15 +3736,17 @@ fn halo_focus_pump_tick(
 }
 
 /// S4: resolve a remote-switch screen id against the live layout. Returns the
-/// owning peer device plus the board point to land on: the live layout rect's
-/// center wins over the engine's advisory snapshot center, because the engine
-/// cannot see topology changes after calibration (see `RemoteSwitch`).
+/// owning peer device, its screen (whose board origin converts the landing
+/// point into the screen-local coordinates the wire carries), and the board
+/// point to land on: the live layout rect's center wins over the engine's
+/// advisory snapshot center, because the engine cannot see topology changes
+/// after calibration (see `RemoteSwitch`).
 /// `None` = the screen belongs to no non-local device (or the layout has no
 /// local role at all) — the caller drops the latch.
 fn halo_remote_switch_target<'a>(
     layout: &'a LayoutState,
     screen_id: &str,
-) -> Option<(&'a Device, (f64, f64))> {
+) -> Option<(&'a Device, &'a Screen, (f64, f64))> {
     for device in &layout.devices {
         if device.role == "local" {
             continue;
@@ -3754,7 +3756,7 @@ fn halo_remote_switch_target<'a>(
                 screen.x as f64 + screen.width as f64 / 2.0,
                 screen.y as f64 + screen.height as f64 / 2.0,
             );
-            return Some((device, point));
+            return Some((device, screen, point));
         }
     }
     None
@@ -3789,7 +3791,8 @@ fn halo_remote_switch_dispatch(state: &AppRuntime, latch: halo::RemoteSwitch, la
     let Ok(layout) = state.layout.try_lock() else {
         return;
     };
-    let Some((device, (board_x, board_y))) = halo_remote_switch_target(&layout, &latch.screen_id)
+    let Some((device, peer_screen, (board_x, board_y))) =
+        halo_remote_switch_target(&layout, &latch.screen_id)
     else {
         log::warn!(
             "halo focus: remote switch screen {} belongs to no peer in the layout; Land dropped",
@@ -3798,6 +3801,13 @@ fn halo_remote_switch_dispatch(state: &AppRuntime, latch: halo::RemoteSwitch, la
         return;
     };
     let device = device.clone();
+    // Wire semantics: the Land carries the point in the PEER screen's own
+    // logical coordinates (origin = that screen's top-left), not board
+    // coordinates — each machine localizes the shared board differently, so
+    // the receiver could never interpret board values. Only the wire fields
+    // convert; the board point stays for the log.
+    let local_x = board_x - peer_screen.x as f64;
+    let local_y = board_y - peer_screen.y as f64;
     let source_device_id = local_peer_from_layout(&layout).id;
     let cluster_id = layout.cluster_id.clone();
     let pair_secret = layout.pair_secret.clone();
@@ -3816,8 +3826,8 @@ fn halo_remote_switch_dispatch(state: &AppRuntime, latch: halo::RemoteSwitch, la
     *land_seq = land_seq.wrapping_add(1);
     let event = halo::HaloFocusEvent::Land {
         screen_id: latch.screen_id.clone(),
-        x: board_x,
-        y: board_y,
+        x: local_x,
+        y: local_y,
     };
     let packet =
         halo::HaloFocusPacket::new(source_device_id, cluster_id, pair_secret, event, *land_seq);
@@ -3843,7 +3853,7 @@ fn halo_remote_switch_dispatch(state: &AppRuntime, latch: halo::RemoteSwitch, la
     );
     match transport.send_datagram(peer, payload) {
         Ok(true) => log::info!(
-            "halo focus: sent land takeover to {} (screen {}, board ({board_x}, {board_y}), seq {})",
+            "halo focus: sent land takeover to {} (screen {}, local ({local_x}, {local_y}), board ({board_x}, {board_y}), seq {})",
             device.name,
             latch.screen_id,
             *land_seq
@@ -17607,11 +17617,16 @@ mod tests {
         ];
         // The screen resolves to the peer, and the point is the LIVE layout
         // rect's center (not the engine's advisory snapshot).
-        let (device, point) =
+        let (device, screen, point) =
             halo_remote_switch_target(&layout, "peer-s").expect("peer screen resolves");
         assert_eq!(device.id, "peer-a");
         assert_eq!(device.name, "Mac mini");
+        assert_eq!(screen.id, "peer-s");
         assert_eq!(point, (-960.0, 540.0));
+        // The dispatch converts this board point into the peer screen's own
+        // local coordinates with the returned origin: (-960, 540) - (-1920, 0).
+        let local = (point.0 - screen.x as f64, point.1 - screen.y as f64);
+        assert_eq!(local, (960.0, 540.0));
         // Local screens are never remote targets even when the id matches.
         assert!(halo_remote_switch_target(&layout, "local-1").is_none());
         // Unknown screen: None (the dispatch drops the latch).

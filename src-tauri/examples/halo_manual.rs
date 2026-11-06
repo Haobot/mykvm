@@ -409,9 +409,11 @@ fn run_windows_subcommand() {
 /// `activate`, window activation. `land` (S4) additionally warps this
 /// machine's cursor onto the landing point before activating — its printed
 /// outcome carries the warp target and acceptance. Coordinates are
-/// board/global logical points; screen ids here are the synthesized
-/// `screen-<index>` of the locally attached displays, and a point inside a
-/// display also resolves by containment, so any on-screen coordinate works.
+/// screen-local logical points (origin = the target screen's top-left);
+/// screen ids here are the synthesized `screen-<index>` of the locally
+/// attached displays — an id that matches no local screen falls back to the
+/// first screen with a warning, so single-display rigs accept any on-screen
+/// coordinate.
 fn run_focus_receive_subcommand(args: &[String]) {
     let kind = args.get(2).map(String::as_str).unwrap_or("");
     let screen_id = args
