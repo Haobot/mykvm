@@ -3801,6 +3801,9 @@ fn halo_remote_switch_dispatch(state: &AppRuntime, latch: halo::RemoteSwitch, la
         return;
     };
     let device = device.clone();
+    // Cloned before the layout lock drops: input.rs needs the layout-form
+    // screen (id + board geometry) to derive the wire screen id itself.
+    let peer_screen = peer_screen.clone();
     // Wire semantics: the Land carries the point in the PEER screen's own
     // logical coordinates (origin = that screen's top-left), not board
     // coordinates — each machine localizes the shared board differently, so
@@ -3866,6 +3869,25 @@ fn halo_remote_switch_dispatch(state: &AppRuntime, latch: halo::RemoteSwitch, la
             "halo focus: send land takeover to {} failed: {error}",
             device.name
         ),
+    }
+    // While this machine is already remote-controlling the peer, its cursor is
+    // driven by absolute MouseMove packets: the peer's own SetCursorPos from
+    // the Land would be overwritten within milliseconds. Re-anchor the
+    // controller session at the landing point and push one MouseMove so the
+    // jump is visible and later increments continue from it. Not
+    // remote-controlling this device (or no session): the receiver's
+    // SetCursorPos stays authoritative.
+    if input::land_remote_cursor(&device.id, &peer_screen, local_x, local_y) {
+        log::info!(
+            "halo focus: land moved controller cursor to ({local_x}, {local_y}) on {} screen {}",
+            device.name,
+            latch.screen_id
+        );
+    } else {
+        log::debug!(
+            "halo focus: land skipped controller cursor move (not remote-controlling {})",
+            device.name
+        );
     }
 }
 

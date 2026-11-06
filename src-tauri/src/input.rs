@@ -1534,6 +1534,11 @@ fn start_platform_capture(
             }
         }
         tap.enable();
+        // Publish only once the taps are up: earlier failure returns below
+        // never stored this slot, so there is nothing to clear on them.
+        if let Ok(mut current) = MACOS_CAPTURE_CONTEXT.lock() {
+            *current = Some(Arc::clone(&context));
+        }
         let _ = ready_tx.send(Ok(()));
         let mut capture_suspended = false;
         while !stop.load(Ordering::Relaxed) {
@@ -1642,6 +1647,9 @@ fn start_platform_capture(
         clear_macos_decouple_pending(&context);
         clear_clipboard_target(&context.clipboard_target);
         clear_pending_edge_drop(&context);
+        // Drop our own slot last (ptr-eq guarded): a capture restart that
+        // already published a fresh context must keep it.
+        clear_macos_capture_context(&context);
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
@@ -2343,7 +2351,7 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
                         target_platform: device.platform.clone(),
                         transport_public_key: device.transport_public_key.clone(),
                         protocol_version: device.protocol_version,
-                        screen_id: peer_screen_id(device, remote_screen),
+                        screen_id: peer_screen_id(&device.id, remote_screen),
                         local_screen: native_local_screen.clone(),
                         layout_local_screen: layout_local_screen.clone(),
                         remote_screen: remote_screen.clone(),
@@ -2472,10 +2480,14 @@ fn ranges_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> bool {
     i32::min(a_end, b_end) - i32::max(a_start, b_start) > EDGE_TOLERANCE
 }
 
-fn peer_screen_id(device: &Device, screen: &Screen) -> String {
+/// The wire screen id for a peer screen: the layout stores peer screens as
+/// `{device.id}-{the peer's own screen id}`, and the receiving side resolves
+/// MouseMove ids against its own local device's screens, so the prefix must
+/// come off before the packet goes out.
+fn peer_screen_id(device_id: &str, screen: &Screen) -> String {
     screen
         .id
-        .strip_prefix(&format!("{}-", device.id))
+        .strip_prefix(&format!("{device_id}-"))
         .unwrap_or(&screen.id)
         .to_string()
 }
@@ -3767,6 +3779,26 @@ struct MacCaptureContext {
     local_left_held: AtomicBool,
 }
 
+/// Global reach into the live macOS capture session, mirroring the Windows
+/// `WINDOWS_CAPTURE_CONTEXT` slot. The capture thread stores the context once
+/// its taps are up and clears it on its own exit (ptr-eq guarded), so external
+/// drivers (halo focus land) never race a stale session.
+#[cfg(target_os = "macos")]
+static MACOS_CAPTURE_CONTEXT: Mutex<Option<Arc<MacCaptureContext>>> = Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+fn macos_capture_context() -> Option<Arc<MacCaptureContext>> {
+    MACOS_CAPTURE_CONTEXT
+        .lock()
+        .ok()
+        .and_then(|context| context.clone())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_capture_context(owner: &Arc<MacCaptureContext>) -> bool {
+    clear_owned_context(&MACOS_CAPTURE_CONTEXT, owner)
+}
+
 #[cfg(target_os = "macos")]
 struct RawMacosGestureTap {
     mach_port: core_foundation::mach_port::CFMachPort,
@@ -4000,7 +4032,7 @@ fn clear_windows_capture_context(owner: &Arc<WindowsCaptureContext>) -> bool {
     clear_owned_context(&WINDOWS_CAPTURE_CONTEXT, owner)
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 fn clear_owned_context<T>(slot: &Mutex<Option<Arc<T>>>, owner: &Arc<T>) -> bool {
     if let Ok(mut current) = slot.lock() {
         if current
@@ -7011,7 +7043,7 @@ fn remote_device_screens(layout: &LayoutState, device_id: &str) -> Vec<Screen> {
                 .iter()
                 .map(|screen| {
                     let mut copy = screen.clone();
-                    copy.id = peer_screen_id(device, screen);
+                    copy.id = peer_screen_id(&device.id, screen);
                     copy
                 })
                 .collect()
@@ -7128,6 +7160,106 @@ fn send_remote_mouse_move(
 
 fn local_anchor_point(active: &ActiveTarget) -> (f64, f64) {
     local_return_point(active)
+}
+
+/// Halo focus landed on a peer screen while this machine is already
+/// remote-controlling that same peer: re-anchor the controller-side session at
+/// the landing point and immediately push one absolute MouseMove through the
+/// regular incremental channel. Without this, every later packet pins the peer
+/// cursor back to the session's stale absolute position within milliseconds of
+/// the peer's own `apply_focus_event` SetCursorPos, so the jump never shows.
+///
+/// `screen` arrives in controller-layout form (`{device-id}-local-display-N`,
+/// geometry in the shared board space — exactly what the caller already holds
+/// under the layout lock); the wire id is derived here with the same
+/// `peer_screen_id` rule every other MouseMove uses, so there is no second
+/// naming source. Returns true when the active session belonged to `device_id`
+/// and was re-targeted; false (no session, another device's session, or no
+/// live capture context) leaves the receiver's own SetCursorPos authoritative
+/// — the designed split for non-remote-control lands.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn land_remote_cursor(device_id: &str, screen: &Screen, x: f64, y: f64) -> bool {
+    #[cfg(target_os = "macos")]
+    if let Some(context) = macos_capture_context() {
+        return land_active_remote_cursor(
+            &context.active,
+            &context.quic_transport,
+            &context.layout_state,
+            &context.input_events,
+            device_id,
+            screen,
+            x,
+            y,
+        );
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(context) = windows_capture_context() {
+        return land_active_remote_cursor(
+            &context.active,
+            &context.quic_transport,
+            &context.layout_state,
+            &context.input_events,
+            device_id,
+            screen,
+            x,
+            y,
+        );
+    }
+    false
+}
+
+/// Non-input-platform stub: there is no capture session to re-anchor, so a
+/// halo land always defers to the receiver's own SetCursorPos.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn land_remote_cursor(_device_id: &str, _screen: &Screen, _x: f64, _y: f64) -> bool {
+    false
+}
+
+/// Shared core of `land_remote_cursor`. Rewrites the active session in place
+/// and sends the jump through the same `send_remote_mouse_move` path the
+/// capture loop uses — never a second encode channel.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn land_active_remote_cursor(
+    active: &Mutex<Option<ActiveTarget>>,
+    quic_transport: &quic_transport::TransportHandle,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+    device_id: &str,
+    screen: &Screen,
+    x: f64,
+    y: f64,
+) -> bool {
+    retarget_active_for_land(active, device_id, screen, x, y)
+        .map(|active| send_remote_mouse_move(quic_transport, &active, layout_state, input_events))
+        .unwrap_or(false)
+}
+
+/// The mutation half of `land_active_remote_cursor`, split out so tests can
+/// observe the rewritten session (and therefore the exact MouseMove values the
+/// shared send path will encode) without a live QUIC transport.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn retarget_active_for_land(
+    active: &Mutex<Option<ActiveTarget>>,
+    device_id: &str,
+    screen: &Screen,
+    x: f64,
+    y: f64,
+) -> Option<ActiveTarget> {
+    let mut guard = active.lock().ok()?;
+    let active_target = guard.as_mut()?;
+    // Only the device currently under control may be re-anchored: a land on
+    // any other peer must not hijack or end this session.
+    if active_target.target.device_id != device_id {
+        return None;
+    }
+    let wire_id = peer_screen_id(device_id, screen);
+    active_target.current_screen = screen.clone();
+    active_target.current_screen.id = wire_id.clone();
+    active_target.current_screen_id = wire_id;
+    // Mirror the crossing-entry clamp: screen-local logical coordinates.
+    active_target.x = x.clamp(0.0, (screen.width.max(1) - 1) as f64);
+    active_target.y = y.clamp(0.0, (screen.height.max(1) - 1) as f64);
+    Some(active_target.clone())
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -11161,6 +11293,97 @@ mod tests {
             assert_eq!(active.x, expected_x);
             assert_eq!(active.y, expected_y);
         }
+    }
+
+    #[test]
+    fn halo_land_retargets_the_active_session_and_uses_the_wire_screen_id() {
+        let target = target_for_coordinate_tests();
+        let mut current_screen = target.remote_screen.clone();
+        current_screen.id = target.screen_id.clone();
+        let active = Mutex::new(Some(ActiveTarget {
+            target,
+            return_point: None,
+            current_screen: current_screen.clone(),
+            current_screen_id: current_screen.id.clone(),
+            x: 100.0,
+            y: 200.0,
+        }));
+
+        // The layout-form screen (prefixed id + board geometry) exactly as
+        // halo_remote_switch_dispatch hands it over.
+        let landing = screen(
+            "peer-device",
+            "peer-device-local-display-1",
+            -9400,
+            -9000,
+            2560,
+            1440,
+        );
+        let retargeted = retarget_active_for_land(&active, "peer-device", &landing, 1280.5, 719.5)
+            .expect("the controlled device's session should be re-anchored");
+
+        // The wire carries the peer's own screen name — the same rule every
+        // incremental MouseMove uses — and the landing point as screen-local
+        // logical coordinates.
+        assert_eq!(retargeted.current_screen_id, "local-display-1");
+        assert_eq!(retargeted.current_screen.id, "local-display-1");
+        assert_eq!(retargeted.current_screen.x, -9400);
+        assert_eq!(retargeted.x.round() as i32, 1281);
+        assert_eq!(retargeted.y.round() as i32, 720);
+        // The session was rewritten in place so the next increments continue
+        // from the landing point.
+        let active = active.lock().unwrap();
+        let active = active.as_ref().unwrap();
+        assert_eq!(active.current_screen_id, "local-display-1");
+        assert_eq!(active.x, 1280.5);
+        assert_eq!(active.y, 719.5);
+    }
+
+    #[test]
+    fn halo_land_is_a_noop_for_a_session_owned_by_another_device() {
+        let target = target_for_coordinate_tests();
+        let mut current_screen = target.remote_screen.clone();
+        current_screen.id = target.screen_id.clone();
+        let active = Mutex::new(Some(ActiveTarget {
+            target,
+            return_point: None,
+            current_screen,
+            current_screen_id: "local-display-1".into(),
+            x: 100.0,
+            y: 200.0,
+        }));
+
+        let landing = screen(
+            "other-device",
+            "other-device-local-display-2",
+            0,
+            0,
+            1920,
+            1080,
+        );
+        assert!(
+            retarget_active_for_land(&active, "other-device", &landing, 10.0, 20.0).is_none(),
+            "a land on another device must not hijack the running session"
+        );
+        let active = active.lock().unwrap();
+        let active = active.as_ref().unwrap();
+        assert_eq!(active.x, 100.0);
+        assert_eq!(active.y, 200.0);
+        assert_eq!(active.current_screen_id, "local-display-1");
+    }
+
+    #[test]
+    fn halo_land_is_a_noop_without_an_active_session() {
+        let active: Mutex<Option<ActiveTarget>> = Mutex::new(None);
+        let landing = screen(
+            "peer-device",
+            "peer-device-local-display-1",
+            0,
+            0,
+            1920,
+            1080,
+        );
+        assert!(retarget_active_for_land(&active, "peer-device", &landing, 10.0, 20.0).is_none());
     }
 
     #[test]
