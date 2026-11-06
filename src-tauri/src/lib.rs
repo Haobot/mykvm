@@ -5936,6 +5936,9 @@ fn spawn_instance_event_listener(name: &str, app: AppHandle, event_kind: Instanc
                 });
             }
             InstanceEvent::Quit => {
+                log::info!(
+                    "quit requested via instance event (installer or second launch); exiting"
+                );
                 request_app_quit(&app);
                 break;
             }
