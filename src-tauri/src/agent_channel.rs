@@ -205,15 +205,6 @@ pub(crate) fn agent_packet_authorized(
     true
 }
 
-/// 本机历代 device id 的稳定前缀 `peer-{hostname}-`（语义与 input.rs
-/// local_peer_host_prefix 一致；该函数是 input 私有的，这里用 crate 根的
-/// hostname/sanitize 重新推导，避免改动 input.rs）。
-fn local_peer_host_prefix() -> Option<String> {
-    let host = crate::hostname()?;
-    let normalized = crate::sanitize_peer_id_part(&host);
-    (!normalized.is_empty()).then(|| format!("peer-{normalized}-"))
-}
-
 /// 路由消歧（语义复用 input.rs packet_targets_local）：空 target = 广播；
 /// 精确匹配本机 id；放行本机主机名铸成的历史 id（device id 内嵌 LAN 地址，
 /// 换 IP 后 id 漂移不应静默丢弃——见 AGENTS.md 已知坑 6）；最后匹配
@@ -223,21 +214,7 @@ pub(crate) fn agent_packet_targets_local(
     packet: &AgentChannelPacket,
     local_peer_id: &str,
 ) -> bool {
-    if packet.target_id.trim().is_empty() {
-        return true;
-    }
-    if packet.target_id == local_peer_id {
-        return true;
-    }
-    if let Some(prefix) = local_peer_host_prefix() {
-        if packet.target_id.starts_with(&prefix) {
-            return true;
-        }
-    }
-    layout
-        .devices
-        .iter()
-        .any(|device| device.role == "local" && device.id == packet.target_id)
+    crate::input::packet_targets_local(layout, &packet.target_id, local_peer_id)
 }
 
 /// 向对端发出 agent request 并等待对应 response（两段式，阻塞至超时）。
@@ -785,6 +762,34 @@ mod tests {
             !agent_packet_targets_local(&layout, &packet, "local-current-id"),
             "无关目标 id 不得被本机接收"
         );
+    }
+
+    #[test]
+    fn agent_routing_matches_input_routing_on_every_branch() {
+        // 路由统一（P1a 技术债消除）：agent_packet_targets_local 委托
+        // input::packet_targets_local，四个路由分支的判定必须逐分支一致——
+        // 广播 / 精确 id / 本机主机名铸成的历史 id（AGENTS.md 已知坑 6）/
+        // devices 本机条目 / 无关 id。
+        let host = crate::hostname().unwrap_or_else(|| "test-host".into());
+        let mut layout = test_agent_layout("client", Vec::new());
+        layout.devices = vec![test_local_device("local-device")];
+        let targets = [
+            String::new(),
+            crate::local_peer_id(&host, "192.168.3.65"),
+            crate::local_peer_id(&host, "192.168.3.42"),
+            "local-device".into(),
+            crate::local_peer_id("some-other-host", "192.168.3.42"),
+        ];
+        for target in &targets {
+            let mut packet = authorized_packet("controller-1", "peer-key-1");
+            packet.target_id = target.clone();
+            let agent = agent_packet_targets_local(&layout, &packet, "peer-local-current");
+            let input = crate::input::packet_targets_local(&layout, target, "peer-local-current");
+            assert_eq!(
+                agent, input,
+                "target={target:?} 的路由判定必须与 input.rs 完全一致"
+            );
+        }
     }
 
     // ---- c. Pending 表 ----

@@ -3167,7 +3167,11 @@ fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlP
     );
 }
 
-fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer_id: &str) -> bool {
+pub(crate) fn packet_targets_local(
+    layout: &LayoutState,
+    target_device_id: &str,
+    local_peer_id: &str,
+) -> bool {
     if target_device_id.trim().is_empty() {
         return true;
     }
