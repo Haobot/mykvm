@@ -32,6 +32,12 @@ pub(crate) const AGENT_KIND_CANCEL: &str = "cancel";
 /// P0 仅有的能力：回显 payload，用于验证两段式 RPC 闭环。
 pub(crate) const AGENT_CAPABILITY_ECHO: &str = "echo";
 
+/// L0 能力：读取本机运行状态快照（P1a）。
+pub(crate) const AGENT_CAPABILITY_STATUS_GET: &str = "status.get";
+
+/// L0 能力：单向消息投递到本机收件箱（P1a）。
+pub(crate) const AGENT_CAPABILITY_MSG_SEND: &str = "msg.send";
+
 /// Agent 通道的用户意图配置（RFC §6.3）：开关 + 能力级别 + 白名单。
 /// 前端所有（Settings 编辑），随 layout.json 持久化；载入（normalize_saved_layout）
 /// 与保存（save_layout）路径各自钳制，消费点（level gate）再次兜底——
@@ -315,6 +321,58 @@ fn global_audit_slot() -> &'static OnceLock<std::sync::Arc<AgentAuditLog>> {
     &SLOT
 }
 
+/// 收件箱容量：内存环形 100 条，超限挤最老（不落盘——消息是瞬时协作信号，
+/// 审计里已留有元数据痕迹）。
+pub(crate) const AGENT_INBOX_CAPACITY: usize = 100;
+
+/// msg.send 正文上限：4KiB（按 UTF-8 字节，截断在字符边界）。
+pub(crate) const AGENT_MSG_TEXT_MAX_BYTES: usize = 4 * 1024;
+
+/// 一条收件箱消息（RFC §6.2 msg.send：对端写收件箱）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentInboxMessage {
+    pub ts_ms: u64,
+    /// 发送方 device id（request 的 origin_id）。
+    pub peer_id: String,
+    pub title: Option<String>,
+    pub text: String,
+    /// text 超过 4KiB 被截断时为 true（任务书「截断并标注 truncated」）。
+    pub truncated: bool,
+}
+
+/// agent 收件箱。生产用 [`global_agent_inbox`]；测试构造独立实例。
+pub(crate) struct AgentInbox {
+    messages: Mutex<VecDeque<AgentInboxMessage>>,
+}
+
+impl AgentInbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            messages: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub(crate) fn push(&self, message: AgentInboxMessage) {
+        let _ = message;
+        todo!("红灯阶段：收件箱投递未实现")
+    }
+
+    /// 收件箱快照（按时间升序）。生产读取方是 P1c 的 Tauri 命令，P1a 只有
+    /// 测试消费——照 lib.rs DRAG_CONTROL_FAILED 的 cfg_attr 惯例压制该构建
+    /// 下的 dead_code。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn snapshot(&self) -> Vec<AgentInboxMessage> {
+        todo!("红灯阶段：收件箱读取未实现")
+    }
+}
+
+/// 生产全局收件箱（OnceLock 单例）。测试不要用它（构造独立实例）。
+pub(crate) fn global_agent_inbox() -> Arc<AgentInbox> {
+    static INBOX: OnceLock<Arc<AgentInbox>> = OnceLock::new();
+    INBOX.get_or_init(|| Arc::new(AgentInbox::new())).clone()
+}
+
 /// LayoutState serde 默认值入口（与 default_input_mode 等惯例一致）。
 pub(crate) fn default_agent_channel() -> AgentChannelConfig {
     AgentChannelConfig::default()
@@ -558,11 +616,24 @@ pub(crate) fn send_agent_request(
     }
 }
 
+/// capability 处理器的执行上下文：一次 request 执行所需的本机信息。
+/// 由 request 分支在异步线程内按请求构造（借用线程自有的 layout 快照）；
+/// 收件箱以注入方式提供——生产为全局实例，测试注入独立实例防串线。
+pub(crate) struct AgentCapabilityContext<'a> {
+    /// on_stream 收包时刻的 layout 快照（与其它 stream 分支同一份快照语义）。
+    pub layout: &'a crate::LayoutState,
+    /// 本机当前 device id（`local_peer_from_layout(..).id`）。
+    pub local_peer_id: &'a str,
+    /// msg.send 的落点。
+    pub inbox: &'a AgentInbox,
+}
+
 /// capability 分发函数：按 packet.capability 执行并返回 response payload。
 /// 以注入方式持有（而非写死调用），测试可替换为带延迟/计数的处理器来锁定
 /// 执行模型的时序性质，生产恒为 [`dispatch_agent_capability`]。
-pub(crate) type AgentCapabilityHandler =
-    Arc<dyn Fn(&AgentChannelPacket) -> Result<Value, String> + Send + Sync>;
+pub(crate) type AgentCapabilityHandler = Arc<
+    dyn Fn(&AgentCapabilityContext<'_>, &AgentChannelPacket) -> Result<Value, String> + Send + Sync,
+>;
 
 /// on_stream agent 分支的运行期依赖（RFC §6.3）。生产由 start_quic_transport
 /// 构造一次、被 on_stream 闭包捕获（[`AgentChannelRuntime::production`]）；
@@ -573,16 +644,19 @@ pub(crate) struct AgentChannelRuntime {
     /// 只能捕获槽位，transport 就绪后由 start_quic_transport 填充。
     pub transport_slot: Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
     pub dispatch: AgentCapabilityHandler,
+    pub inbox: Arc<AgentInbox>,
 }
 
 impl AgentChannelRuntime {
-    /// 生产构造：capability 分发固定为 [`dispatch_agent_capability`]。
+    /// 生产构造：capability 分发固定为 [`dispatch_agent_capability`]，
+    /// 收件箱为进程全局实例。
     pub(crate) fn production(
         transport_slot: Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
     ) -> Self {
         Self {
             transport_slot,
             dispatch: Arc::new(dispatch_agent_capability),
+            inbox: global_agent_inbox(),
         }
     }
 }
@@ -663,17 +737,22 @@ fn handle_agent_request(
     // spawn 前把回调依赖克隆进线程（Arc clone 是廉价引用计数）；
     // layout 快照也随线程带走，回调线程不再持有任何本分支借用。
     let runtime = runtime.clone();
-    let mut packet = packet.clone();
+    let packet = packet.clone();
     let layout = layout.clone();
     let local_peer_id = local_peer_id.to_string();
     std::thread::spawn(move || {
-        let (status, payload) = match (runtime.dispatch)(&packet) {
+        let context = AgentCapabilityContext {
+            layout: &layout,
+            local_peer_id: &local_peer_id,
+            inbox: &runtime.inbox,
+        };
+        let (status, payload) = match (runtime.dispatch)(&context, &packet) {
             Ok(result) => ("ok", result),
             Err(error) => ("err", serde_json::json!({ "error": error })),
         };
         send_agent_response(
             &runtime,
-            &mut packet,
+            &packet,
             status,
             payload,
             &layout,
@@ -688,7 +767,7 @@ fn handle_agent_request(
 /// 消费，由发起方超时兜底重试。
 fn send_agent_response(
     runtime: &AgentChannelRuntime,
-    packet: &mut AgentChannelPacket,
+    packet: &AgentChannelPacket,
     status: &str,
     payload: Value,
     layout: &crate::LayoutState,
@@ -760,12 +839,45 @@ fn handle_agent_response(packet: &AgentChannelPacket, layout: &crate::LayoutStat
     global_pending_table().resolve(&packet.request_id, result)
 }
 
-/// 生产 capability 分发（P0：仅 echo，原样回 payload）。
-fn dispatch_agent_capability(packet: &AgentChannelPacket) -> Result<Value, String> {
+/// 生产 capability 分发（P1a：echo + status.get + msg.send；log.read/file.*
+/// 留给 P1b）。
+fn dispatch_agent_capability(
+    context: &AgentCapabilityContext<'_>,
+    packet: &AgentChannelPacket,
+) -> Result<Value, String> {
     match packet.capability.as_str() {
         AGENT_CAPABILITY_ECHO => Ok(packet.payload.clone()),
+        AGENT_CAPABILITY_STATUS_GET => Ok(agent_status_payload(context)),
+        AGENT_CAPABILITY_MSG_SEND => agent_handle_msg_send(context, packet),
         other => Err(format!("未支持的 agent capability: {other}")),
     }
+}
+
+/// status.get 的响应体（RFC §6.2 L0）：本机身份/配置快照。全部来源只读。
+fn agent_status_payload(context: &AgentCapabilityContext<'_>) -> Value {
+    todo!("红灯阶段：status.get 未实现")
+}
+
+/// msg.send：payload { text, title? } → 写入收件箱 + log::info → ok。
+/// text 超 4KiB 截断并标注 truncated；text 缺失/为空/非字符串 → err。
+fn agent_handle_msg_send(
+    context: &AgentCapabilityContext<'_>,
+    packet: &AgentChannelPacket,
+) -> Result<Value, String> {
+    todo!("红灯阶段：msg.send 未实现")
+}
+
+/// 按 UTF-8 字节上限截断，切点回退到最近的字符边界（不切出半个字符）。
+/// 返回（截断后文本, 是否发生截断）。
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut cut = max_bytes;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (text[..cut].to_string(), true)
 }
 
 /// 从 err/denied 响应的 payload 提取人读错误消息。
@@ -1342,14 +1454,18 @@ mod tests {
 
     // ---- f. 异步执行模型（P1a，RFC §6.3 执行模型）----
 
-    /// 构造测试 runtime：capability 分发为注入的闭包。
+    /// 构造测试 runtime：capability 分发为注入的闭包（收件箱为独立实例）。
     fn runtime_with_dispatch(
         slot: Arc<Mutex<Option<quic_transport::TransportHandle>>>,
-        dispatch: impl Fn(&AgentChannelPacket) -> Result<Value, String> + Send + Sync + 'static,
+        dispatch: impl Fn(&AgentCapabilityContext<'_>, &AgentChannelPacket) -> Result<Value, String>
+            + Send
+            + Sync
+            + 'static,
     ) -> AgentChannelRuntime {
         AgentChannelRuntime {
             transport_slot: slot,
-            dispatch: Arc::new(move |packet| dispatch(packet)),
+            dispatch: Arc::new(move |context, packet| dispatch(context, packet)),
+            inbox: Arc::new(AgentInbox::new()),
         }
     }
 
@@ -1361,7 +1477,7 @@ mod tests {
         // 与文件传输/剪贴板互饿。用 800ms 的伪 capability 验证 ack 毫秒级返回。
         init_test_logger();
         let slot: Arc<Mutex<Option<quic_transport::TransportHandle>>> = Arc::new(Mutex::new(None));
-        let runtime = runtime_with_dispatch(slot, |_packet| {
+        let runtime = runtime_with_dispatch(slot, |_context, _packet| {
             std::thread::sleep(Duration::from_millis(800));
             Ok(serde_json::json!({ "slow": true }))
         });
@@ -1393,7 +1509,7 @@ mod tests {
         let slot: Arc<Mutex<Option<quic_transport::TransportHandle>>> = Arc::new(Mutex::new(None));
         let started_flag = Arc::new(AtomicU64::new(0));
         let flag_for_dispatch = Arc::clone(&started_flag);
-        let runtime = runtime_with_dispatch(slot, move |_packet| {
+        let runtime = runtime_with_dispatch(slot, move |_context, _packet| {
             flag_for_dispatch.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(150));
             Ok(Value::Null)
@@ -1796,5 +1912,227 @@ mod tests {
         assert_eq!(log.snapshot().len(), 2, "落盘失败不得影响环形记录");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- i. 首批 L0 能力：status.get / msg.send（P1a）----
+
+    /// 构造一个 capability 请求包（鉴权字段齐全）。
+    fn capability_packet(capability: &str, payload: Value) -> AgentChannelPacket {
+        let mut packet = authorized_packet("controller-1", "peer-key-1");
+        packet.capability = capability.into();
+        packet.payload = payload;
+        packet
+    }
+
+    #[test]
+    fn status_get_reports_local_identity_and_agent_config() {
+        let mut layout = test_agent_layout("client", Vec::new());
+        layout.input_mode = "receive".into();
+        layout.transport_port = 47833;
+        layout.quic_port = 47834;
+        let inbox = AgentInbox::new();
+        let context = AgentCapabilityContext {
+            layout: &layout,
+            local_peer_id: "peer-local-1",
+            inbox: &inbox,
+        };
+
+        let payload = dispatch_agent_capability(
+            &context,
+            &capability_packet(AGENT_CAPABILITY_STATUS_GET, Value::Null),
+        )
+        .expect("status.get 必须成功");
+
+        assert_eq!(payload["machineRole"], "client");
+        assert_eq!(payload["inputMode"], "receive");
+        assert_eq!(payload["agentEnabled"], true);
+        assert_eq!(payload["agentLevel"], "readonly");
+        assert_eq!(payload["platform"], crate::current_platform());
+        assert_eq!(
+            payload["hostname"],
+            crate::hostname().unwrap_or_default(),
+            "hostname 必须来自 crate::hostname()"
+        );
+        assert_eq!(
+            payload["deviceId"], "peer-local-1",
+            "deviceId 必须是本机当前 id"
+        );
+        assert_eq!(
+            payload["appVersion"],
+            crate::APP_VERSION
+                .get()
+                .cloned()
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+            "appVersion 必须与 LanPeer 宣告同源（APP_VERSION 兜底 CARGO_PKG_VERSION）"
+        );
+        assert_eq!(payload["quicPort"], 47834);
+        assert!(
+            !payload.to_string().contains(TEST_SECRET)
+                && !payload.to_string().contains(TEST_CLUSTER),
+            "status.get 不得泄漏配对凭据"
+        );
+    }
+
+    #[test]
+    fn status_get_reports_effective_level_for_invalid_config() {
+        // 边界：layout 快照里若残留非法 level（钳制前的旧快照），status 汇报的
+        // 必须是 gate 实际执行的有效级别 readonly，而不是原样回显非法值。
+        let mut layout = test_agent_layout("server", Vec::new());
+        layout.agent_channel.level = "root".into();
+        layout.agent_channel.enabled = false;
+        let inbox = AgentInbox::new();
+        let context = AgentCapabilityContext {
+            layout: &layout,
+            local_peer_id: "peer-local-1",
+            inbox: &inbox,
+        };
+        let payload = dispatch_agent_capability(
+            &context,
+            &capability_packet(AGENT_CAPABILITY_STATUS_GET, Value::Null),
+        )
+        .expect("status.get 必须成功");
+        assert_eq!(payload["agentLevel"], "readonly");
+        assert_eq!(payload["agentEnabled"], false);
+    }
+
+    #[test]
+    fn msg_send_stores_message_in_inbox_and_acks() {
+        let layout = test_agent_layout("server", Vec::new());
+        let inbox = AgentInbox::new();
+        let context = AgentCapabilityContext {
+            layout: &layout,
+            local_peer_id: "peer-local-1",
+            inbox: &inbox,
+        };
+
+        let ack = dispatch_agent_capability(
+            &context,
+            &capability_packet(
+                AGENT_CAPABILITY_MSG_SEND,
+                serde_json::json!({ "text": "构建完成，请看日志", "title": "CI" }),
+            ),
+        )
+        .expect("msg.send 必须成功");
+
+        assert_eq!(ack["delivered"], true);
+        assert_eq!(ack["truncated"], false);
+        let messages = inbox.snapshot();
+        assert_eq!(messages.len(), 1, "消息必须进入收件箱");
+        assert_eq!(
+            messages[0].peer_id, "controller-1",
+            "peer_id 取 request 的 origin_id"
+        );
+        assert_eq!(messages[0].title.as_deref(), Some("CI"));
+        assert_eq!(messages[0].text, "构建完成，请看日志");
+        assert!(!messages[0].truncated);
+
+        // title 可省略。
+        dispatch_agent_capability(
+            &context,
+            &capability_packet(
+                AGENT_CAPABILITY_MSG_SEND,
+                serde_json::json!({ "text": "无标题" }),
+            ),
+        )
+        .expect("缺省 title 必须成功");
+        assert_eq!(inbox.snapshot()[1].title, None);
+    }
+
+    #[test]
+    fn msg_send_rejects_empty_missing_or_non_string_text() {
+        let layout = test_agent_layout("server", Vec::new());
+        let inbox = AgentInbox::new();
+        let context = AgentCapabilityContext {
+            layout: &layout,
+            local_peer_id: "peer-local-1",
+            inbox: &inbox,
+        };
+        for payload in [
+            serde_json::json!({ "text": "" }),
+            serde_json::json!({ "text": "   " }),
+            serde_json::json!({}),
+            serde_json::json!({ "text": 42 }),
+            serde_json::json!({ "text": "ok", "title": 7 }),
+            Value::Null,
+        ] {
+            let result = dispatch_agent_capability(
+                &context,
+                &capability_packet(AGENT_CAPABILITY_MSG_SEND, payload.clone()),
+            );
+            assert!(result.is_err(), "非法 payload {payload} 必须返回 err");
+        }
+        assert!(inbox.snapshot().is_empty(), "被拒绝的消息不得进入收件箱");
+    }
+
+    #[test]
+    fn msg_send_truncates_text_over_4kib_on_char_boundary() {
+        let layout = test_agent_layout("server", Vec::new());
+        let inbox = AgentInbox::new();
+        let context = AgentCapabilityContext {
+            layout: &layout,
+            local_peer_id: "peer-local-1",
+            inbox: &inbox,
+        };
+        // 3 字节汉字 × 2000 = 6000 字节 > 4096：截断必须落在字符边界上。
+        let long_text = "汉".repeat(2000);
+        let ack = dispatch_agent_capability(
+            &context,
+            &capability_packet(
+                AGENT_CAPABILITY_MSG_SEND,
+                serde_json::json!({ "text": long_text }),
+            ),
+        )
+        .expect("超长消息截断后仍须成功");
+        assert_eq!(ack["truncated"], true, "超长必须在 ack 里标注 truncated");
+
+        let message = &inbox.snapshot()[0];
+        assert!(message.truncated, "收件箱条目必须标注 truncated");
+        assert!(
+            message.text.len() <= AGENT_MSG_TEXT_MAX_BYTES,
+            "截断后不得超过 4KiB（实际 {} 字节）",
+            message.text.len()
+        );
+        assert!(
+            message.text.len() > AGENT_MSG_TEXT_MAX_BYTES - 3,
+            "截断应尽量保留到 4KiB 边界内最后一个完整字符"
+        );
+        assert!(
+            message.text.chars().all(|character| character == '汉'),
+            "不得切出半个字符"
+        );
+
+        // 恰好 4096 字节不截断（边界值）。
+        let exact = "a".repeat(AGENT_MSG_TEXT_MAX_BYTES);
+        let ack = dispatch_agent_capability(
+            &context,
+            &capability_packet(
+                AGENT_CAPABILITY_MSG_SEND,
+                serde_json::json!({ "text": exact }),
+            ),
+        )
+        .expect("边界值必须成功");
+        assert_eq!(ack["truncated"], false, "恰好 4KiB 不算超长");
+    }
+
+    #[test]
+    fn inbox_caps_at_100_and_drops_oldest() {
+        let inbox = AgentInbox::new();
+        for index in 0..AGENT_INBOX_CAPACITY + 3 {
+            inbox.push(AgentInboxMessage {
+                ts_ms: index as u64,
+                peer_id: "peer-a".into(),
+                title: None,
+                text: format!("msg-{index}"),
+                truncated: false,
+            });
+        }
+        let messages = inbox.snapshot();
+        assert_eq!(
+            messages.len(),
+            AGENT_INBOX_CAPACITY,
+            "收件箱必须封顶 100 条"
+        );
+        assert_eq!(messages[0].text, "msg-3", "最老的 3 条被挤出");
+        assert_eq!(messages[messages.len() - 1].text, "msg-102");
     }
 }
