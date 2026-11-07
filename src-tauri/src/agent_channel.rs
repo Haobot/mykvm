@@ -1156,8 +1156,9 @@ fn modified_ms(metadata: &std::fs::Metadata) -> u64 {
 /// 一律 base64（不猜文本编码）。默认读 [`AGENT_FILE_READ_DEFAULT_BYTES`]，
 /// maxBytes 超过 [`AGENT_FILE_READ_MAX_BYTES`] 时**钳制**（不拒绝）；文件大于
 /// 读取上限时截断尾部——决策：读**头部**（truncate 尾部），日志类「看最新」
-/// 场景应使用 log.read；offsetRead 字段名明确这一语义。目录/不存在 → err
-/// （exists 语义属于 file.stat，调用方按「先 stat 再 read」协作）。
+/// 场景应使用 log.read；offsetRead 字段名明确这一语义。requestedBytes 回显
+/// 钳制后本次请求读取的上限（配 truncated 供调用方知晓截断）。目录/不存在
+/// → err（exists 语义属于 file.stat，调用方按「先 stat 再 read」协作）。
 fn agent_handle_file_read(
     context: &AgentCapabilityContext<'_>,
     packet: &AgentChannelPacket,
@@ -1217,6 +1218,9 @@ fn agent_handle_file_read(
     Ok(serde_json::json!({
         "contentBase64": base64::engine::general_purpose::STANDARD.encode(&content),
         "sizeBytes": metadata.len(),
+        // 本次请求读取的字节数（maxBytes 钳制后的上限）：readBytes == requestedBytes
+        // 说明读到了上限，可能还有更多。
+        "requestedBytes": max_bytes,
         "readBytes": read_bytes,
         "truncated": metadata.len() > read_bytes,
         "offsetRead": 0,
@@ -3358,6 +3362,10 @@ mod tests {
             "解码内容必须与原文件一致（不猜文本编码）"
         );
         assert_eq!(payload["sizeBytes"], 9, "sizeBytes 是文件实际大小");
+        assert_eq!(
+            payload["requestedBytes"], AGENT_FILE_READ_DEFAULT_BYTES,
+            "缺省时回显钳制后的默认读取上限"
+        );
         assert_eq!(payload["readBytes"], 9);
         assert_eq!(payload["truncated"], false);
         assert_eq!(
@@ -3383,6 +3391,10 @@ mod tests {
             "请求 2MiB 必须被钳制到恰好 1MiB"
         );
         assert_eq!(payload_2mib["sizeBytes"], 2 * 1024 * 1024);
+        assert_eq!(
+            payload_2mib["requestedBytes"], AGENT_FILE_READ_MAX_BYTES,
+            "requestedBytes 回显钳制后的上限（1MiB），而不是调用方请求的 2MiB"
+        );
         assert_eq!(payload_2mib["truncated"], true);
     }
 
