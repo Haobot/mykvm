@@ -8,7 +8,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, Mutex, OnceLock,
@@ -37,6 +37,27 @@ pub(crate) const AGENT_CAPABILITY_STATUS_GET: &str = "status.get";
 
 /// L0 能力：单向消息投递到本机收件箱（P1a）。
 pub(crate) const AGENT_CAPABILITY_MSG_SEND: &str = "msg.send";
+
+/// L0 能力：白名单根目录内 stat 文件/列目录（P1b）。
+pub(crate) const AGENT_CAPABILITY_FILE_STAT: &str = "file.stat";
+
+/// L0 能力：白名单根目录内内联读取小文件，一律 base64（P1b）。
+pub(crate) const AGENT_CAPABILITY_FILE_READ: &str = "file.read";
+
+/// L0 能力：读取本机日志尾部（P1b）。
+pub(crate) const AGENT_CAPABILITY_LOG_READ: &str = "log.read";
+
+/// file.read 的默认读取字节数（RFC §6.2：≤1MiB 内联）。
+pub(crate) const AGENT_FILE_READ_DEFAULT_BYTES: u64 = 256 * 1024;
+
+/// file.read 的参数上限：超过钳制到该值（而非拒绝）。
+pub(crate) const AGENT_FILE_READ_MAX_BYTES: u64 = 1024 * 1024;
+
+/// log.read 的默认尾部字节数。
+pub(crate) const AGENT_LOG_READ_DEFAULT_BYTES: u64 = 64 * 1024;
+
+/// log.read 的参数上限：超过钳制到该值（而非拒绝）。
+pub(crate) const AGENT_LOG_READ_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Agent 通道的用户意图配置（RFC §6.3）：开关 + 能力级别 + 白名单。
 /// 前端所有（Settings 编辑），随 layout.json 持久化；载入（normalize_saved_layout）
@@ -684,6 +705,13 @@ pub(crate) struct AgentCapabilityContext<'a> {
     pub local_peer_id: &'a str,
     /// msg.send 的落点。
     pub inbox: &'a AgentInbox,
+    /// P1b：file.stat/file.read 的默认可读根（config.file_roots 为空时兜底）。
+    /// 生产 = [本机日志目录, 文件接收根]，见 [`AgentChannelRuntime::file_roots`]；
+    /// 能力线程没有 AppHandle（Tauri 路径解析无法进测试），故照收件箱先例注入。
+    pub default_file_roots: &'a [PathBuf],
+    /// P1b：本机日志目录（log.read 在其中定位当前日志文件的唯一真相源，
+    /// 语义同 lib.rs write_own_log_tail）；None = 日志能力不可用。
+    pub log_dir: Option<&'a Path>,
 }
 
 /// capability 分发函数：按 packet.capability 执行并返回 response payload。
@@ -705,6 +733,13 @@ pub(crate) struct AgentChannelRuntime {
     pub inbox: Arc<AgentInbox>,
     /// 审计落点（RFC §5.3 对策二）。
     pub audit: Arc<AgentAuditLog>,
+    /// P1b：file.stat/file.read 的默认可读根（config.file_roots 为空时兜底）。
+    /// 生产由 lib.rs start_quic_transport 解析 [app_log_dir, file_transfer_receive_root]
+    /// 注入（能力线程无 AppHandle）；Arc 便于闭包捕获与线程转移。
+    pub file_roots: Arc<Vec<PathBuf>>,
+    /// P1b：本机日志目录（log.read 定位当前日志文件的唯一真相源目录）。
+    /// 生产 = `app.path().app_log_dir()`；None/测试不注入时 log.read 返回 err。
+    pub log_dir: Option<PathBuf>,
 }
 
 impl AgentChannelRuntime {
@@ -719,6 +754,8 @@ impl AgentChannelRuntime {
             dispatch: Arc::new(dispatch_agent_capability),
             inbox: global_agent_inbox(),
             audit: global_audit_log(),
+            file_roots: Arc::new(Vec::new()),
+            log_dir: None,
         }
     }
 }
@@ -852,6 +889,8 @@ fn handle_agent_request(
             layout: &layout,
             local_peer_id: &local_peer_id,
             inbox: &runtime.inbox,
+            default_file_roots: runtime.file_roots.as_slice(),
+            log_dir: runtime.log_dir.as_deref(),
         };
         let (status, payload, summary) = match (runtime.dispatch)(&context, &packet) {
             Ok(result) => ("ok", result, payload_summary(&packet.payload)),
@@ -987,8 +1026,8 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// 生产 capability 分发（P1a：echo + status.get + msg.send；log.read/file.*
-/// 留给 P1b）。
+/// 生产 capability 分发（P1a：echo + status.get + msg.send；P1b：file.stat/
+/// file.read/log.read）。
 fn dispatch_agent_capability(
     context: &AgentCapabilityContext<'_>,
     packet: &AgentChannelPacket,
@@ -997,6 +1036,10 @@ fn dispatch_agent_capability(
         AGENT_CAPABILITY_ECHO => Ok(packet.payload.clone()),
         AGENT_CAPABILITY_STATUS_GET => Ok(agent_status_payload(context)),
         AGENT_CAPABILITY_MSG_SEND => agent_handle_msg_send(context, packet),
+        // P1b 红灯占位：尚未实现，先返回 err（证明用例失败于「能力不存在」这一预期原因）。
+        AGENT_CAPABILITY_FILE_STAT => Err("file.stat 尚未实现".into()),
+        AGENT_CAPABILITY_FILE_READ => Err("file.read 尚未实现".into()),
+        AGENT_CAPABILITY_LOG_READ => Err("log.read 尚未实现".into()),
         other => Err(format!("未支持的 agent capability: {other}")),
     }
 }
@@ -1666,6 +1709,8 @@ mod tests {
             dispatch: Arc::new(move |context, packet| dispatch(context, packet)),
             inbox: Arc::new(AgentInbox::new()),
             audit: Arc::new(AgentAuditLog::in_memory()),
+            file_roots: Arc::new(Vec::new()),
+            log_dir: None,
         }
     }
 
@@ -2124,6 +2169,58 @@ mod tests {
         packet
     }
 
+    /// 空注入的 capability 上下文（本机 id 固定、无默认根/日志目录）。
+    /// 需要文件能力的用例改用 [`file_capability_context`] 注入临时目录。
+    fn bare_capability_context<'a>(
+        layout: &'a LayoutState,
+        inbox: &'a AgentInbox,
+    ) -> AgentCapabilityContext<'a> {
+        AgentCapabilityContext {
+            layout,
+            local_peer_id: "peer-local-1",
+            inbox,
+            default_file_roots: &[],
+            log_dir: None,
+        }
+    }
+
+    /// P1b 文件能力用例的共享状态：layout + 收件箱 + 可读根/日志目录注入。
+    /// 根与日志目录都指向沙箱（tempfile 自动清理），绝不依赖真实用户目录。
+    struct FileCapabilityFixture {
+        layout: LayoutState,
+        inbox: AgentInbox,
+        _guard: tempfile::TempDir,
+        /// 测试根（沙箱内 root/）。
+        root: PathBuf,
+    }
+
+    impl FileCapabilityFixture {
+        fn new() -> Self {
+            let guard = tempfile::tempdir().expect("创建临时目录");
+            let base = guard.path().to_path_buf();
+            let root = base.join("root");
+            std::fs::create_dir_all(&root).expect("建测试根");
+            let mut layout = test_agent_layout("server", Vec::new());
+            layout.agent_channel.file_roots = vec![root.to_string_lossy().into_owned()];
+            Self {
+                layout,
+                inbox: AgentInbox::new(),
+                _guard: guard,
+                root,
+            }
+        }
+
+        fn context(&self) -> AgentCapabilityContext<'_> {
+            AgentCapabilityContext {
+                layout: &self.layout,
+                local_peer_id: "peer-local-1",
+                inbox: &self.inbox,
+                default_file_roots: &[],
+                log_dir: None,
+            }
+        }
+    }
+
     #[test]
     fn status_get_reports_local_identity_and_agent_config() {
         let mut layout = test_agent_layout("client", Vec::new());
@@ -2131,11 +2228,7 @@ mod tests {
         layout.transport_port = 47833;
         layout.quic_port = 47834;
         let inbox = AgentInbox::new();
-        let context = AgentCapabilityContext {
-            layout: &layout,
-            local_peer_id: "peer-local-1",
-            inbox: &inbox,
-        };
+        let context = bare_capability_context(&layout, &inbox);
 
         let payload = dispatch_agent_capability(
             &context,
@@ -2181,11 +2274,7 @@ mod tests {
         layout.agent_channel.level = "root".into();
         layout.agent_channel.enabled = false;
         let inbox = AgentInbox::new();
-        let context = AgentCapabilityContext {
-            layout: &layout,
-            local_peer_id: "peer-local-1",
-            inbox: &inbox,
-        };
+        let context = bare_capability_context(&layout, &inbox);
         let payload = dispatch_agent_capability(
             &context,
             &capability_packet(AGENT_CAPABILITY_STATUS_GET, Value::Null),
@@ -2199,11 +2288,7 @@ mod tests {
     fn msg_send_stores_message_in_inbox_and_acks() {
         let layout = test_agent_layout("server", Vec::new());
         let inbox = AgentInbox::new();
-        let context = AgentCapabilityContext {
-            layout: &layout,
-            local_peer_id: "peer-local-1",
-            inbox: &inbox,
-        };
+        let context = bare_capability_context(&layout, &inbox);
 
         let ack = dispatch_agent_capability(
             &context,
@@ -2242,11 +2327,7 @@ mod tests {
     fn msg_send_rejects_empty_missing_or_non_string_text() {
         let layout = test_agent_layout("server", Vec::new());
         let inbox = AgentInbox::new();
-        let context = AgentCapabilityContext {
-            layout: &layout,
-            local_peer_id: "peer-local-1",
-            inbox: &inbox,
-        };
+        let context = bare_capability_context(&layout, &inbox);
         for payload in [
             serde_json::json!({ "text": "" }),
             serde_json::json!({ "text": "   " }),
@@ -2268,11 +2349,7 @@ mod tests {
     fn msg_send_truncates_text_over_4kib_on_char_boundary() {
         let layout = test_agent_layout("server", Vec::new());
         let inbox = AgentInbox::new();
-        let context = AgentCapabilityContext {
-            layout: &layout,
-            local_peer_id: "peer-local-1",
-            inbox: &inbox,
-        };
+        let context = bare_capability_context(&layout, &inbox);
         // 3 字节汉字 × 2000 = 6000 字节 > 4096：截断必须落在字符边界上。
         let long_text = "汉".repeat(2000);
         let ack = dispatch_agent_capability(
@@ -2354,6 +2431,8 @@ mod tests {
             dispatch: Arc::new(dispatch_agent_capability),
             inbox: Arc::new(AgentInbox::new()),
             audit: Arc::new(AgentAuditLog::in_memory()),
+            file_roots: Arc::new(Vec::new()),
+            log_dir: None,
         }
     }
 
@@ -2814,5 +2893,484 @@ mod tests {
         sender.stop_and_wait().expect("发送端停止");
         receiver.stop_and_wait().expect("拒绝端停止");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- k. P1b 只读能力：file.stat / file.read / log.read ----
+
+    impl FileCapabilityFixture {
+        /// 在根内写一个内容为 `bytes` 的文件并返回其绝对路径字符串。
+        fn write_root_file(&self, name: &str, bytes: &[u8]) -> String {
+            let path = self.root.join(name);
+            std::fs::write(&path, bytes).expect("写测试文件");
+            path.to_str().expect("测试根必须是 UTF-8").to_string()
+        }
+
+        /// 在根内建一个子目录（含中间层）并返回其绝对路径字符串。
+        fn make_root_dir(&self, relative: &str) -> String {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(&path).expect("建测试目录");
+            path.to_str().expect("测试根必须是 UTF-8").to_string()
+        }
+
+        /// 根外文件的绝对路径字符串（写入 base 下、root 外）。
+        fn outside_path(&self, name: &str) -> String {
+            let path = self._guard.path().join(name);
+            std::fs::write(&path, b"outside").expect("写根外文件");
+            path.to_str().expect("沙箱路径必须是 UTF-8").to_string()
+        }
+    }
+
+    /// 修改 fixture 的可读根为注入列表（测默认根回落路径）。
+    fn with_default_roots(context_roots: &[PathBuf]) -> Vec<PathBuf> {
+        context_roots.to_vec()
+    }
+
+    fn stat_request(path: &str) -> AgentChannelPacket {
+        capability_packet(
+            AGENT_CAPABILITY_FILE_STAT,
+            serde_json::json!({ "path": path }),
+        )
+    }
+
+    fn read_request(path: &str, max_bytes: Option<u64>) -> AgentChannelPacket {
+        capability_packet(
+            AGENT_CAPABILITY_FILE_READ,
+            match max_bytes {
+                Some(bytes) => serde_json::json!({ "path": path, "maxBytes": bytes }),
+                None => serde_json::json!({ "path": path }),
+            },
+        )
+    }
+
+    fn log_read_request(tail_bytes: Option<u64>) -> AgentChannelPacket {
+        capability_packet(
+            AGENT_CAPABILITY_LOG_READ,
+            match tail_bytes {
+                Some(bytes) => serde_json::json!({ "tailBytes": bytes }),
+                None => serde_json::json!({}),
+            },
+        )
+    }
+
+    #[test]
+    fn file_stat_reports_existing_file_fields() {
+        let fixture = FileCapabilityFixture::new();
+        let path = fixture.write_root_file("hello.txt", b"hello world");
+        let payload = dispatch_agent_capability(&fixture.context(), &stat_request(&path))
+            .expect("file.stat 根内文件必须成功");
+
+        assert_eq!(payload["exists"], true);
+        assert_eq!(payload["isFile"], true);
+        assert_eq!(payload["isDir"], false);
+        assert_eq!(payload["sizeBytes"], 11);
+        assert!(
+            payload["modifiedMs"].as_u64().unwrap_or(0) > 0,
+            "modifiedMs 必须是文件的真实 mtime 毫秒（实际 {}）",
+            payload["modifiedMs"]
+        );
+        assert_eq!(
+            payload["entries"],
+            serde_json::json!([]),
+            "文件的 entries 必须为空"
+        );
+        assert_eq!(payload["entriesTruncated"], false);
+    }
+
+    #[test]
+    fn file_stat_lists_directory_entries_sorted_with_cap() {
+        let fixture = FileCapabilityFixture::new();
+        let dir = fixture.make_root_dir("folder");
+
+        let payload = dispatch_agent_capability(&fixture.context(), &stat_request(&dir))
+            .expect("file.stat 目录必须成功");
+        assert_eq!(payload["exists"], true);
+        assert_eq!(payload["isFile"], false);
+        assert_eq!(payload["isDir"], true);
+        assert_eq!(
+            payload["entries"],
+            serde_json::json!([]),
+            "空目录 entries 为空"
+        );
+        assert_eq!(payload["entriesTruncated"], false);
+
+        // 先填一个文件再建目录：非按名称序的创建顺序，验证排序按名称。
+        fixture.write_root_file("folder/z.txt", b"z");
+        fixture.make_root_dir("folder/a-dir");
+        fixture.write_root_file("folder/m.txt", b"mm");
+        let payload = dispatch_agent_capability(&fixture.context(), &stat_request(&dir))
+            .expect("列目录必须成功");
+        let entries = payload["entries"].as_array().expect("entries 数组");
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("条目必须有 name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a-dir", "m.txt", "z.txt"],
+            "entries 必须按名称排序"
+        );
+        assert_eq!(entries[0]["isDir"], true, "目录条目标注 isDir");
+        assert_eq!(entries[0]["sizeBytes"], 0);
+        assert_eq!(entries[1]["sizeBytes"], 2, "文件条目带真实大小");
+        assert_eq!(entries[2]["isDir"], false);
+        assert_eq!(payload["entriesTruncated"], false);
+    }
+
+    #[test]
+    fn file_stat_truncates_entries_at_200() {
+        let fixture = FileCapabilityFixture::new();
+        let dir = fixture.make_root_dir("many");
+        for index in 0..250 {
+            fixture.write_root_file(&format!("many/{index:03}.txt"), b"x");
+        }
+
+        let payload = dispatch_agent_capability(&fixture.context(), &stat_request(&dir))
+            .expect("列大目录必须成功");
+        let entries = payload["entries"].as_array().expect("entries 数组");
+        assert_eq!(entries.len(), 200, "entries 必须封顶 200 条");
+        assert_eq!(entries[0]["name"], "000.txt", "截断保留名称排序的前 200 条");
+        assert_eq!(entries[199]["name"], "199.txt");
+        assert_eq!(payload["entriesTruncated"], true, "超限必须标注截断");
+    }
+
+    #[test]
+    fn file_stat_missing_path_reports_exists_false_with_zero_fields() {
+        let fixture = FileCapabilityFixture::new();
+        let missing = fixture.root.join("ghost.txt");
+        let payload = dispatch_agent_capability(
+            &fixture.context(),
+            &stat_request(missing.to_str().expect("测试路径")),
+        )
+        .expect("根内不存在的路径不算错误（调用方先 stat 再 read）");
+
+        assert_eq!(payload["exists"], false);
+        assert_eq!(payload["isFile"], false);
+        assert_eq!(payload["isDir"], false);
+        assert_eq!(payload["sizeBytes"], 0);
+        assert_eq!(payload["modifiedMs"], 0);
+        assert_eq!(payload["entries"], serde_json::json!([]));
+        assert_eq!(payload["entriesTruncated"], false);
+    }
+
+    #[test]
+    fn file_stat_rejects_paths_outside_roots() {
+        let fixture = FileCapabilityFixture::new();
+        let outside = fixture.outside_path("secret.txt");
+
+        let error = dispatch_agent_capability(&fixture.context(), &stat_request(&outside))
+            .expect_err("根外路径必须拒绝");
+        assert!(error.contains("根目录"), "错误须说明原因（实际 {error:?}）");
+
+        // `..` 穿越同样落到安全层拒绝。
+        let traversal = format!("{}/../secret.txt", fixture.root.to_str().expect("测试根"));
+        assert!(
+            dispatch_agent_capability(&fixture.context(), &stat_request(&traversal)).is_err(),
+            "`..` 穿越必须拒绝"
+        );
+
+        // 相对路径/空路径拒绝。
+        assert!(dispatch_agent_capability(&fixture.context(), &stat_request("inner.txt")).is_err());
+        assert!(dispatch_agent_capability(&fixture.context(), &stat_request("")).is_err());
+    }
+
+    #[test]
+    fn file_stat_uses_configured_roots_over_defaults() {
+        // layout 配置了根时用配置根（默认根不参与）：根外的默认目录即便存在也拒绝。
+        let fixture = FileCapabilityFixture::new();
+        let other_root = fixture._guard.path().join("other-root");
+        std::fs::create_dir_all(&other_root).expect("建另一个根");
+        let other_file = other_root.join("f.txt");
+        std::fs::write(&other_file, b"other").expect("写文件");
+
+        let payload = dispatch_agent_capability(
+            &fixture.context(),
+            &stat_request(other_file.to_str().expect("沙箱路径")),
+        )
+        .expect("另一配置根内的文件必须放行");
+        assert_eq!(payload["exists"], true);
+        assert_eq!(payload["isFile"], true);
+    }
+
+    #[test]
+    fn file_read_returns_base64_content_of_small_file() {
+        let fixture = FileCapabilityFixture::new();
+        let path = fixture.write_root_file("data.bin", b"\x00\x01\xffbinary");
+        let payload = dispatch_agent_capability(&fixture.context(), &read_request(&path, None))
+            .expect("file.read 根内小文件必须成功");
+
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload["contentBase64"].as_str().expect("contentBase64"))
+            .expect("contentBase64 必须是合法 base64");
+        assert_eq!(
+            decoded, b"\x00\x01\xffbinary",
+            "解码内容必须与原文件一致（不猜文本编码）"
+        );
+        assert_eq!(payload["sizeBytes"], 9, "sizeBytes 是文件实际大小");
+        assert_eq!(payload["readBytes"], 9);
+        assert_eq!(payload["truncated"], false);
+        assert_eq!(
+            payload["offsetRead"], 0,
+            "决策：读头部（truncate 尾部），字段名明确语义"
+        );
+    }
+
+    #[test]
+    fn file_read_clamps_oversized_max_bytes_to_1mib() {
+        // 请求 2MiB：钳制到 1MiB 放行（而非拒绝），truncated 标注供调用方知晓。
+        let fixture = FileCapabilityFixture::new();
+        let payload_2mib = dispatch_agent_capability(
+            &fixture.context(),
+            &read_request(
+                &fixture.write_root_file("big.bin", &vec![0u8; 2 * 1024 * 1024]),
+                Some(2 * 1024 * 1024),
+            ),
+        )
+        .expect("maxBytes 超上限必须钳制而非拒绝");
+        assert_eq!(
+            payload_2mib["readBytes"], AGENT_FILE_READ_MAX_BYTES,
+            "请求 2MiB 必须被钳制到恰好 1MiB"
+        );
+        assert_eq!(payload_2mib["sizeBytes"], 2 * 1024 * 1024);
+        assert_eq!(payload_2mib["truncated"], true);
+    }
+
+    #[test]
+    fn file_read_truncates_file_bigger_than_max_bytes() {
+        let fixture = FileCapabilityFixture::new();
+        let path = fixture.write_root_file("ten.bin", b"0123456789");
+        let payload = dispatch_agent_capability(&fixture.context(), &read_request(&path, Some(4)))
+            .expect("按 maxBytes 读取必须成功");
+        assert_eq!(payload["readBytes"], 4);
+        assert_eq!(payload["sizeBytes"], 10);
+        assert_eq!(payload["truncated"], true, "文件大于 maxBytes 必须标注截断");
+        assert_eq!(payload["offsetRead"], 0);
+    }
+
+    #[test]
+    fn file_read_rejects_directory_and_missing_file() {
+        let fixture = FileCapabilityFixture::new();
+        let dir = fixture.make_root_dir("a-folder");
+        let error = dispatch_agent_capability(&fixture.context(), &read_request(&dir, None))
+            .expect_err("目录必须返回 err");
+        assert!(
+            error.contains("目录"),
+            "目录错误须说明原因（实际 {error:?}）"
+        );
+
+        let missing = fixture.root.join("ghost.bin");
+        let error = dispatch_agent_capability(
+            &fixture.context(),
+            &read_request(missing.to_str().expect("测试路径"), None),
+        )
+        .expect_err("决策：read 不存在 → err 带明确信息（exists 语义属于 file.stat）");
+        assert!(
+            error.contains("不存在"),
+            "不存在错误须说明原因（实际 {error:?}）"
+        );
+    }
+
+    #[test]
+    fn file_read_rejects_paths_outside_roots() {
+        let fixture = FileCapabilityFixture::new();
+        let outside = fixture.outside_path("secret.bin");
+        assert!(
+            dispatch_agent_capability(&fixture.context(), &read_request(&outside, None)).is_err(),
+            "file.read 与 file.stat 共用同一条安全层边界"
+        );
+    }
+
+    fn log_fixture() -> (FileCapabilityFixture, PathBuf) {
+        let fixture = FileCapabilityFixture::new();
+        let log_dir = fixture._guard.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("建日志目录");
+        (fixture, log_dir)
+    }
+
+    /// 构造注入了日志目录的上下文（fixture.context() 的日志目录变体）。
+    fn log_capability_context<'a>(
+        fixture: &'a FileCapabilityFixture,
+        log_dir: &'a Path,
+    ) -> AgentCapabilityContext<'a> {
+        AgentCapabilityContext {
+            layout: &fixture.layout,
+            local_peer_id: "peer-local-1",
+            inbox: &fixture.inbox,
+            default_file_roots: &[],
+            log_dir: Some(log_dir),
+        }
+    }
+
+    #[test]
+    fn log_read_returns_tail_of_newest_log_file() {
+        let (fixture, log_dir) = log_fixture();
+        // 旧日志（更早 mtime）+ 当前日志（最新 mtime）：必须选中后者。
+        let old = log_dir.join("mykvm-old.log");
+        std::fs::write(&old, "旧轮转日志\n").expect("写旧日志");
+        let file_stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("时钟")
+            .as_secs();
+        let new = log_dir.join("mykvm.log");
+        std::fs::write(&new, "第一行\n第二行\n第三行\n").expect("写当前日志");
+
+        let payload = dispatch_agent_capability(
+            &log_capability_context(&fixture, &log_dir),
+            &log_read_request(None),
+        )
+        .expect("log.read 必须成功");
+        assert_eq!(payload["text"], "第一行\n第二行\n第三行\n");
+        assert_eq!(
+            payload["path"],
+            new.to_str().expect("沙箱路径").to_string(),
+            "必须选 mtime 最新的 .log 文件（唯一真相源语义，同 write_own_log_tail）"
+        );
+        assert_eq!(
+            payload["sizeBytes"],
+            std::fs::metadata(&new).expect("元数据").len()
+        );
+        assert_eq!(payload["truncatedFromHead"], false);
+        let _ = file_stamp;
+    }
+
+    #[test]
+    fn log_read_drops_partial_head_line_and_flags_truncation() {
+        let (fixture, log_dir) = log_fixture();
+        let mut content = "a".repeat(40) + "\n";
+        content.push_str("完整行\n不完整的尾部行");
+        std::fs::write(log_dir.join("mykvm.log"), &content).expect("写日志");
+
+        // tailBytes 恰好切到「完整行」中间：头部被切的不完整行必须丢弃并标注。
+        let payload = dispatch_agent_capability(
+            &log_capability_context(&fixture, &log_dir),
+            &log_read_request(Some(45)),
+        )
+        .expect("log.read 尾部读取必须成功");
+        assert_eq!(payload["truncatedFromHead"], true);
+        assert!(
+            payload["text"]
+                .as_str()
+                .expect("text")
+                .starts_with("完整行"),
+            "尾部必须切成完整行（实际 {:?}）",
+            payload["text"]
+        );
+    }
+
+    #[test]
+    fn log_read_clamps_tail_bytes_to_1mib() {
+        let (fixture, log_dir) = log_fixture();
+        let line = "x".repeat(99) + "\n";
+        let content = line.repeat(20_000); // ≈2MiB
+        std::fs::write(log_dir.join("mykvm.log"), &content).expect("写 2MiB 日志");
+
+        let payload = dispatch_agent_capability(
+            &log_capability_context(&fixture, &log_dir),
+            &log_read_request(Some(2 * 1024 * 1024)),
+        )
+        .expect("超限 tailBytes 必须钳制而非拒绝");
+        let text = payload["text"].as_str().expect("text");
+        assert!(
+            text.len() <= AGENT_LOG_READ_MAX_BYTES as usize,
+            "钳制后不得超过 1MiB（实际 {}）",
+            text.len()
+        );
+        assert_eq!(payload["truncatedFromHead"], true);
+        assert!(
+            text.starts_with("x"),
+            "丢弃头部残行后仍以完整行开头（实际前 20 字 {:?}）",
+            text.chars().take(20).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn log_read_errors_without_log_dir_or_log_file() {
+        let (fixture, _log_dir) = log_fixture();
+        let error = dispatch_agent_capability(&fixture.context(), &log_read_request(None))
+            .expect_err("未注入日志目录（None）必须 err 而不是 panic");
+        assert!(error.contains("日志"), "错误须说明原因（实际 {error:?}）");
+
+        let (fixture, empty_log_dir) = log_fixture();
+        // 首次运行：日志目录存在但还没有任何 .log 文件。
+        let error = dispatch_agent_capability(
+            &log_capability_context(&fixture, &empty_log_dir),
+            &log_read_request(None),
+        )
+        .expect_err("目录里没有日志文件必须 err");
+        assert!(
+            error.contains("不存在") || error.contains("日志"),
+            "错误须说明原因（实际 {error:?}）"
+        );
+    }
+
+    #[test]
+    fn log_read_survives_non_utf8_bytes_via_lossy_decoding() {
+        let (fixture, log_dir) = log_fixture();
+        let mut bytes = "正常行\n".to_string().into_bytes();
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']); // 非法 UTF-8 序列
+        bytes.extend_from_slice("尾行\n".as_bytes());
+        std::fs::write(log_dir.join("mykvm.log"), &bytes).expect("写含坏字节日志");
+
+        let payload = dispatch_agent_capability(
+            &log_capability_context(&fixture, &log_dir),
+            &log_read_request(None),
+        )
+        .expect("损坏字节必须 lossy 解码而不是报错");
+        let text = payload["text"].as_str().expect("text");
+        assert!(
+            text.contains("正常行") && text.contains("尾行"),
+            "合法内容保留"
+        );
+        assert!(
+            text.contains('\u{FFFD}'),
+            "损坏字节替换为 U+FFFD（实际 {text:?}）"
+        );
+    }
+
+    #[test]
+    fn dispatch_wires_file_log_capabilities_with_injected_context() {
+        // 接线确认：三个新能力在 dispatch 分支上可达（能力名 → 安全层 → 本机路径）。
+        let fixture = FileCapabilityFixture::new();
+        let path = fixture.write_root_file("wired.txt", b"wired");
+        let stat = dispatch_agent_capability(&fixture.context(), &stat_request(&path))
+            .expect("file.stat 分支必须接线");
+        assert_eq!(stat["exists"], true);
+        let read = dispatch_agent_capability(&fixture.context(), &read_request(&path, None))
+            .expect("file.read 分支必须接线");
+        assert_eq!(read["sizeBytes"], 5);
+    }
+
+    #[test]
+    fn default_file_roots_fallback_via_agent_file_access_layer() {
+        // config.file_roots 为空时用注入的默认根（生产 = [日志目录, 接收根]），
+        // 跨模块确认 agent_file_roots 的回落逻辑被 dispatch 消费。
+        let guard = tempfile::tempdir().expect("创建临时目录");
+        let base = guard.path().to_path_buf();
+        let log_dir = base.join("logs");
+        let transfers = base.join("transfers");
+        std::fs::create_dir_all(&log_dir).expect("建日志目录");
+        std::fs::create_dir_all(&transfers).expect("建接收根");
+        let in_transfers = transfers.join("received.txt");
+        std::fs::write(&in_transfers, b"received").expect("写接收文件");
+
+        let mut layout = test_agent_layout("server", Vec::new());
+        layout.agent_channel.file_roots = Vec::new(); // 空 = 默认根
+        let inbox = AgentInbox::new();
+        let default_roots =
+            crate::agent_file_access::default_agent_file_roots(Some(&log_dir), Some(&transfers));
+        let context = AgentCapabilityContext {
+            layout: &layout,
+            local_peer_id: "peer-local-1",
+            inbox: &inbox,
+            default_file_roots: &default_roots,
+            log_dir: None,
+        };
+
+        let payload = dispatch_agent_capability(
+            &context,
+            &stat_request(in_transfers.to_str().expect("沙箱路径")),
+        )
+        .expect("默认根内的路径必须放行");
+        assert_eq!(payload["exists"], true);
     }
 }
