@@ -109,6 +109,8 @@ struct AgentChannelPacket {
 | `status.get` | L0 | 对端运行状态（peer 快照、输入链路、halo 状态） |
 | `log.read` | L0 | 抓取对端日志（`fetch_client_log` 的推广，lib.rs:5280 先例） |
 | `file.stat` / `file.read` | L0 | 白名单目录内列目录/读文件（读走 transfer 引用） |
+
+路径安全层（P1b 实施，agent_file_access.rs）：请求必须绝对路径；规范化（解析 `..`/symlink/junction/`\\?\`）后**逐组件**限根放行。默认根 = [日志目录, `Downloads/MyKVM Transfers`（复用 `file_transfer_receive_root`）]——比「整个 Downloads」更窄更保守。额外拒绝：设备命名空间（`\\.\`）、未配置网络根时的 UNC（防借一次 stat 触发本机向任意 SMB 主机外发 NTLM 凭据）、悬空链接、不存在段中的 `..`。
 | `msg.send` | L0 | 单向通知（对端弹气泡/写收件箱） |
 | `file.write` | L1 | 写文件到白名单目录（默认项目目录 + Downloads） |
 | `cmd.run` | L2/L3 | 执行命令：L2 白名单前缀匹配 + 目录约束 + 超时 + 输出截断；L3 任意命令需对端逐次审批 |
@@ -154,8 +156,8 @@ Agent 侧工具命名建议：`peer_status` / `peer_log` / `peer_file_read` / `p
 | 阶段 | 内容 | 验收标准 |
 |---|---|---|
 | P0 协议骨架 ✅ 2026-11-07（4ed881c） | `agent_channel.rs` + 协议包 + on_stream 分支 + 鉴权 + 两段式 RPC 闭环（echo 能力）+ 跨版本混跑测试 | 双端真实 QUIC 上 echo 往返 ✓；**旧版对端收到 agent 包优雅拒绝不崩不挂起** ✓；`cargo test --lib` 515 全绿 ✓；鉴权否定路径（错 cluster/一位差 secret/白名单外/空 secret）✓ |
-| P1a 基础设施 | 异步执行模型 + `AgentChannelConfig`/level gate + 审计环形日志 + 路由函数与 input.rs 统一 + `status.get` / `msg.send` | level 不足被拒且审计记 `denied`；鉴权失败也留痕（对外仍静默）；echo 闭环在异步模型下仍绿 |
-| P1b 只读能力 | `file.stat` / `file.read`（≤1MiB 内联）/ `log.read`（尾部） | 白名单根目录外、`..` 穿越、symlink 逃逸全部拒绝；大小参数被钳制 |
+| P1a 基础设施 ✅ 2026-11-08（ab22da4） | 异步执行模型 + `AgentChannelConfig`/level gate + 审计环形日志 + 路由函数与 input.rs 统一 + `status.get` / `msg.send` | level 不足被拒且审计记 `denied` ✓；鉴权失败也留痕（对外仍静默）✓；echo 闭环在异步模型下仍绿 ✓（545 测试） |
+| P1b 只读能力 ✅ 2026-11-08（69ca131） | `file.stat` / `file.read`（≤1MiB 内联）/ `log.read`（尾部） | 白名单根目录外、`..` 穿越、junction 逃逸全部拒绝 ✓；大小参数被钳制 ✓（588 测试）。已知限制：log.read 窗口恰从行首开始时仍丢第一完整行 |
 | P1c 集成面 | Tauri 命令 + `LanPeer` 能力宣告 + `desktopApi.ts` + 最小 Settings 开关 | A 端（通过手动 invoke）能拉到 B 端日志与状态；审计记录完整；L0 为默认级别 |
 | P2 文件交换 | `file.write` + transfer_id 大载荷集成 + 进度 UI（复用 `file-transfer-progress`） | ≥100MiB 文件双向传输带进度与断点续传；与剪贴板并发不互饿（并发预算处理） |
 | P3 命令控制 | `cmd.run` L2 白名单 + L3 审批 UI + 熔断开关 | 白名单外命令被拒并审计；L3 全流程：请求→对端弹窗（完整命令可见）→批准/拒绝→结果回传；熔断后键鼠/剪贴板不受影响 |
