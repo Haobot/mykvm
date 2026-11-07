@@ -371,7 +371,13 @@ pub(crate) fn handle_agent_stream_packet(
     }
 }
 
-/// 处理 request：鉴权 → 路由 → capability 分发 → 反向新建流回 response。
+/// 处理 request：鉴权 → 路由 → 立即接受（返回 true，流 ack 即 accepted），
+/// capability 分发 + response 回发在独立线程执行。
+///
+/// 执行模型（RFC §6.3，P0 验收结论）：on_stream 回调内同步执行会占住 QUIC
+/// stream slot（并发上限 8）最长 6s，与文件传输/剪贴板互饿。本分支照 lib.rs
+/// handle_peer_request_packet 的 Log/Clipboard 先例：先在回调内完成廉价的
+/// 鉴权/路由检查，之后 `std::thread::spawn` 做真正的工作。
 /// 鉴权/路由失败照抄 clipboard 分支策略：静默 return false（对端收到 QUIC 层
 /// reject ack，不回 agent 层错误包，避免给未授权来源任何确认信息）。
 fn handle_agent_request(
@@ -388,11 +394,41 @@ fn handle_agent_request(
         return false;
     }
 
-    let (status, payload) = match (runtime.dispatch)(packet) {
-        Ok(echoed) => ("ok", echoed),
-        Err(error) => ("err", serde_json::json!({ "error": error })),
-    };
+    // spawn 前把回调依赖克隆进线程（Arc clone 是廉价引用计数）；
+    // layout 快照也随线程带走，回调线程不再持有任何本分支借用。
+    let runtime = runtime.clone();
+    let mut packet = packet.clone();
+    let layout = layout.clone();
+    let local_peer_id = local_peer_id.to_string();
+    std::thread::spawn(move || {
+        let (status, payload) = match (runtime.dispatch)(&packet) {
+            Ok(result) => ("ok", result),
+            Err(error) => ("err", serde_json::json!({ "error": error })),
+        };
+        send_agent_response(
+            &runtime,
+            &mut packet,
+            status,
+            payload,
+            &layout,
+            &local_peer_id,
+            source,
+        );
+    });
+    true
+}
 
+/// 异步线程内回发 response（两段式反向新建流）。失败只记 warn：请求已被
+/// 消费，由发起方超时兜底重试。
+fn send_agent_response(
+    runtime: &AgentChannelRuntime,
+    packet: &mut AgentChannelPacket,
+    status: &str,
+    payload: Value,
+    layout: &crate::LayoutState,
+    local_peer_id: &str,
+    source: SocketAddr,
+) {
     let transport = runtime
         .transport_slot
         .lock()
@@ -405,7 +441,7 @@ fn handle_agent_request(
             "agent: 收到 {} 请求但 QUIC transport 尚未就绪，无法回发响应",
             packet.capability
         );
-        return true;
+        return;
     };
 
     let response = AgentChannelPacket {
@@ -425,7 +461,7 @@ fn handle_agent_request(
         Ok(bytes) => bytes,
         Err(error) => {
             log::warn!("agent: 响应 {} 编码失败: {error}", packet.request_id);
-            return true;
+            return;
         }
     };
     // 反向新建流（两段式）：目标地址就是 request 的来源；证书钉扎用请求方
@@ -438,7 +474,6 @@ fn handle_agent_request(
     if let Err(error) = transport.send_stream_expect_ack(peer, encoded) {
         log::warn!("agent: 响应 {} 回发失败: {error}", packet.request_id);
     }
-    true
 }
 
 /// 处理 response：鉴权 → 按 request_id 完成 pending 等待者。
