@@ -342,6 +342,14 @@ struct LayoutState {
     /// pairing fields merged by merge_runtime_owned_layout_fields.
     #[serde(default)]
     focus_halo: halo::FocusHaloSettings,
+    /// 跨机 Agent 通道的用户意图配置（RFC §6.3，P1a）：同为前端所有，
+    /// 载入/保存路径各自钳制，不进 merge_runtime_owned_layout_fields。
+    #[serde(default = "default_agent_channel")]
+    agent_channel: agent_channel::AgentChannelConfig,
+}
+
+fn default_agent_channel() -> agent_channel::AgentChannelConfig {
+    agent_channel::default_agent_channel()
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -7144,6 +7152,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         focus_halo: halo::FocusHaloSettings::default(),
+        agent_channel: default_agent_channel(),
         devices: vec![Device {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
@@ -7194,6 +7203,7 @@ fn detect_fallback_layout() -> LayoutState {
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         focus_halo: halo::FocusHaloSettings::default(),
+        agent_channel: default_agent_channel(),
     }
 }
 
@@ -7526,6 +7536,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
         screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
         focus_halo: saved_layout.focus_halo.clone(),
+        agent_channel: saved_layout.agent_channel.clone(),
     }
 }
 
@@ -13860,6 +13871,56 @@ mod tests {
         assert_eq!(restored.input_protection, InputProtection::default());
     }
 
+    #[test]
+    fn layout_roundtrip_clamps_agent_channel_config() {
+        // P1a：agent_channel 是前端所有的用户意图配置，手改 layout.json 或
+        // 旧版快照里的非法值必须在载入（normalize_saved_layout）与保存
+        // （save_layout，经同一 sanitized）两条路径被钳回安全默认。
+        let mut saved = test_layout();
+        saved.agent_channel = agent_channel::AgentChannelConfig {
+            enabled: true,
+            level: "root".into(),
+            file_roots: vec!["  ".into(), " /tmp/a ".into(), "/tmp/a".into()],
+            cmd_whitelist: vec!["".into(), " cargo test ".into()],
+            approval_ttl_secs: 300,
+        };
+        let restored = normalize_saved_layout(saved, test_layout());
+        assert_eq!(restored.agent_channel.level, "readonly", "非法 level 必须钳回 readonly");
+        assert_eq!(
+            restored.agent_channel.file_roots,
+            vec!["/tmp/a".to_string()],
+            "file_roots 必须清洗"
+        );
+        assert_eq!(
+            restored.agent_channel.cmd_whitelist,
+            vec!["cargo test".to_string()],
+            "cmd_whitelist 必须清洗"
+        );
+
+        // 合法值必须原样保留（用户明确选择的级别不被覆盖）。
+        let mut saved = test_layout();
+        saved.agent_channel.level = "files".into();
+        let restored = normalize_saved_layout(saved, test_layout());
+        assert_eq!(restored.agent_channel.level, "files");
+    }
+
+    #[test]
+    fn layout_json_without_agent_channel_defaults_to_enabled_readonly() {
+        // 旧版 layout.json 没有该字段：序列化后剥掉 agentChannel 再反序列化，
+        // 必须落回「启用 + readonly」默认（升级路径行为可预期）。
+        let saved = test_layout();
+        let mut json = serde_json::to_value(normalized_transient_clone(&saved)).expect("序列化");
+        json.as_object_mut()
+            .expect("layout 是对象")
+            .remove("agentChannel");
+        let restored: LayoutState = serde_json::from_value(json).expect("缺字段反序列化");
+        assert_eq!(
+            restored.agent_channel,
+            agent_channel::AgentChannelConfig::default(),
+            "缺失 agentChannel 必须落回默认（enabled=true, level=readonly, TTL=300）"
+        );
+    }
+
     fn test_layout() -> LayoutState {
         LayoutState {
             lock_sync: false,
@@ -13928,6 +13989,7 @@ mod tests {
             edge_switch_hotkey: default_edge_switch_hotkey(),
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
             focus_halo: halo::FocusHaloSettings::default(),
+            agent_channel: default_agent_channel(),
         }
     }
 

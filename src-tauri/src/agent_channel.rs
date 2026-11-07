@@ -31,6 +31,58 @@ pub(crate) const AGENT_KIND_CANCEL: &str = "cancel";
 /// P0 仅有的能力：回显 payload，用于验证两段式 RPC 闭环。
 pub(crate) const AGENT_CAPABILITY_ECHO: &str = "echo";
 
+/// Agent 通道的用户意图配置（RFC §6.3）：开关 + 能力级别 + 白名单。
+/// 前端所有（Settings 编辑），随 layout.json 持久化；载入（normalize_saved_layout）
+/// 与保存（save_layout）路径各自钳制，消费点（level gate）再次兜底——
+/// 照 focus_halo「存储钳制 + 消费点 sanitized」双层先例。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct AgentChannelConfig {
+    /// 总开关（RFC §5.3 对策三）：独立于 input_mode，一键禁用不影响键鼠/剪贴板。
+    pub enabled: bool,
+    /// 能力级别："readonly"(L0) | "files"(L1) | "commands"(L2) | "full"(L3)。
+    pub level: String,
+    /// 文件白名单根目录（P1b 消费）；空 = 运行期默认 [日志目录, Downloads]。
+    pub file_roots: Vec<String>,
+    /// L2 命令白名单（P3 消费），本阶段仅定义与清洗。
+    pub cmd_whitelist: Vec<String>,
+    /// L3 审批窗口秒数（P3 消费）。
+    pub approval_ttl_secs: u64,
+}
+
+impl Default for AgentChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: "readonly".into(),
+            file_roots: Vec::new(),
+            cmd_whitelist: Vec::new(),
+            approval_ttl_secs: 300,
+        }
+    }
+}
+
+impl AgentChannelConfig {
+    /// 钳制非法值：level 越界回 "readonly"（fail closed）、白名单去空白项并
+    /// 去重排序（确定性存储）。TTL/开关不钳（布尔无越界；TTL 语义由 P3 消费时定）。
+    pub(crate) fn sanitized(&self) -> Self {
+        todo!("红灯阶段：配置钳制未实现")
+    }
+
+    /// capability 是否被当前 level 放行（映射表见 RFC §6.2 + 任务书 P1a 范围）：
+    /// echo/status.get/msg.send/log.read/file.stat/file.read ∈ L0+；
+    /// file.write ∈ L1+；cmd.run ∈ L2+；未知 capability 一律拒绝。
+    pub(crate) fn capability_allowed(&self, capability: &str) -> bool {
+        let _ = capability;
+        todo!("红灯阶段：level gate 未实现")
+    }
+}
+
+/// LayoutState serde 默认值入口（与 default_input_mode 等惯例一致）。
+pub(crate) fn default_agent_channel() -> AgentChannelConfig {
+    AgentChannelConfig::default()
+}
+
 /// Agent 通道协议包（RFC §6.1）。字段命名与既有线上包一致（camelCase），
 /// 新增字段一律带 `#[serde(default)]` 以保证向前兼容（旧解码器忽略未知字段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -534,6 +586,7 @@ mod tests {
             edge_switch_hotkey: crate::default_edge_switch_hotkey(),
             screen_switch_hotkeys: Default::default(),
             focus_halo: crate::halo::FocusHaloSettings::default(),
+            agent_channel: AgentChannelConfig::default(),
         }
     }
 
@@ -1152,5 +1205,147 @@ mod tests {
             started_at.elapsed() < Duration::from_secs(5),
             "整个用例不得被 capability 的执行时长拖满"
         );
+    }
+
+    // ---- g. AgentChannelConfig 配置与 level gate（P1a，RFC §5.3/§6.3）----
+
+    #[test]
+    fn sanitize_clamps_invalid_level_and_cleans_lists() {
+        let config = AgentChannelConfig {
+            enabled: true,
+            level: "  root  ".into(),
+            file_roots: vec![
+                "  ".into(),
+                " /tmp/downloads ".into(),
+                "/tmp/downloads".into(),
+                "/tmp/logs".into(),
+            ],
+            cmd_whitelist: vec!["cargo test".into(), "  ".into(), " cargo test ".into()],
+            approval_ttl_secs: 300,
+        };
+        let sanitized = config.sanitized();
+        assert_eq!(
+            sanitized.level, "readonly",
+            "白名单外的 level（含大小写/空白变体）必须钳制回 readonly（fail closed）"
+        );
+        assert_eq!(
+            sanitized.file_roots,
+            vec!["/tmp/downloads".to_string(), "/tmp/logs".to_string()],
+            "file_roots 必须去空白项、trim、去重并排序"
+        );
+        assert_eq!(
+            sanitized.cmd_whitelist,
+            vec!["cargo test".to_string()],
+            "cmd_whitelist 必须去空白项、trim、去重并排序"
+        );
+        assert!(sanitized.enabled, "sanitize 不得改动 enabled（布尔无越界）");
+        assert_eq!(
+            sanitized.approval_ttl_secs, 300,
+            "sanitize 不得改动 approval_ttl_secs（语义由 P3 消费时定）"
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_valid_levels_untouched() {
+        for level in ["readonly", "files", "commands", "full"] {
+            let config = AgentChannelConfig {
+                level: level.into(),
+                ..AgentChannelConfig::default()
+            };
+            assert_eq!(
+                config.sanitized().level,
+                level,
+                "合法 level {level} 必须原样保留"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_allowed_follows_level_ladder() {
+        // L0 及以上：echo/status.get/msg.send/log.read/file.stat/file.read。
+        let l0_caps = [
+            "echo",
+            "status.get",
+            "msg.send",
+            "log.read",
+            "file.stat",
+            "file.read",
+        ];
+        let readonly = AgentChannelConfig::default();
+        for capability in l0_caps {
+            assert!(
+                readonly.capability_allowed(capability),
+                "readonly(L0) 必须放行 {capability}"
+            );
+        }
+        assert!(
+            !readonly.capability_allowed("file.write"),
+            "readonly 不得放行 file.write（L1+）"
+        );
+        assert!(
+            !readonly.capability_allowed("cmd.run"),
+            "readonly 不得放行 cmd.run（L2+）"
+        );
+
+        let files = AgentChannelConfig {
+            level: "files".into(),
+            ..AgentChannelConfig::default()
+        };
+        assert!(
+            files.capability_allowed("file.write"),
+            "files(L1) 放行 file.write"
+        );
+        assert!(
+            !files.capability_allowed("cmd.run"),
+            "files(L1) 仍不得放行 cmd.run"
+        );
+
+        let commands = AgentChannelConfig {
+            level: "commands".into(),
+            ..AgentChannelConfig::default()
+        };
+        assert!(
+            commands.capability_allowed("cmd.run"),
+            "commands(L2) 放行 cmd.run"
+        );
+
+        let full = AgentChannelConfig {
+            level: "full".into(),
+            ..AgentChannelConfig::default()
+        };
+        assert!(full.capability_allowed("cmd.run"), "full(L3) 放行 cmd.run");
+
+        assert!(
+            !readonly.capability_allowed("human.ask"),
+            "未在本阶段映射表中的 capability 一律拒绝"
+        );
+        assert!(!readonly.capability_allowed(""), "空 capability 一律拒绝");
+    }
+
+    #[test]
+    fn default_config_is_enabled_readonly_and_survives_missing_fields() {
+        let default = AgentChannelConfig::default();
+        assert!(
+            default.enabled,
+            "默认必须启用通道（RFC §8 开放问题②的建议值）"
+        );
+        assert_eq!(default.level, "readonly", "默认级别必须是 L0");
+        assert!(
+            default.file_roots.is_empty(),
+            "空 file_roots = 运行期默认目录"
+        );
+        assert!(default.cmd_whitelist.is_empty());
+        assert_eq!(default.approval_ttl_secs, 300);
+
+        // layout.json 缺失整段/缺失单字段时的 serde 默认（向前兼容旧快照）。
+        let from_empty: AgentChannelConfig =
+            serde_json::from_value(serde_json::json!({})).expect("空对象反序列化");
+        assert_eq!(from_empty, default, "全字段缺失必须落回默认值");
+        let partial: AgentChannelConfig = serde_json::from_value(serde_json::json!({
+            "level": "files"
+        }))
+        .expect("部分字段反序列化");
+        assert_eq!(partial.level, "files");
+        assert!(partial.enabled, "缺失的 enabled 必须落默认 true");
     }
 }
