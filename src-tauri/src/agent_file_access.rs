@@ -9,7 +9,10 @@
 //!
 //! 根目录与日志目录一律以参数注入（不在本模块读取真实用户目录），测试注入临时目录。
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Component, Path, PathBuf, Prefix},
+};
 
 use crate::agent_channel::AgentChannelConfig;
 
@@ -19,9 +22,11 @@ pub(crate) fn agent_file_roots(
     config: &AgentChannelConfig,
     default_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
-    // 红灯脚手架：尚未实现。
-    let _ = (config, default_roots);
-    Vec::new()
+    let configured = config.sanitized().file_roots;
+    if configured.is_empty() {
+        return default_roots.to_vec();
+    }
+    configured.into_iter().map(PathBuf::from).collect()
 }
 
 /// 默认可读根的组成：[本机日志目录, 文件接收根]（缺失的项跳过）。
@@ -29,19 +34,113 @@ pub(crate) fn default_agent_file_roots(
     log_dir: Option<&Path>,
     receive_root: Option<&Path>,
 ) -> Vec<PathBuf> {
-    // 红灯脚手架：尚未实现。
-    let _ = (log_dir, receive_root);
-    Vec::new()
+    [log_dir, receive_root]
+        .into_iter()
+        .flatten()
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 /// 把对端请求的路径解析为本机可读的规范化路径；不在任何根内一律拒绝。
+///
+/// 判定顺序（前三步是纯词法、不触盘）：
+/// 1. 空路径、相对路径拒绝——相对路径的含义取决于本机进程当前目录。
+/// 2. 设备命名空间（`\\.\pipe\...` 等）拒绝；UNC 只在存在网络根时才继续——否则
+///    对端可借一次 stat 让本机向任意 SMB 主机发起连接（Windows 会自动携带 NTLM
+///    凭据），解析不可达主机还会阻塞数秒。
+/// 3. 相对根忽略（fail closed）：macOS GUI 应用的当前目录是 `/`，相对根 "." 等于
+///    整个文件系统。
+/// 4. 请求与各根都规范化（不存在的部分见 [`canonicalize_allowing_missing_tail`]），
+///    规范化结果按组件前缀（`Path::starts_with`，非字符串前缀）落在某个根内才放行。
+///    两侧都取盘上真实大小写与 verbatim 形式，Windows 大小写/`\\?\` 差异不影响判定。
+///
+/// 返回值是规范化后的路径，调用方后续一律操作它而不是原始请求。
 pub(crate) fn resolve_agent_readable_path(
     roots: &[PathBuf],
     requested: &str,
 ) -> Result<PathBuf, String> {
-    // 红灯脚手架：尚未做任何校验（原样放行），用于证明否定路径用例能够失败。
-    let _ = roots;
-    Ok(PathBuf::from(requested))
+    if requested.trim().is_empty() {
+        return Err("路径为空".into());
+    }
+    let requested_path = Path::new(requested);
+    if !requested_path.is_absolute() {
+        return Err("必须是绝对路径（Windows 需带盘符，如 C:\\...）".into());
+    }
+    let usable_roots: Vec<&PathBuf> = roots.iter().filter(|root| root.is_absolute()).collect();
+    match path_volume(requested_path) {
+        PathVolume::Device => return Err("不支持设备命名空间路径".into()),
+        PathVolume::Network
+            if !usable_roots
+                .iter()
+                .any(|root| path_volume(root) == PathVolume::Network) =>
+        {
+            return Err("路径不在允许的根目录内（未配置网络共享根）".into());
+        }
+        _ => {}
+    }
+
+    let resolved = canonicalize_allowing_missing_tail(requested_path)?;
+    let inside_some_root = usable_roots.iter().any(|root| {
+        canonicalize_allowing_missing_tail(root)
+            .is_ok_and(|canonical_root| resolved.starts_with(&canonical_root))
+    });
+    if inside_some_root {
+        Ok(resolved)
+    } else {
+        Err("路径解析后不在允许的根目录内".into())
+    }
+}
+
+/// 路径所在的「卷」类别（纯词法，看 Windows 路径前缀；Unix 路径无前缀恒为 Local）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathVolume {
+    Local,
+    Network,
+    Device,
+}
+
+fn path_volume(path: &Path) -> PathVolume {
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return PathVolume::Local;
+    };
+    match prefix.kind() {
+        Prefix::Disk(_) | Prefix::VerbatimDisk(_) => PathVolume::Local,
+        Prefix::UNC(..) | Prefix::VerbatimUNC(..) => PathVolume::Network,
+        // `\\?\GLOBALROOT\...`、`\\?\Volume{GUID}\...` 等非盘符 verbatim 形式一并按
+        // 设备处理：根经 canonicalize 后是 `\\?\C:\...` 形式，这类请求本就匹配不上。
+        Prefix::DeviceNS(_) | Prefix::Verbatim(_) => PathVolume::Device,
+    }
+}
+
+/// 规范化一个可能不存在的路径：存在 → `canonicalize()`；不存在 → `canonicalize()`
+/// 其最长的存在祖先，再拼回不存在的剩余组件（file.stat 不存在的路径据此得到
+/// exists=false 而不是报错）。
+///
+/// 两条保守规则：剩余部分只允许普通组件——`..` 落在不存在的段里时语义不可判定
+/// （Windows 词法折叠、Unix 按真实目录解析），拒绝；不存在却能 lstat 到的段是悬空
+/// 链接（或无权访问的条目），其最终指向随时可能被建出来，拒绝。
+fn canonicalize_allowing_missing_tail(path: &Path) -> Result<PathBuf, String> {
+    let mut ancestor = path.to_path_buf();
+    let mut missing_tail: Vec<OsString> = Vec::new();
+    loop {
+        if ancestor.exists() {
+            let mut resolved = ancestor
+                .canonicalize()
+                .map_err(|error| format!("路径无法规范化: {error}"))?;
+            resolved.extend(missing_tail.iter().rev());
+            return Ok(resolved);
+        }
+        if std::fs::symlink_metadata(&ancestor).is_ok() {
+            return Err("路径包含无法解析的链接（悬空链接或无权访问）".into());
+        }
+        match ancestor.components().next_back() {
+            Some(Component::Normal(name)) => {
+                missing_tail.push(name.to_os_string());
+                ancestor.pop();
+            }
+            _ => return Err("路径不存在且无法解析".into()),
+        }
+    }
 }
 
 #[cfg(test)]
