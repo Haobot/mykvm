@@ -162,7 +162,9 @@ pub(crate) struct AgentAuditEntry {
 }
 
 impl AgentAuditEntry {
-    /// 构造并截断摘要（字符边界安全，超长打省略号标记）。
+    /// 构造并封顶：peer/capability/request_id 来自未鉴权的对端（伪造包可带
+    /// 超长字段），统一按 [`AGENT_AUDIT_FIELD_MAX_CHARS`] 封顶；摘要按
+    /// [`AGENT_AUDIT_SUMMARY_MAX_CHARS`] 封顶。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         direction: &str,
@@ -176,9 +178,9 @@ impl AgentAuditEntry {
         Self {
             ts_ms: crate::now_ms(),
             direction: direction.into(),
-            peer_id: peer_id.into(),
-            capability: capability.into(),
-            request_id: request_id.into(),
+            peer_id: truncate_chars(peer_id, AGENT_AUDIT_FIELD_MAX_CHARS),
+            capability: truncate_chars(capability, AGENT_AUDIT_FIELD_MAX_CHARS),
+            request_id: truncate_chars(request_id, AGENT_AUDIT_FIELD_MAX_CHARS),
             status: status.into(),
             duration_ms,
             summary: truncate_summary(summary),
@@ -188,13 +190,15 @@ impl AgentAuditEntry {
 
 /// 摘要截断：按字符取前 [`AGENT_AUDIT_SUMMARY_MAX_CHARS`] 个，截断时补 `…`。
 pub(crate) fn truncate_summary(summary: &str) -> String {
-    if summary.chars().count() <= AGENT_AUDIT_SUMMARY_MAX_CHARS {
-        return summary.to_string();
+    truncate_chars(summary, AGENT_AUDIT_SUMMARY_MAX_CHARS)
+}
+
+/// 通用字符封顶：取前 `max_chars` 个字符，截断补 `…`（结果最多 max_chars+1）。
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
     }
-    let mut truncated: String = summary
-        .chars()
-        .take(AGENT_AUDIT_SUMMARY_MAX_CHARS)
-        .collect();
+    let mut truncated: String = text.chars().take(max_chars).collect();
     truncated.push('…');
     truncated
 }
@@ -604,42 +608,70 @@ pub(crate) fn send_agent_request(
     timeout: Duration,
     audit: &AgentAuditLog,
 ) -> Result<AgentResponse, String> {
-    let _ = audit;
-    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
-        return Err("当前设备尚未完成配对，无法使用 Agent 通道。".into());
-    }
-
+    let started = Instant::now();
     let request_id = new_request_id();
-    let rx = global_pending_table().register(request_id.clone(), timeout);
-
-    let packet = AgentChannelPacket {
-        protocol: AGENT_PROTOCOL.into(),
-        kind: AGENT_KIND_REQUEST.into(),
-        request_id: request_id.clone(),
-        origin_id: local_peer_id.into(),
-        origin_transport_public_key: local_transport_public_key.into(),
-        target_id: target_device_id.into(),
-        cluster_id: layout.cluster_id.clone(),
-        pair_secret: layout.pair_secret.clone(),
-        capability: capability.into(),
-        payload,
-        status: None,
-    };
-    let encoded = crate::encode_wire_packet(&packet)?;
-
-    // 流发送的 ack 只说明对端 handler 收下了包（≤6s）；结果本身等 response。
-    if let Err(error) = transport.send_stream_expect_ack(peer.clone(), encoded) {
-        global_pending_table().cancel(&request_id);
-        return Err(format!("agent 请求发送失败: {error}"));
-    }
-
-    match rx.recv_timeout(timeout + Duration::from_secs(1)) {
-        Ok(result) => result,
-        Err(_) => {
-            global_pending_table().cancel(&request_id);
-            Err(format!("agent 请求超时（{timeout:?}）: 未收到响应"))
+    let params = payload_summary(&payload);
+    // 审计需区分「等不到响应」(timeout) 与其它失败 (err)：标签块内各失败
+    // 路径 break 出错误，超时路径额外置位。
+    let mut timed_out = false;
+    let outcome: Result<AgentResponse, String> = 'send: {
+        if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+            break 'send Err("当前设备尚未完成配对，无法使用 Agent 通道。".into());
         }
-    }
+
+        let rx = global_pending_table().register(request_id.clone(), timeout);
+        let packet = AgentChannelPacket {
+            protocol: AGENT_PROTOCOL.into(),
+            kind: AGENT_KIND_REQUEST.into(),
+            request_id: request_id.clone(),
+            origin_id: local_peer_id.into(),
+            origin_transport_public_key: local_transport_public_key.into(),
+            target_id: target_device_id.into(),
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            capability: capability.into(),
+            payload,
+            status: None,
+        };
+        let encoded = match crate::encode_wire_packet(&packet) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                global_pending_table().cancel(&request_id);
+                break 'send Err(error);
+            }
+        };
+
+        // 流发送的 ack 只说明对端 handler 收下了包（≤6s）；结果本身等 response。
+        if let Err(error) = transport.send_stream_expect_ack(peer.clone(), encoded) {
+            global_pending_table().cancel(&request_id);
+            break 'send Err(format!("agent 请求发送失败: {error}"));
+        }
+
+        match rx.recv_timeout(timeout + Duration::from_secs(1)) {
+            Ok(result) => result,
+            Err(_) => {
+                global_pending_table().cancel(&request_id);
+                timed_out = true;
+                Err(format!("agent 请求超时（{timeout:?}）: 未收到响应"))
+            }
+        }
+    };
+
+    let (status, summary) = match &outcome {
+        Ok(_) => ("ok", params),
+        Err(message) if timed_out => ("timeout", format!("{message}；参数 {params}")),
+        Err(message) => ("err", format!("{message}；参数 {params}")),
+    };
+    audit.record(AgentAuditEntry::new(
+        "out",
+        target_device_id,
+        capability,
+        &request_id,
+        status,
+        elapsed_ms(started),
+        &summary,
+    ));
+    outcome
 }
 
 /// capability 处理器的执行上下文：一次 request 执行所需的本机信息。
@@ -710,13 +742,29 @@ pub(crate) fn handle_agent_stream_packet(
         return false;
     }
 
-    match packet.kind.as_str() {
+    let kind = packet.kind.as_str();
+    if !matches!(
+        kind,
+        AGENT_KIND_REQUEST | AGENT_KIND_RESPONSE | AGENT_KIND_CANCEL | AGENT_KIND_NOTIFY
+    ) {
+        // 未知 kind：拒绝（reject ack），为未来版本保留向前兼容语义——
+        // 旧版对任何它不认识的 kind 也是同样反应。
+        return false;
+    }
+    if !agent_packet_authorized(layout, &packet) {
+        audit_denied(
+            runtime,
+            &packet,
+            source,
+            &format!("鉴权失败（kind={kind}）"),
+        );
+        return false;
+    }
+
+    match kind {
         AGENT_KIND_REQUEST => handle_agent_request(&packet, layout, local_peer_id, runtime, source),
-        AGENT_KIND_RESPONSE => handle_agent_response(&packet, layout),
+        AGENT_KIND_RESPONSE => handle_agent_response(&packet),
         AGENT_KIND_CANCEL => {
-            if !agent_packet_authorized(layout, &packet) {
-                return false;
-            }
             if global_pending_table().cancel(&packet.request_id) {
                 log::info!(
                     "agent: 请求 {} 已被对端 {} 取消",
@@ -726,10 +774,7 @@ pub(crate) fn handle_agent_stream_packet(
             }
             true
         }
-        AGENT_KIND_NOTIFY => {
-            if !agent_packet_authorized(layout, &packet) {
-                return false;
-            }
+        _ => {
             log::info!(
                 "agent: 收到来自 {} 的通知: {}",
                 packet.origin_id,
@@ -737,21 +782,37 @@ pub(crate) fn handle_agent_stream_packet(
             );
             true
         }
-        // 未知 kind：拒绝（reject ack），为未来版本保留向前兼容语义——
-        // 旧版对任何它不认识的 kind 也是同样反应。
-        _ => false,
     }
 }
 
-/// 处理 request：鉴权 → 路由 → 立即接受（返回 true，流 ack 即 accepted），
-/// capability 分发 + response 回发在独立线程执行。
+/// 记一条 (in, denied)：summary 只含原因 + 来源地址——不碰包内凭据字段。
+fn audit_denied(
+    runtime: &AgentChannelRuntime,
+    packet: &AgentChannelPacket,
+    source: SocketAddr,
+    reason: &str,
+) {
+    runtime.audit.record(AgentAuditEntry::new(
+        "in",
+        &packet.origin_id,
+        &packet.capability,
+        &packet.request_id,
+        "denied",
+        0,
+        &format!("{reason}；来源 {source}"),
+    ));
+}
+
+/// 处理已鉴权的 request：路由 → level gate → 立即接受（返回 true，流 ack
+/// 即 accepted），capability 分发 + response 回发在独立线程执行。
 ///
 /// 执行模型（RFC §6.3，P0 验收结论）：on_stream 回调内同步执行会占住 QUIC
 /// stream slot（并发上限 8）最长 6s，与文件传输/剪贴板互饿。本分支照 lib.rs
 /// handle_peer_request_packet 的 Log/Clipboard 先例：先在回调内完成廉价的
-/// 鉴权/路由检查，之后 `std::thread::spawn` 做真正的工作。
-/// 鉴权/路由失败照抄 clipboard 分支策略：静默 return false（对端收到 QUIC 层
-/// reject ack，不回 agent 层错误包，避免给未授权来源任何确认信息）。
+/// 路由/gate 检查，之后 `std::thread::spawn` 做真正的工作。
+/// 路由/gate 失败照抄 clipboard 分支策略：静默 return false（对端收到 QUIC 层
+/// reject ack，不回 agent 层错误包，避免给对端任何确认信息）；gate 拒绝本机
+/// 审计记 denied。
 fn handle_agent_request(
     packet: &AgentChannelPacket,
     layout: &crate::LayoutState,
@@ -759,10 +820,23 @@ fn handle_agent_request(
     runtime: &AgentChannelRuntime,
     source: SocketAddr,
 ) -> bool {
-    if !agent_packet_authorized(layout, packet) {
+    if !agent_packet_targets_local(layout, packet, local_peer_id) {
         return false;
     }
-    if !agent_packet_targets_local(layout, packet, local_peer_id) {
+    // 消费点再钳一次（照 focus_halo「存储钳制 + 消费点 sanitized」）：即便
+    // layout 快照绕过了载入/保存钳制，非法 level 也按 readonly 判定。
+    let config = layout.agent_channel.sanitized();
+    if !config.enabled {
+        audit_denied(runtime, packet, source, "agent 通道已关闭");
+        return false;
+    }
+    if !config.capability_allowed(&packet.capability) {
+        audit_denied(
+            runtime,
+            packet,
+            source,
+            &format!("级别 {} 不允许该能力", config.level),
+        );
         return false;
     }
 
@@ -773,15 +847,29 @@ fn handle_agent_request(
     let layout = layout.clone();
     let local_peer_id = local_peer_id.to_string();
     std::thread::spawn(move || {
+        let started = Instant::now();
         let context = AgentCapabilityContext {
             layout: &layout,
             local_peer_id: &local_peer_id,
             inbox: &runtime.inbox,
         };
-        let (status, payload) = match (runtime.dispatch)(&context, &packet) {
-            Ok(result) => ("ok", result),
-            Err(error) => ("err", serde_json::json!({ "error": error })),
+        let (status, payload, summary) = match (runtime.dispatch)(&context, &packet) {
+            Ok(result) => ("ok", result, payload_summary(&packet.payload)),
+            Err(error) => (
+                "err",
+                serde_json::json!({ "error": error }),
+                format!("{error}；参数 {}", payload_summary(&packet.payload)),
+            ),
         };
+        runtime.audit.record(AgentAuditEntry::new(
+            "in",
+            &packet.origin_id,
+            &packet.capability,
+            &packet.request_id,
+            status,
+            elapsed_ms(started),
+            &summary,
+        ));
         send_agent_response(
             &runtime,
             &packet,
@@ -795,8 +883,8 @@ fn handle_agent_request(
     true
 }
 
-/// 异步线程内回发 response（两段式反向新建流）。失败只记 warn：请求已被
-/// 消费，由发起方超时兜底重试。
+/// 异步线程内回发 response（两段式反向新建流），结果记一条 out 审计。
+/// 失败只记 warn + 审计 err：请求已被消费，由发起方超时兜底重试。
 fn send_agent_response(
     runtime: &AgentChannelRuntime,
     packet: &AgentChannelPacket,
@@ -806,20 +894,50 @@ fn send_agent_response(
     local_peer_id: &str,
     source: SocketAddr,
 ) {
+    let started = Instant::now();
+    let result = deliver_agent_response(
+        runtime,
+        packet,
+        status,
+        payload,
+        layout,
+        local_peer_id,
+        source,
+    );
+    let (audit_status, summary) = match &result {
+        Ok(()) => ("ok", format!("response({status}) 已回发至 {source}")),
+        Err(error) => {
+            log::warn!("agent: 响应 {} 回发失败: {error}", packet.request_id);
+            ("err", format!("response({status}) 回发失败：{error}"))
+        }
+    };
+    runtime.audit.record(AgentAuditEntry::new(
+        "out",
+        &packet.origin_id,
+        &packet.capability,
+        &packet.request_id,
+        audit_status,
+        elapsed_ms(started),
+        &summary,
+    ));
+}
+
+fn deliver_agent_response(
+    runtime: &AgentChannelRuntime,
+    packet: &AgentChannelPacket,
+    status: &str,
+    payload: Value,
+    layout: &crate::LayoutState,
+    local_peer_id: &str,
+    source: SocketAddr,
+) -> Result<(), String> {
+    // transport 槽位尚空（启动竞态窗口）：请求已消费但响应无法回发。
     let transport = runtime
         .transport_slot
         .lock()
         .ok()
-        .and_then(|slot| slot.clone());
-    let Some(transport) = transport else {
-        // transport 槽位尚空（启动竞态窗口）：请求已消费但响应无法回发，
-        // 由发起方超时兜底重试。
-        log::warn!(
-            "agent: 收到 {} 请求但 QUIC transport 尚未就绪，无法回发响应",
-            packet.capability
-        );
-        return;
-    };
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| "QUIC transport 尚未就绪".to_string())?;
 
     let response = AgentChannelPacket {
         protocol: AGENT_PROTOCOL.into(),
@@ -834,13 +952,7 @@ fn send_agent_response(
         payload,
         status: Some(status.into()),
     };
-    let encoded = match crate::encode_wire_packet(&response) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            log::warn!("agent: 响应 {} 编码失败: {error}", packet.request_id);
-            return;
-        }
-    };
+    let encoded = crate::encode_wire_packet(&response)?;
     // 反向新建流（两段式）：目标地址就是 request 的来源；证书钉扎用请求方
     // 自报的 transport 公钥。响应包带齐鉴权三件套（RFC §8 对策四：双向都不裸信任）。
     let peer = transport.peer(
@@ -848,17 +960,12 @@ fn send_agent_response(
         packet.origin_transport_public_key.clone(),
         crate::quic_transport::PROTOCOL_VERSION,
     );
-    if let Err(error) = transport.send_stream_expect_ack(peer, encoded) {
-        log::warn!("agent: 响应 {} 回发失败: {error}", packet.request_id);
-    }
+    transport.send_stream_expect_ack(peer, encoded)
 }
 
-/// 处理 response：鉴权 → 按 request_id 完成 pending 等待者。
+/// 处理已鉴权的 response：按 request_id 完成 pending 等待者。
 /// 查无此 id（超时回收/重放/重复响应）→ 拒绝（RFC §8 对策四）。
-fn handle_agent_response(packet: &AgentChannelPacket, layout: &crate::LayoutState) -> bool {
-    if !agent_packet_authorized(layout, packet) {
-        return false;
-    }
+fn handle_agent_response(packet: &AgentChannelPacket) -> bool {
     let status = packet.status.clone().unwrap_or_else(|| "err".into());
     let result = if status == "ok" {
         Ok(AgentResponse {

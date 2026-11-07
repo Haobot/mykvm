@@ -6322,6 +6322,9 @@ pub fn run() {
                     config_dir.display()
                 )
             })?;
+            // Agent 通道审计落盘到配置目录（RFC §5.3 对策二）：必须先于任何
+            // QUIC transport 启动（其 on_stream 闭包取用全局审计实例）。
+            agent_channel::init_global_audit_log(&config_dir);
 
             let detected_layout = detect_local_layout(app.handle());
             let runtime = AppRuntime::new(
