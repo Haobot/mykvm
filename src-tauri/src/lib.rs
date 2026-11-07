@@ -949,6 +949,10 @@ impl AppRuntime {
         let peers_for_pairing = Arc::clone(&self.peers);
         let layout_for_halo_focus = Arc::clone(&self.layout);
         let transport_packets_for_halo_focus = Arc::clone(&self.transport_packets);
+        // Agent 通道（RFC §6.3）的响应回发槽位：on_stream 闭包先于 transport
+        // 创建，只能捕获槽位；transport 就绪后填充（见下方 start 之后）。
+        let agent_transport_slot = Arc::new(Mutex::new(None::<quic_transport::TransportHandle>));
+        let agent_transport_slot_for_stream = Arc::clone(&agent_transport_slot);
 
         // P4 cross-machine focus: install the receive hook once at transport
         // startup. The hook is the only place that turns an authorized halo
@@ -1010,6 +1014,20 @@ impl AppRuntime {
                 layout.clone()
             };
             let current_peer = local_peer_from_layout(&layout);
+
+            // Agent 通道（mykvm.agent.v1）：request/response/cancel/notify。
+            // decode 失败或鉴权不过返回 false，交回调度链——旧版对端收到
+            // agent 包在各分支 decode 失败最终同样落到 reject ack（RFC §4）。
+            if agent_channel::handle_agent_stream_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &agent_transport_slot_for_stream,
+                source,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
 
             if handle_drag_control_packet(&payload, &layout, &current_peer.id) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
@@ -1076,6 +1094,11 @@ impl AppRuntime {
             .unwrap_or_else(|| PathBuf::from("."));
         let transport =
             quic_transport::start(preferred_port, identity_dir, on_datagram, on_stream)?;
+        // transport 就绪后填充 agent 通道的响应回发槽位。填充前到达的
+        // agent request 会记 warn 并放弃回发（发起方超时兜底）。
+        if let Ok(mut slot) = agent_transport_slot.lock() {
+            *slot = Some(transport.clone());
+        }
         let mut stored = self
             .quic_transport
             .lock()

@@ -302,9 +302,147 @@ pub(crate) fn handle_agent_stream_packet(
     transport_slot: &std::sync::Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
     source: SocketAddr,
 ) -> bool {
-    let _ = (payload, layout, local_peer_id, transport_slot, source);
-    // 红灯阶段：request/response/cancel/notify 分支未接线（绿灯 commit 实现）。
-    false
+    let Some(packet) = crate::decode_wire_packet::<AgentChannelPacket>(payload) else {
+        return false;
+    };
+    if packet.protocol != AGENT_PROTOCOL {
+        return false;
+    }
+
+    match packet.kind.as_str() {
+        AGENT_KIND_REQUEST => {
+            handle_agent_request(&packet, layout, local_peer_id, transport_slot, source)
+        }
+        AGENT_KIND_RESPONSE => handle_agent_response(&packet, layout),
+        AGENT_KIND_CANCEL => {
+            if !agent_packet_authorized(layout, &packet) {
+                return false;
+            }
+            if global_pending_table().cancel(&packet.request_id) {
+                log::info!(
+                    "agent: 请求 {} 已被对端 {} 取消",
+                    packet.request_id,
+                    packet.origin_id
+                );
+            }
+            true
+        }
+        AGENT_KIND_NOTIFY => {
+            if !agent_packet_authorized(layout, &packet) {
+                return false;
+            }
+            log::info!(
+                "agent: 收到来自 {} 的通知: {}",
+                packet.origin_id,
+                packet.payload
+            );
+            true
+        }
+        // 未知 kind：拒绝（reject ack），为未来版本保留向前兼容语义——
+        // 旧版对任何它不认识的 kind 也是同样反应。
+        _ => false,
+    }
+}
+
+/// 处理 request：鉴权 → 路由 → capability 分发 → 反向新建流回 response。
+/// 鉴权/路由失败照抄 clipboard 分支策略：静默 return false（对端收到 QUIC 层
+/// reject ack，不回 agent 层错误包，避免给未授权来源任何确认信息）。
+fn handle_agent_request(
+    packet: &AgentChannelPacket,
+    layout: &crate::LayoutState,
+    local_peer_id: &str,
+    transport_slot: &std::sync::Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
+    source: SocketAddr,
+) -> bool {
+    if !agent_packet_authorized(layout, packet) {
+        return false;
+    }
+    if !agent_packet_targets_local(layout, packet, local_peer_id) {
+        return false;
+    }
+
+    let (status, payload) = match dispatch_agent_capability(packet) {
+        Ok(echoed) => ("ok", echoed),
+        Err(error) => ("err", serde_json::json!({ "error": error })),
+    };
+
+    let transport = transport_slot.lock().ok().and_then(|slot| slot.clone());
+    let Some(transport) = transport else {
+        // transport 槽位尚空（启动竞态窗口）：请求已消费但响应无法回发，
+        // 由发起方超时兜底重试。
+        log::warn!(
+            "agent: 收到 {} 请求但 QUIC transport 尚未就绪，无法回发响应",
+            packet.capability
+        );
+        return true;
+    };
+
+    let response = AgentChannelPacket {
+        protocol: AGENT_PROTOCOL.into(),
+        kind: AGENT_KIND_RESPONSE.into(),
+        request_id: packet.request_id.clone(),
+        origin_id: local_peer_id.into(),
+        origin_transport_public_key: transport.public_key().to_string(),
+        target_id: packet.origin_id.clone(),
+        cluster_id: layout.cluster_id.clone(),
+        pair_secret: layout.pair_secret.clone(),
+        capability: packet.capability.clone(),
+        payload,
+        status: Some(status.into()),
+    };
+    let encoded = match crate::encode_wire_packet(&response) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::warn!("agent: 响应 {} 编码失败: {error}", packet.request_id);
+            return true;
+        }
+    };
+    // 反向新建流（两段式）：目标地址就是 request 的来源；证书钉扎用请求方
+    // 自报的 transport 公钥。响应包带齐鉴权三件套（RFC §8 对策四：双向都不裸信任）。
+    let peer = transport.peer(
+        source.to_string(),
+        packet.origin_transport_public_key.clone(),
+        crate::quic_transport::PROTOCOL_VERSION,
+    );
+    if let Err(error) = transport.send_stream_expect_ack(peer, encoded) {
+        log::warn!("agent: 响应 {} 回发失败: {error}", packet.request_id);
+    }
+    true
+}
+
+/// 处理 response：鉴权 → 按 request_id 完成 pending 等待者。
+/// 查无此 id（超时回收/重放/重复响应）→ 拒绝（RFC §8 对策四）。
+fn handle_agent_response(packet: &AgentChannelPacket, layout: &crate::LayoutState) -> bool {
+    if !agent_packet_authorized(layout, packet) {
+        return false;
+    }
+    let status = packet.status.clone().unwrap_or_else(|| "err".into());
+    let result = if status == "ok" {
+        Ok(AgentResponse {
+            status,
+            payload: packet.payload.clone(),
+        })
+    } else {
+        Err(agent_error_message(&packet.payload, &status))
+    };
+    global_pending_table().resolve(&packet.request_id, result)
+}
+
+/// P0 capability 分发：仅 echo（原样回 payload）。
+fn dispatch_agent_capability(packet: &AgentChannelPacket) -> Result<Value, String> {
+    match packet.capability.as_str() {
+        AGENT_CAPABILITY_ECHO => Ok(packet.payload.clone()),
+        other => Err(format!("未支持的 agent capability: {other}")),
+    }
+}
+
+/// 从 err/denied 响应的 payload 提取人读错误消息。
+fn agent_error_message(payload: &Value, status: &str) -> String {
+    payload
+        .get("error")
+        .and_then(|value| value.as_str())
+        .map(Into::into)
+        .unwrap_or_else(|| format!("对端返回 {status}"))
 }
 
 #[cfg(test)]
@@ -562,6 +700,27 @@ mod tests {
         Some(forged)
     }
 
+    #[test]
+    fn request_targets_local_via_local_device_entry() {
+        let mut layout = test_agent_layout("client", Vec::new());
+        layout.devices = vec![test_local_device("local-new-id")];
+        let mut packet = authorized_packet("controller-1", "peer-key-1");
+
+        // devices 里 role="local" 的条目命中 → 落本机
+        packet.target_id = "local-new-id".into();
+        assert!(
+            agent_packet_targets_local(&layout, &packet, "local-current-id"),
+            "devices 本机条目必须命中路由"
+        );
+
+        // 不属于本机历史 id、不在 devices → 不落本机（多客户端路由消歧）
+        packet.target_id = "peer-zzz-not-this-host-999".into();
+        assert!(
+            !agent_packet_targets_local(&layout, &packet, "local-current-id"),
+            "无关目标 id 不得被本机接收"
+        );
+    }
+
     // ---- c. Pending 表 ----
 
     #[test]
@@ -663,19 +822,56 @@ mod tests {
         ))
     }
 
+    /// 测试期把 log crate 的 warn/info 打到 stderr：QUIC/agent 通道的失败
+    /// 路径只写 log::warn，不打开 logger 就无法定位闭环断点。
+    fn init_test_logger() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            struct StderrLogger;
+            impl log::Log for StderrLogger {
+                fn enabled(&self, metadata: &log::Metadata) -> bool {
+                    metadata.level() <= log::Level::Info
+                }
+                fn log(&self, record: &log::Record) {
+                    eprintln!("[{}] {}", record.level(), record.args());
+                }
+                fn flush(&self) {}
+            }
+            let _ = log::set_boxed_logger(Box::new(StderrLogger));
+            log::set_max_level(log::LevelFilter::Info);
+        });
+    }
+
     #[test]
     fn agent_echo_roundtrip_over_real_quic_loopback() {
+        init_test_logger();
         let dir = temp_identity_dir("echo");
         let _ = std::fs::remove_dir_all(&dir);
 
         // 发起端 A：先起，拿到稳定 transport 公钥供 B 钉扎/白名单。
+        // A 的 on_stream 同样走生产接线（response 分支按 request_id 完成
+        // pending 等待者）——发起方也是完整接线的端点，不是哑管道。
+        let layout_a = test_agent_layout("server", Vec::new());
+        let slot_a: Arc<Mutex<Option<quic_transport::TransportHandle>>> =
+            Arc::new(Mutex::new(None));
+        let slot_for_a = Arc::clone(&slot_a);
+        let layout_for_a_stream = layout_a.clone();
         let sender = quic_transport::start(
             free_quic_port(),
             dir.join("sender"),
             Arc::new(|_, _| {}),
-            Arc::new(|_, _| true),
+            Arc::new(move |payload: Vec<u8>, source: SocketAddr| {
+                handle_agent_stream_packet(
+                    &payload,
+                    &layout_for_a_stream,
+                    "peer-a",
+                    &slot_for_a,
+                    source,
+                )
+            }),
         )
         .expect("发起端 transport 启动");
+        *slot_a.lock().expect("发起端槽位锁") = Some(sender.clone());
 
         // 受控端 B：client 角色 + 白名单只认 A（走最严格的鉴权路径）。
         let layout_b = test_agent_layout(
@@ -704,7 +900,6 @@ mod tests {
             receiver.public_key().into(),
             quic_transport::PROTOCOL_VERSION,
         );
-        let layout_a = test_agent_layout("server", Vec::new());
         let result = send_agent_request(
             &sender,
             &peer,
