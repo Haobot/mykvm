@@ -66,16 +66,61 @@ impl AgentChannelConfig {
     /// 钳制非法值：level 越界回 "readonly"（fail closed）、白名单去空白项并
     /// 去重排序（确定性存储）。TTL/开关不钳（布尔无越界；TTL 语义由 P3 消费时定）。
     pub(crate) fn sanitized(&self) -> Self {
-        todo!("红灯阶段：配置钳制未实现")
+        Self {
+            enabled: self.enabled,
+            level: normalize_agent_level(&self.level),
+            file_roots: clean_string_list(&self.file_roots),
+            cmd_whitelist: clean_string_list(&self.cmd_whitelist),
+            approval_ttl_secs: self.approval_ttl_secs,
+        }
     }
 
     /// capability 是否被当前 level 放行（映射表见 RFC §6.2 + 任务书 P1a 范围）：
     /// echo/status.get/msg.send/log.read/file.stat/file.read ∈ L0+；
     /// file.write ∈ L1+；cmd.run ∈ L2+；未知 capability 一律拒绝。
     pub(crate) fn capability_allowed(&self, capability: &str) -> bool {
-        let _ = capability;
-        todo!("红灯阶段：level gate 未实现")
+        let level = agent_level_number(&self.level);
+        match capability {
+            "echo" | "status.get" | "msg.send" | "log.read" | "file.stat" | "file.read" => {
+                level >= 0
+            }
+            "file.write" => level >= 1,
+            "cmd.run" => level >= 2,
+            _ => false,
+        }
     }
+}
+
+/// level 字符串 → 序数（L0-L3）。非法值（含大小写/空白变体）一律按 L0 处理：
+/// gate 的消费点会先 sanitized，这里是第二道 fail closed 兜底。
+fn agent_level_number(level: &str) -> i8 {
+    match level.trim() {
+        "files" => 1,
+        "commands" => 2,
+        "full" => 3,
+        _ => 0,
+    }
+}
+
+fn normalize_agent_level(level: &str) -> String {
+    match level.trim() {
+        "files" => "files".into(),
+        "commands" => "commands".into(),
+        "full" => "full".into(),
+        _ => "readonly".into(),
+    }
+}
+
+/// 白名单清洗：trim、去空白项、排序去重（排序保证落盘内容确定、可 diff）。
+fn clean_string_list(values: &[String]) -> Vec<String> {
+    let mut cleaned: Vec<String> = values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    cleaned.sort();
+    cleaned.dedup();
+    cleaned
 }
 
 /// LayoutState serde 默认值入口（与 default_input_mode 等惯例一致）。

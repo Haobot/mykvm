@@ -1841,6 +1841,9 @@ fn save_layout(
         // (no merge from `current`); a hand-edited snapshot must still be
         // clamped back into range before it reaches disk or the overlay.
         saved_layout.focus_halo = saved_layout.focus_halo.sanitized();
+        // agent_channel 同为前端所有：保存路径钳制非法 level / 清洗白名单，
+        // 与载入路径（normalize_saved_layout）互为防线。
+        saved_layout.agent_channel = saved_layout.agent_channel.sanitized();
         if let Err(error) = validate_shared_hotkeys(&saved_layout) {
             log::warn!("save_layout: hotkey validation rejected the save: {error}");
             return Err(error);
@@ -7536,7 +7539,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
         screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
         focus_halo: saved_layout.focus_halo.clone(),
-        agent_channel: saved_layout.agent_channel.clone(),
+        agent_channel: saved_layout.agent_channel.sanitized(),
     }
 }
 

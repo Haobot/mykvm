@@ -216,6 +216,8 @@ export interface LayoutState {
   edgeSwitchHotkey: string
   screenSwitchHotkeys: ScreenSwitchHotkeys
   focusHalo?: FocusHaloSettings
+  /** 跨机 Agent 通道配置；旧快照缺省时后端落默认（enabled=true, readonly）。 */
+  agentChannel?: AgentChannelConfig
 }
 
 export interface InputProtection {
@@ -223,4 +225,19 @@ export interface InputProtection {
   protectFullscreen: boolean
   blockedApplications: string[]
   lockHotkey: string
+}
+
+/** 跨机 Agent 通道能力级别（RFC §5.3 L0-L3；P1a 仅 readonly 生效）。 */
+export type AgentChannelLevel = 'readonly' | 'files' | 'commands' | 'full'
+
+/** Mirrors the Rust `agent_channel::AgentChannelConfig` (serde camelCase)。 */
+export interface AgentChannelConfig {
+  enabled: boolean
+  level: AgentChannelLevel
+  /** 文件白名单根目录；空 = 运行期默认 [日志目录, Downloads]。 */
+  fileRoots: string[]
+  /** L2 命令白名单（P3 消费）。 */
+  cmdWhitelist: string[]
+  /** L3 审批窗口秒数（P3 消费）。 */
+  approvalTtlSecs: number
 }
