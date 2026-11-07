@@ -292,9 +292,26 @@ pub(crate) fn send_agent_request(
     }
 }
 
+/// on_stream 的 agent 分支入口（lib.rs 调度链在 pairing 之后、drag 之前调用）。
+/// 返回 true = 该包属于 agent 协议且已处理；false = 交回调度链继续尝试
+/// （decode 失败/协议不符/鉴权失败——与 clipboard 分支相同的静默拒绝策略）。
+pub(crate) fn handle_agent_stream_packet(
+    payload: &[u8],
+    layout: &crate::LayoutState,
+    local_peer_id: &str,
+    transport_slot: &std::sync::Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
+    source: SocketAddr,
+) -> bool {
+    let _ = (payload, layout, local_peer_id, transport_slot, source);
+    // 红灯阶段：request/response/cancel/notify 分支未接线（绿灯 commit 实现）。
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::{quic_transport, Device, LayoutState, PairedController};
 
     const TEST_CLUSTER: &str = "cluster-test";
@@ -625,5 +642,145 @@ mod tests {
             "request_id 必须唯一（单调计数保证顺序、nonce 防碰撞）"
         );
         assert!(a.contains('-'), "格式应为 计数-nonce");
+    }
+
+    // ---- d/e. QUIC 真实闭环（复用 quic_transport.rs tests 的双端 loopback 模式：
+    // 127.0.0.1 随机端口 + 独立临时身份目录 + 互相持证书钉扎）----
+
+    fn free_quic_port() -> u16 {
+        std::net::UdpSocket::bind(("127.0.0.1", 0))
+            .expect("预留随机端口")
+            .local_addr()
+            .expect("读取随机端口")
+            .port()
+    }
+
+    fn temp_identity_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mykvm-agent-{tag}-{}-{}",
+            std::process::id(),
+            free_quic_port()
+        ))
+    }
+
+    #[test]
+    fn agent_echo_roundtrip_over_real_quic_loopback() {
+        let dir = temp_identity_dir("echo");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 发起端 A：先起，拿到稳定 transport 公钥供 B 钉扎/白名单。
+        let sender = quic_transport::start(
+            free_quic_port(),
+            dir.join("sender"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        )
+        .expect("发起端 transport 启动");
+
+        // 受控端 B：client 角色 + 白名单只认 A（走最严格的鉴权路径）。
+        let layout_b = test_agent_layout(
+            "client",
+            vec![test_controller("peer-a", sender.public_key())],
+        );
+        let slot_b: Arc<Mutex<Option<quic_transport::TransportHandle>>> =
+            Arc::new(Mutex::new(None));
+        let slot_for_stream = Arc::clone(&slot_b);
+        let receiver = quic_transport::start(
+            free_quic_port(),
+            dir.join("receiver"),
+            Arc::new(|_, _| {}),
+            // 生产等价分支：on_stream 的 agent 处理入口（layout 快照 + 本机 id +
+            // transport 槽位 + 来源地址，与 lib.rs 接线形态一致）。
+            Arc::new(move |payload: Vec<u8>, source: SocketAddr| {
+                handle_agent_stream_packet(&payload, &layout_b, "peer-b", &slot_for_stream, source)
+            }),
+        )
+        .expect("受控端 transport 启动");
+        // 生产 start_quic_transport 同款时序：transport 就绪后把 handle 填进槽位。
+        *slot_b.lock().expect("槽位锁") = Some(receiver.clone());
+
+        let peer = sender.peer(
+            format!("127.0.0.1:{}", receiver.port()),
+            receiver.public_key().into(),
+            quic_transport::PROTOCOL_VERSION,
+        );
+        let layout_a = test_agent_layout("server", Vec::new());
+        let result = send_agent_request(
+            &sender,
+            &peer,
+            &layout_a,
+            "peer-a",
+            sender.public_key(),
+            "peer-b",
+            AGENT_CAPABILITY_ECHO,
+            serde_json::json!({ "ping": 42 }),
+            Duration::from_secs(15),
+        );
+
+        let response = result.expect("echo 往返必须成功");
+        assert_eq!(response.status, "ok", "echo 的 response 必须 status=ok");
+        assert_eq!(
+            response.payload,
+            serde_json::json!({ "ping": 42 }),
+            "echo 必须原样返回 payload"
+        );
+
+        sender.stop_and_wait().expect("发起端停止");
+        receiver.stop_and_wait().expect("受控端停止");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_peer_rejects_agent_packet_gracefully() {
+        // 旧版等价物：调度链各分支对 mykvm.agent.v1 包全部 decode 失败 →
+        // on_stream 返回 false → QUIC 层回 reject ack。锁定三条性质：
+        // 发送方收到 STREAM_REJECTED 错误（不挂起）、对端不 panic、
+        // accept 循环不被阻塞（后续流仍被正常处理）。
+        let dir = temp_identity_dir("legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let receiver = quic_transport::start(
+            free_quic_port(),
+            dir.join("receiver"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| false),
+        )
+        .expect("旧版等价端 transport 启动");
+        let sender = quic_transport::start(
+            free_quic_port(),
+            dir.join("sender"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        )
+        .expect("发送端 transport 启动");
+
+        let peer = sender.peer(
+            format!("127.0.0.1:{}", receiver.port()),
+            receiver.public_key().into(),
+            quic_transport::PROTOCOL_VERSION,
+        );
+        let packet = authorized_packet("peer-a", sender.public_key());
+        let bytes = crate::encode_wire_packet(&packet).expect("agent 包编码");
+
+        let first = sender.send_stream_expect_ack(peer.clone(), bytes.clone());
+        assert!(
+            first
+                .unwrap_err()
+                .starts_with(quic_transport::STREAM_REJECTED),
+            "旧版对端必须以 reject ack 拒绝 agent 包，发送方不得挂起"
+        );
+
+        // accept 循环未被阻塞：第二条流仍被正常处理（同样 reject，而非挂起/断连）。
+        let second = sender.send_stream_expect_ack(peer.clone(), bytes);
+        assert!(
+            second
+                .unwrap_err()
+                .starts_with(quic_transport::STREAM_REJECTED),
+            "拒绝后续的流必须仍被 accept 并处理，对端不得卡死"
+        );
+
+        sender.stop_and_wait().expect("发送端停止");
+        receiver.stop_and_wait().expect("旧版等价端停止");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
