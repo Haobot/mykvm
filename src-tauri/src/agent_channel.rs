@@ -353,9 +353,15 @@ impl AgentInbox {
         }
     }
 
+    /// 投递一条消息（超限挤最老）。
     pub(crate) fn push(&self, message: AgentInboxMessage) {
-        let _ = message;
-        todo!("红灯阶段：收件箱投递未实现")
+        let Ok(mut messages) = self.messages.lock() else {
+            return;
+        };
+        if messages.len() >= AGENT_INBOX_CAPACITY {
+            messages.pop_front();
+        }
+        messages.push_back(message);
     }
 
     /// 收件箱快照（按时间升序）。生产读取方是 P1c 的 Tauri 命令，P1a 只有
@@ -363,7 +369,10 @@ impl AgentInbox {
     /// 下的 dead_code。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> Vec<AgentInboxMessage> {
-        todo!("红灯阶段：收件箱读取未实现")
+        self.messages
+            .lock()
+            .map(|messages| messages.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -853,18 +862,68 @@ fn dispatch_agent_capability(
     }
 }
 
-/// status.get 的响应体（RFC §6.2 L0）：本机身份/配置快照。全部来源只读。
+/// status.get 的响应体（RFC §6.2 L0）：本机身份/配置快照。全部来源只读：
+/// layout 快照 + crate::hostname()/current_platform() + 与 LanPeer 宣告同源的
+/// APP_VERSION（setup 写入，未写入时兜底 CARGO_PKG_VERSION）。
+/// agent 级别汇报 sanitized 后的**有效**级别（与 gate 判定一致）。
 fn agent_status_payload(context: &AgentCapabilityContext<'_>) -> Value {
-    todo!("红灯阶段：status.get 未实现")
+    let layout = context.layout;
+    let agent = layout.agent_channel.sanitized();
+    serde_json::json!({
+        "machineRole": layout.machine_role,
+        "inputMode": layout.input_mode,
+        "agentEnabled": agent.enabled,
+        "agentLevel": agent.level,
+        "platform": crate::current_platform(),
+        "hostname": crate::hostname().unwrap_or_default(),
+        "deviceId": context.local_peer_id,
+        "appVersion": crate::APP_VERSION
+            .get()
+            .cloned()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        "quicPort": crate::normalize_quic_port(layout.transport_port, layout.quic_port),
+    })
 }
 
 /// msg.send：payload { text, title? } → 写入收件箱 + log::info → ok。
-/// text 超 4KiB 截断并标注 truncated；text 缺失/为空/非字符串 → err。
+/// text 超 4KiB 截断并标注 truncated；text 缺失/为空/非字符串、title 非字符串 → err。
 fn agent_handle_msg_send(
     context: &AgentCapabilityContext<'_>,
     packet: &AgentChannelPacket,
 ) -> Result<Value, String> {
-    todo!("红灯阶段：msg.send 未实现")
+    let text = packet
+        .payload
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "msg.send 需要字符串字段 text".to_string())?;
+    if text.trim().is_empty() {
+        return Err("msg.send 的 text 不能为空".into());
+    }
+    let title = match packet.payload.get("title") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(title)) => Some(title.clone()),
+        Some(_) => return Err("msg.send 的 title 必须是字符串".into()),
+    };
+    let (text, truncated) = truncate_utf8_bytes(text, AGENT_MSG_TEXT_MAX_BYTES);
+
+    log::info!(
+        "agent: 收到来自 {} 的消息{}（{} 字节{}）",
+        packet.origin_id,
+        title
+            .as_deref()
+            .map(|title| format!("「{title}」"))
+            .unwrap_or_default(),
+        text.len(),
+        if truncated { "，已截断" } else { "" }
+    );
+    context.inbox.push(AgentInboxMessage {
+        ts_ms: crate::now_ms(),
+        peer_id: packet.origin_id.clone(),
+        title,
+        text,
+        truncated,
+    });
+    Ok(serde_json::json!({ "delivered": true, "truncated": truncated }))
 }
 
 /// 按 UTF-8 字节上限截断，切点回退到最近的字符边界（不切出半个字符）。
