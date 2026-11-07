@@ -1009,4 +1009,108 @@ mod tests {
         receiver.stop_and_wait().expect("旧版等价端停止");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- f. 异步执行模型（P1a，RFC §6.3 执行模型）----
+
+    /// 构造测试 runtime：capability 分发为注入的闭包。
+    fn runtime_with_dispatch(
+        slot: Arc<Mutex<Option<quic_transport::TransportHandle>>>,
+        dispatch: impl Fn(&AgentChannelPacket) -> Result<Value, String> + Send + Sync + 'static,
+    ) -> AgentChannelRuntime {
+        AgentChannelRuntime {
+            transport_slot: slot,
+            dispatch: Arc::new(move |packet| dispatch(packet)),
+        }
+    }
+
+    #[test]
+    fn slow_capability_does_not_block_on_stream_ack() {
+        // RFC §6.3 执行模型：request 鉴权/路由通过后 on_stream 必须立即返回
+        // true（流 ack 即 accepted），capability 处理移出 stream slot——否则
+        // 慢处理器会占着 MAX_CONCURRENT_STREAMS=8 里的一个 slot 最长 6s，
+        // 与文件传输/剪贴板互饿。用 800ms 的伪 capability 验证 ack 毫秒级返回。
+        init_test_logger();
+        let slot: Arc<Mutex<Option<quic_transport::TransportHandle>>> = Arc::new(Mutex::new(None));
+        let runtime = runtime_with_dispatch(slot, |_packet| {
+            std::thread::sleep(Duration::from_millis(800));
+            Ok(serde_json::json!({ "slow": true }))
+        });
+        let layout = test_agent_layout("server", Vec::new());
+        let packet = authorized_packet("controller-1", "peer-key-1");
+
+        let started = Instant::now();
+        let accepted = handle_agent_stream_packet(
+            &crate::encode_wire_packet(&packet).expect("编码"),
+            &layout,
+            "peer-local",
+            &runtime,
+            "127.0.0.1:65000".parse().expect("来源地址"),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(accepted, "已鉴权的 request 必须被 on_stream 接受");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "on_stream 必须在慢 capability 执行完成前立即返回（实际耗时 {elapsed:?}）"
+        );
+    }
+
+    #[test]
+    fn async_request_eventually_sends_response_and_frees_thread() {
+        // 异步模型的闭环性质：慢 capability 最终在独立线程执行完成并回发
+        // response；随后 on_stream 恢复即时返回（线程不吞后续包的 ack）。
+        init_test_logger();
+        let slot: Arc<Mutex<Option<quic_transport::TransportHandle>>> = Arc::new(Mutex::new(None));
+        let started_flag = Arc::new(AtomicU64::new(0));
+        let flag_for_dispatch = Arc::clone(&started_flag);
+        let runtime = runtime_with_dispatch(slot, move |_packet| {
+            flag_for_dispatch.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(Value::Null)
+        });
+        let layout = test_agent_layout("server", Vec::new());
+        let packet = authorized_packet("controller-1", "peer-key-1");
+
+        let started_at = Instant::now();
+        assert!(
+            handle_agent_stream_packet(
+                &crate::encode_wire_packet(&packet).expect("编码"),
+                &layout,
+                "peer-local",
+                &runtime,
+                "127.0.0.1:65000".parse().expect("来源地址"),
+            ),
+            "request 必须被接受"
+        );
+        // 等待独立线程真正进入 capability 处理器。
+        let wait_started = Instant::now();
+        while started_flag.load(Ordering::Relaxed) == 0 {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(5),
+                "异步线程必须在 5s 内开始执行 capability"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 处理器还在 sleep(150ms) 期间，后续包必须已被即时处理（不排队等待）。
+        let second_started = Instant::now();
+        assert!(
+            handle_agent_stream_packet(
+                &crate::encode_wire_packet(&packet).expect("编码"),
+                &layout,
+                "peer-local",
+                &runtime,
+                "127.0.0.1:65000".parse().expect("来源地址"),
+            ),
+            "后续包必须被继续接受"
+        );
+        assert!(
+            second_started.elapsed() < Duration::from_millis(50),
+            "第一个请求在后台执行时，on_stream 必须保持即时返回（实际 {:?}）",
+            second_started.elapsed()
+        );
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "整个用例不得被 capability 的执行时长拖满"
+        );
+    }
 }
