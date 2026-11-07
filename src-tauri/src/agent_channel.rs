@@ -214,18 +214,82 @@ impl AgentAuditLog {
         }
     }
 
+    /// 记录一条审计：入环形（超限挤最老）+ 尽力追加落盘。落盘失败只记
+    /// warn 不上抛——审计不得反过来影响 agent 通道本身。
     pub(crate) fn record(&self, entry: AgentAuditEntry) {
-        todo!("红灯阶段：审计记录未实现")
+        // 序列化在持锁区内完成：并发请求线程各自记录自己那条，避免
+        // append 阶段经 back() 读到他人条目造成丢行/重复行。
+        let line = {
+            let Ok(mut ring) = self.ring.lock() else {
+                return;
+            };
+            if ring.len() >= AGENT_AUDIT_RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(entry);
+            match serde_json::to_string(ring.back().expect("刚 push 必有尾元素")) {
+                Ok(line) => line,
+                Err(error) => {
+                    log::warn!("agent: 审计条目序列化失败: {error}");
+                    return;
+                }
+            }
+        };
+        self.append_line_to_file(&line);
     }
 
     /// 环形快照（按时间升序；后续 P1c 审计查看 UI 消费）。
     pub(crate) fn snapshot(&self) -> Vec<AgentAuditEntry> {
-        todo!("红灯阶段：审计读取未实现")
+        self.ring
+            .lock()
+            .map(|ring| ring.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
-    /// 轮转：主文件超过阈值时改名为 `<path>.1`（覆盖旧 .1）。
+    /// 追加一行到落盘文件（尽力而为）：先按需轮转。
+    fn append_line_to_file(&self, line: &str) {
+        let Some(path) = &self.file_path else {
+            return;
+        };
+        self.rotate_if_needed();
+        let append = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")
+        };
+        if let Err(error) = append() {
+            log::warn!("agent: 审计落盘失败（{}）: {error}", path.display());
+        }
+    }
+
+    /// 轮转：主文件超过阈值时改名为 `<path>.1`（覆盖旧 .1）。检查点在
+    /// 每次 append 之前，用元数据大小判断——多进程同时写同一目录不是
+    /// 本场景（单应用单进程），无需文件锁。
     fn rotate_if_needed(&self) {
-        todo!("红灯阶段：审计轮转未实现")
+        let Some(path) = &self.file_path else {
+            return;
+        };
+        let oversized = std::fs::metadata(path)
+            .map(|metadata| metadata.len() > self.max_file_bytes)
+            .unwrap_or(false);
+        if !oversized {
+            return;
+        }
+        let rotated_path = path.with_extension(format!(
+            "{}.1",
+            path.extension()
+                .map(|extension| extension.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+        // rename 的目标既有语义：Windows MoveFileEx(REPLACE_EXISTING) 与
+        // POSIX rename(2) 都直接覆盖既有文件——旧 .1 即被覆盖（规格如此）。
+        if let Err(error) = std::fs::rename(path, &rotated_path) {
+            log::warn!("agent: 审计轮转失败（{}）: {error}", path.display());
+        }
     }
 }
 
