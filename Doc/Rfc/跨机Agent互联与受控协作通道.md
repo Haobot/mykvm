@@ -88,6 +88,7 @@ struct AgentChannelPacket {
     kind: String,               // "request" | "response" | "notify" | "cancel" | "approval"
     request_id: String,         // 多路分复用键，含单调计数 + 随机 nonce
     origin_id: String,          // 复用 packet_targets_local 路由语义（input.rs:3170）
+    origin_transport_public_key: String, // 发送方证书公钥；鉴权按它优先匹配（device id 随 IP 漂移，与 ClipboardPacket 同因；P0 实施时补入）
     target_id: String,
     cluster_id: String,         // 鉴权三件套，照抄 clipboard_packet_authorized（lib.rs:9379）
     pair_secret: String,
@@ -126,7 +127,8 @@ mykvm-agent-mcp（子命令，P4）          # stdio MCP server，见 6.4
 
 配置挂载（照现有惯例）：
 
-- `LayoutState` 新增 `#[serde(default)] agent_channel: AgentChannelConfig { enabled, level, cmd_whitelist, approval_ttl }`；权限字段归入 `merge_runtime_owned_layout_fields`（lib.rs:3924）防前端陈旧快照回滚。
+- `LayoutState` 新增 `#[serde(default)] agent_channel: AgentChannelConfig { enabled, level, file_roots, cmd_whitelist, approval_ttl }`。所有权：它是用户意图配置（Settings 页编辑），归**前端所有**，照 `focus_halo` 先例用 `sanitized()` 钳制非法值（level 越界、空白名单项），不进 `merge_runtime_owned_layout_fields`——后者只保护配对产生的机密。
+- 执行模型（P0 验收时发现）：`on_stream` 回调内同步回发 response 会占用 stream slot 最长 6s（并发上限 8）。P0 echo 即时可回无碍；**P1 起 request 处理改为「on_stream 立即返回 true（流 ack 即 accepted）→ 独立线程执行 capability 并回发 response」**，照 Log 请求先例（lib.rs:10674 spawn 线程）。
 - `LanPeer` 新增 `#[serde(default)] agent_channel: Option<AgentCapabilityAnnounce>`，随 announce 传播。
 
 Tauri 命令（照 `fetch_client_log` 先例）：`agent_channel_send` / `agent_channel_status` / `agent_channel_cancel` / `agent_approve_request` / `agent_read_audit`；后端→前端事件 `agent-request-pending`、`agent-audit-appended`。
@@ -151,8 +153,10 @@ Agent 侧工具命名建议：`peer_status` / `peer_log` / `peer_file_read` / `p
 
 | 阶段 | 内容 | 验收标准 |
 |---|---|---|
-| P0 协议骨架 | `agent_channel.rs` + 协议包 + on_stream 分支 + 鉴权 + 两段式 RPC 闭环（echo 能力）+ 跨版本混跑测试 | 双端真实 QUIC 上 echo 往返；**旧版对端收到 agent 包优雅拒绝不崩不挂起**；`cargo test --lib` 全绿；新增单测覆盖鉴权否定路径（错 cluster/secret/白名单外） |
-| P1 消息与只读 | `status.get` / `log.read` / `file.stat` / `file.read`（小文件）/ `msg.send` + 审计日志 + Tauri 命令 | A 端（通过手动 invoke）能拉到 B 端日志与状态；审计记录完整；L0 为默认级别 |
+| P0 协议骨架 ✅ 2026-11-07（4ed881c） | `agent_channel.rs` + 协议包 + on_stream 分支 + 鉴权 + 两段式 RPC 闭环（echo 能力）+ 跨版本混跑测试 | 双端真实 QUIC 上 echo 往返 ✓；**旧版对端收到 agent 包优雅拒绝不崩不挂起** ✓；`cargo test --lib` 515 全绿 ✓；鉴权否定路径（错 cluster/一位差 secret/白名单外/空 secret）✓ |
+| P1a 基础设施 | 异步执行模型 + `AgentChannelConfig`/level gate + 审计环形日志 + 路由函数与 input.rs 统一 + `status.get` / `msg.send` | level 不足被拒且审计记 `denied`；鉴权失败也留痕（对外仍静默）；echo 闭环在异步模型下仍绿 |
+| P1b 只读能力 | `file.stat` / `file.read`（≤1MiB 内联）/ `log.read`（尾部） | 白名单根目录外、`..` 穿越、symlink 逃逸全部拒绝；大小参数被钳制 |
+| P1c 集成面 | Tauri 命令 + `LanPeer` 能力宣告 + `desktopApi.ts` + 最小 Settings 开关 | A 端（通过手动 invoke）能拉到 B 端日志与状态；审计记录完整；L0 为默认级别 |
 | P2 文件交换 | `file.write` + transfer_id 大载荷集成 + 进度 UI（复用 `file-transfer-progress`） | ≥100MiB 文件双向传输带进度与断点续传；与剪贴板并发不互饿（并发预算处理） |
 | P3 命令控制 | `cmd.run` L2 白名单 + L3 审批 UI + 熔断开关 | 白名单外命令被拒并审计；L3 全流程：请求→对端弹窗（完整命令可见）→批准/拒绝→结果回传；熔断后键鼠/剪贴板不受影响 |
 | P4 Agent 集成 | MCP stdio server + `human.ask` halo 联动 | ZCode 在 A 机通过 MCP 工具驱动 B 机完成一次真实联调循环（拉日志→改→构建→回传产物）；`human.ask` 光环提示可见 |
