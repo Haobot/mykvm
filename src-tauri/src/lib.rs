@@ -949,10 +949,12 @@ impl AppRuntime {
         let peers_for_pairing = Arc::clone(&self.peers);
         let layout_for_halo_focus = Arc::clone(&self.layout);
         let transport_packets_for_halo_focus = Arc::clone(&self.transport_packets);
-        // Agent 通道（RFC §6.3）的响应回发槽位：on_stream 闭包先于 transport
-        // 创建，只能捕获槽位；transport 就绪后填充（见下方 start 之后）。
+        // Agent 通道（RFC §6.3）的运行期依赖：on_stream 闭包先于 transport
+        // 创建，response 回发只能经由槽位；transport 就绪后填充（见下方 start
+        // 之后）。capability 分发同样经由 runtime 注入（P1a 起在独立线程执行）。
         let agent_transport_slot = Arc::new(Mutex::new(None::<quic_transport::TransportHandle>));
-        let agent_transport_slot_for_stream = Arc::clone(&agent_transport_slot);
+        let agent_runtime_for_stream =
+            agent_channel::AgentChannelRuntime::production(Arc::clone(&agent_transport_slot));
 
         // P4 cross-machine focus: install the receive hook once at transport
         // startup. The hook is the only place that turns an authorized halo
@@ -1022,7 +1024,7 @@ impl AppRuntime {
                 &payload,
                 &layout,
                 &current_peer.id,
-                &agent_transport_slot_for_stream,
+                &agent_runtime_for_stream,
                 source,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);

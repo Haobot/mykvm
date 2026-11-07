@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Mutex, OnceLock,
+        mpsc, Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -292,6 +292,35 @@ pub(crate) fn send_agent_request(
     }
 }
 
+/// capability 分发函数：按 packet.capability 执行并返回 response payload。
+/// 以注入方式持有（而非写死调用），测试可替换为带延迟/计数的处理器来锁定
+/// 执行模型的时序性质，生产恒为 [`dispatch_agent_capability`]。
+pub(crate) type AgentCapabilityHandler =
+    Arc<dyn Fn(&AgentChannelPacket) -> Result<Value, String> + Send + Sync>;
+
+/// on_stream agent 分支的运行期依赖（RFC §6.3）。生产由 start_quic_transport
+/// 构造一次、被 on_stream 闭包捕获（[`AgentChannelRuntime::production`]）；
+/// 测试按用例构造独立实例，避免进程级全局状态串线。
+#[derive(Clone)]
+pub(crate) struct AgentChannelRuntime {
+    /// response 回发用的 transport 槽位：on_stream 闭包先于 transport 创建，
+    /// 只能捕获槽位，transport 就绪后由 start_quic_transport 填充。
+    pub transport_slot: Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
+    pub dispatch: AgentCapabilityHandler,
+}
+
+impl AgentChannelRuntime {
+    /// 生产构造：capability 分发固定为 [`dispatch_agent_capability`]。
+    pub(crate) fn production(
+        transport_slot: Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
+    ) -> Self {
+        Self {
+            transport_slot,
+            dispatch: Arc::new(dispatch_agent_capability),
+        }
+    }
+}
+
 /// on_stream 的 agent 分支入口（lib.rs 调度链在 pairing 之后、drag 之前调用）。
 /// 返回 true = 该包属于 agent 协议且已处理；false = 交回调度链继续尝试
 /// （decode 失败/协议不符/鉴权失败——与 clipboard 分支相同的静默拒绝策略）。
@@ -299,7 +328,7 @@ pub(crate) fn handle_agent_stream_packet(
     payload: &[u8],
     layout: &crate::LayoutState,
     local_peer_id: &str,
-    transport_slot: &std::sync::Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
+    runtime: &AgentChannelRuntime,
     source: SocketAddr,
 ) -> bool {
     let Some(packet) = crate::decode_wire_packet::<AgentChannelPacket>(payload) else {
@@ -310,9 +339,7 @@ pub(crate) fn handle_agent_stream_packet(
     }
 
     match packet.kind.as_str() {
-        AGENT_KIND_REQUEST => {
-            handle_agent_request(&packet, layout, local_peer_id, transport_slot, source)
-        }
+        AGENT_KIND_REQUEST => handle_agent_request(&packet, layout, local_peer_id, runtime, source),
         AGENT_KIND_RESPONSE => handle_agent_response(&packet, layout),
         AGENT_KIND_CANCEL => {
             if !agent_packet_authorized(layout, &packet) {
@@ -351,7 +378,7 @@ fn handle_agent_request(
     packet: &AgentChannelPacket,
     layout: &crate::LayoutState,
     local_peer_id: &str,
-    transport_slot: &std::sync::Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
+    runtime: &AgentChannelRuntime,
     source: SocketAddr,
 ) -> bool {
     if !agent_packet_authorized(layout, packet) {
@@ -361,12 +388,16 @@ fn handle_agent_request(
         return false;
     }
 
-    let (status, payload) = match dispatch_agent_capability(packet) {
+    let (status, payload) = match (runtime.dispatch)(packet) {
         Ok(echoed) => ("ok", echoed),
         Err(error) => ("err", serde_json::json!({ "error": error })),
     };
 
-    let transport = transport_slot.lock().ok().and_then(|slot| slot.clone());
+    let transport = runtime
+        .transport_slot
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
     let Some(transport) = transport else {
         // transport 槽位尚空（启动竞态窗口）：请求已消费但响应无法回发，
         // 由发起方超时兜底重试。
@@ -428,7 +459,7 @@ fn handle_agent_response(packet: &AgentChannelPacket, layout: &crate::LayoutStat
     global_pending_table().resolve(&packet.request_id, result)
 }
 
-/// P0 capability 分发：仅 echo（原样回 payload）。
+/// 生产 capability 分发（P0：仅 echo，原样回 payload）。
 fn dispatch_agent_capability(packet: &AgentChannelPacket) -> Result<Value, String> {
     match packet.capability.as_str() {
         AGENT_CAPABILITY_ECHO => Ok(packet.payload.clone()),
@@ -854,7 +885,7 @@ mod tests {
         let layout_a = test_agent_layout("server", Vec::new());
         let slot_a: Arc<Mutex<Option<quic_transport::TransportHandle>>> =
             Arc::new(Mutex::new(None));
-        let slot_for_a = Arc::clone(&slot_a);
+        let runtime_a = AgentChannelRuntime::production(Arc::clone(&slot_a));
         let layout_for_a_stream = layout_a.clone();
         let sender = quic_transport::start(
             free_quic_port(),
@@ -865,7 +896,7 @@ mod tests {
                     &payload,
                     &layout_for_a_stream,
                     "peer-a",
-                    &slot_for_a,
+                    &runtime_a,
                     source,
                 )
             }),
@@ -880,15 +911,15 @@ mod tests {
         );
         let slot_b: Arc<Mutex<Option<quic_transport::TransportHandle>>> =
             Arc::new(Mutex::new(None));
-        let slot_for_stream = Arc::clone(&slot_b);
+        let runtime_b = AgentChannelRuntime::production(Arc::clone(&slot_b));
         let receiver = quic_transport::start(
             free_quic_port(),
             dir.join("receiver"),
             Arc::new(|_, _| {}),
             // 生产等价分支：on_stream 的 agent 处理入口（layout 快照 + 本机 id +
-            // transport 槽位 + 来源地址，与 lib.rs 接线形态一致）。
+            // 运行期依赖 + 来源地址，与 lib.rs 接线形态一致）。
             Arc::new(move |payload: Vec<u8>, source: SocketAddr| {
-                handle_agent_stream_packet(&payload, &layout_b, "peer-b", &slot_for_stream, source)
+                handle_agent_stream_packet(&payload, &layout_b, "peer-b", &runtime_b, source)
             }),
         )
         .expect("受控端 transport 启动");
