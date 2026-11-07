@@ -5,6 +5,8 @@
 //! 应答由接收方反向新建流发回（ConnectionMap 对称，反向拨号命中既有信任面），
 //! 不改动 quic_transport.rs 的 StreamHandler 签名。
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
@@ -15,9 +17,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// 协议字符串：旧版对端在调度链各分支 decode 失败而落入默认拒绝路径
 /// （`b"reject"` ack），对旧版无破坏。
@@ -1036,12 +1035,248 @@ fn dispatch_agent_capability(
         AGENT_CAPABILITY_ECHO => Ok(packet.payload.clone()),
         AGENT_CAPABILITY_STATUS_GET => Ok(agent_status_payload(context)),
         AGENT_CAPABILITY_MSG_SEND => agent_handle_msg_send(context, packet),
-        // P1b 红灯占位：尚未实现，先返回 err（证明用例失败于「能力不存在」这一预期原因）。
-        AGENT_CAPABILITY_FILE_STAT => Err("file.stat 尚未实现".into()),
-        AGENT_CAPABILITY_FILE_READ => Err("file.read 尚未实现".into()),
-        AGENT_CAPABILITY_LOG_READ => Err("log.read 尚未实现".into()),
+        AGENT_CAPABILITY_FILE_STAT => agent_handle_file_stat(context, packet),
+        AGENT_CAPABILITY_FILE_READ => agent_handle_file_read(context, packet),
+        AGENT_CAPABILITY_LOG_READ => agent_handle_log_read(context, packet),
         other => Err(format!("未支持的 agent capability: {other}")),
     }
+}
+
+/// file.stat / file.read 共用的可读根与路径解析：配置根（sanitized）非空用配置，
+/// 否则回落注入的默认根；请求经 [`resolve_agent_readable_path`] 限根。
+fn resolve_capability_path(
+    context: &AgentCapabilityContext<'_>,
+    requested: &str,
+) -> Result<PathBuf, String> {
+    let roots = crate::agent_file_access::agent_file_roots(
+        &context.layout.agent_channel.sanitized(),
+        context.default_file_roots,
+    );
+    crate::agent_file_access::resolve_agent_readable_path(&roots, requested)
+}
+
+/// file.stat：payload { path } → 安全层解析 → 文件/目录元信息（目录含按名称
+/// 排序的 entries，封顶 [`AGENT_STAT_ENTRIES_LIMIT`] 条并标注截断）。
+/// 根内不存在的路径返回 exists=false 零值而非 err（调用方「先 stat 再 read」
+/// 的模式需要）；目录元数据读取失败 → err。
+fn agent_handle_file_stat(
+    context: &AgentCapabilityContext<'_>,
+    packet: &AgentChannelPacket,
+) -> Result<Value, String> {
+    let requested = packet
+        .payload
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "file.stat 需要字符串字段 path".to_string())?;
+    let path = resolve_capability_path(context, requested)?;
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(missing_stat_payload());
+        }
+        Err(error) => {
+            return Err(format!(
+                "file.stat 读取元数据失败（{}）: {error}",
+                path.display()
+            ));
+        }
+    };
+
+    let is_dir = metadata.is_dir();
+    let (entries, entries_truncated) = if is_dir {
+        read_stat_entries(&path)?
+    } else {
+        (Vec::new(), false)
+    };
+    Ok(serde_json::json!({
+        "exists": true,
+        "isFile": metadata.is_file(),
+        "isDir": is_dir,
+        "sizeBytes": metadata.len(),
+        "modifiedMs": modified_ms(&metadata),
+        "entries": entries,
+        "entriesTruncated": entries_truncated,
+    }))
+}
+
+/// file.stat 对不存在路径的响应体（其余字段零值，不算错误）。
+fn missing_stat_payload() -> Value {
+    serde_json::json!({
+        "exists": false,
+        "isFile": false,
+        "isDir": false,
+        "sizeBytes": 0,
+        "modifiedMs": 0,
+        "entries": [],
+        "entriesTruncated": false,
+    })
+}
+
+/// file.stat 的目录列举上限（任务书规格：最多 200 条）。
+const AGENT_STAT_ENTRIES_LIMIT: usize = 200;
+
+/// 列举目录条目：按名称排序，封顶 [`AGENT_STAT_ENTRIES_LIMIT`] 条并标注截断。
+/// read_dir 本身失败（权限等）→ err；单个条目取元数据失败按零值处理（尽力列举）。
+fn read_stat_entries(path: &Path) -> Result<(Vec<Value>, bool), String> {
+    let mut entries: Vec<(String, bool, u64)> = std::fs::read_dir(path)
+        .map_err(|error| format!("file.stat 列举目录失败（{}）: {error}", path.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let metadata = entry.metadata().ok();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                metadata.as_ref().is_some_and(|metadata| metadata.is_dir()),
+                metadata.map(|metadata| metadata.len()).unwrap_or(0),
+            )
+        })
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let truncated = entries.len() > AGENT_STAT_ENTRIES_LIMIT;
+    entries.truncate(AGENT_STAT_ENTRIES_LIMIT);
+    let payload = entries
+        .into_iter()
+        .map(|(name, is_dir, size_bytes)| {
+            serde_json::json!({ "name": name, "isDir": is_dir, "sizeBytes": size_bytes })
+        })
+        .collect();
+    Ok((payload, truncated))
+}
+
+/// mtime → UNIX 毫秒（早于纪元/时钟异常时 0，不因时间字段让整个 stat 失败）。
+fn modified_ms(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// file.read：payload { path, maxBytes? } → 安全层解析 → 内联读取文件头部，
+/// 一律 base64（不猜文本编码）。默认读 [`AGENT_FILE_READ_DEFAULT_BYTES`]，
+/// maxBytes 超过 [`AGENT_FILE_READ_MAX_BYTES`] 时**钳制**（不拒绝）；文件大于
+/// 读取上限时截断尾部——决策：读**头部**（truncate 尾部），日志类「看最新」
+/// 场景应使用 log.read；offsetRead 字段名明确这一语义。目录/不存在 → err
+/// （exists 语义属于 file.stat，调用方按「先 stat 再 read」协作）。
+fn agent_handle_file_read(
+    context: &AgentCapabilityContext<'_>,
+    packet: &AgentChannelPacket,
+) -> Result<Value, String> {
+    let requested = packet
+        .payload
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "file.read 需要字符串字段 path".to_string())?;
+    let max_bytes = match packet.payload.get("maxBytes") {
+        None | Some(Value::Null) => AGENT_FILE_READ_DEFAULT_BYTES,
+        Some(Value::Number(number)) => {
+            let requested_bytes = number
+                .as_u64()
+                .ok_or_else(|| "file.read 的 maxBytes 必须是非负整数".to_string())?;
+            requested_bytes.min(AGENT_FILE_READ_MAX_BYTES)
+        }
+        Some(_) => return Err("file.read 的 maxBytes 必须是数字".into()),
+    };
+
+    let path = resolve_capability_path(context, requested)?;
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        format!(
+            "file.read 目标不存在或不可访问（{}）: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.is_dir() {
+        return Err(format!(
+            "file.read 的目标是目录（{}），只支持读文件",
+            path.display()
+        ));
+    }
+    // 判定过的类型也可能在 stat 与 open 之间变化（TOCTOU）：读到的按实际内容算。
+    let mut file = std::fs::File::open(&path)
+        .map_err(|error| format!("file.read 打开失败（{}）: {error}", path.display()))?;
+    let mut content = Vec::with_capacity(max_bytes.min(metadata.len()) as usize);
+    let mut chunk = [0u8; 64 * 1024];
+    let mut read_bytes = 0u64;
+    loop {
+        use std::io::Read as _;
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| format!("file.read 读取失败（{}）: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        let take = read.min((max_bytes - read_bytes) as usize);
+        content.extend_from_slice(&chunk[..take]);
+        read_bytes += take as u64;
+        if read_bytes >= max_bytes {
+            break;
+        }
+    }
+
+    use base64::Engine as _;
+    Ok(serde_json::json!({
+        "contentBase64": base64::engine::general_purpose::STANDARD.encode(&content),
+        "sizeBytes": metadata.len(),
+        "readBytes": read_bytes,
+        "truncated": metadata.len() > read_bytes,
+        "offsetRead": 0,
+    }))
+}
+
+/// log.read：payload { tailBytes? } → 本机日志尾部。日志文件定位唯一真相源 =
+/// lib.rs `write_own_log_tail`（10547-10571）的语义：日志目录内 mtime 最新的
+/// .log 文件（tauri-plugin-log 轮转 KeepSome(5) 会换文件，不能写死文件名），
+/// 复用 lib.rs 提取的 [`crate::newest_log_file_in`]；尾部字节复用
+/// [`crate::tail_of_file`]。tailBytes 默认 [`AGENT_LOG_READ_DEFAULT_BYTES`]、
+/// 超过 [`AGENT_LOG_READ_MAX_BYTES`] 钳制。尾部切掉第一个不完整行并标注
+/// truncatedFromHead；文本 UTF-8 lossy 解码（日志本身是 UTF-8，损坏字节→
+/// U+FFFD，不让一个坏字节让整个读取失败）。
+fn agent_handle_log_read(
+    context: &AgentCapabilityContext<'_>,
+    packet: &AgentChannelPacket,
+) -> Result<Value, String> {
+    let tail_bytes = match packet.payload.get("tailBytes") {
+        None | Some(Value::Null) => AGENT_LOG_READ_DEFAULT_BYTES,
+        Some(Value::Number(number)) => {
+            let requested_bytes = number
+                .as_u64()
+                .ok_or_else(|| "log.read 的 tailBytes 必须是非负整数".to_string())?;
+            requested_bytes.min(AGENT_LOG_READ_MAX_BYTES)
+        }
+        Some(_) => return Err("log.read 的 tailBytes 必须是数字".into()),
+    };
+    let log_dir = context
+        .log_dir
+        .ok_or_else(|| "本机日志目录不可用（未注入），无法读取日志".to_string())?;
+    let path = crate::newest_log_file_in(log_dir).map_err(|error| {
+        // 目录不可读与「无 .log 文件」（首次运行尚未产生日志）各自带出原因。
+        format!("log.read 定位日志失败: {error}")
+    })?;
+    let tail = crate::tail_of_file(&path, tail_bytes)
+        .map_err(|error| format!("log.read 读取日志失败（{}）: {error}", path.display()))?;
+    let size_bytes = std::fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| format!("log.read 读取日志元数据失败: {error}"))?;
+
+    // 只有读取确实截掉了头部（文件大于本次 tail 读取）时，tail 的第一段才可能是
+    // 残行：丢弃到第一个换行为止（残行不完整，不能当日志给对端）。文件小于 tail
+    // 读取时拿到的就是全文件，第一个换行是第一行的行尾，原样解码。
+    let head_cut = u64::try_from(tail.len()).unwrap_or(u64::MAX) < size_bytes;
+    let text = if head_cut {
+        match tail.iter().position(|byte| *byte == b'\n') {
+            Some(first_newline) => String::from_utf8_lossy(&tail[first_newline + 1..]).into_owned(),
+            // 一次读取内没有任何完整行：整体视为残行丢弃。
+            _ => String::new(),
+        }
+    } else {
+        String::from_utf8_lossy(&tail).into_owned()
+    };
+    Ok(serde_json::json!({
+        "text": text,
+        "path": path.to_string_lossy(),
+        "sizeBytes": size_bytes,
+        "truncatedFromHead": head_cut,
+    }))
 }
 
 /// status.get 的响应体（RFC §6.2 L0）：本机身份/配置快照。全部来源只读：
@@ -2920,11 +3155,6 @@ mod tests {
         }
     }
 
-    /// 修改 fixture 的可读根为注入列表（测默认根回落路径）。
-    fn with_default_roots(context_roots: &[PathBuf]) -> Vec<PathBuf> {
-        context_roots.to_vec()
-    }
-
     fn stat_request(path: &str) -> AgentChannelPacket {
         capability_packet(
             AGENT_CAPABILITY_FILE_STAT,
@@ -3075,20 +3305,41 @@ mod tests {
 
     #[test]
     fn file_stat_uses_configured_roots_over_defaults() {
-        // layout 配置了根时用配置根（默认根不参与）：根外的默认目录即便存在也拒绝。
+        // layout 配置了根时用配置根：注入的默认根（生产 = 日志目录/接收根）即便
+        // 存在也不参与，默认根内的文件必须拒绝；配置根内的文件照常放行。
         let fixture = FileCapabilityFixture::new();
-        let other_root = fixture._guard.path().join("other-root");
-        std::fs::create_dir_all(&other_root).expect("建另一个根");
-        let other_file = other_root.join("f.txt");
-        std::fs::write(&other_file, b"other").expect("写文件");
+        let default_root = fixture._guard.path().join("default-root");
+        std::fs::create_dir_all(&default_root).expect("建默认根目录");
+        let default_file = default_root.join("f.txt");
+        std::fs::write(&default_file, b"other").expect("写默认根内文件");
 
+        // 模拟生产注入：默认根指向 default-root（不在 layout 配置里）。
+        let default_roots = vec![default_root.clone()];
+        let inbox = AgentInbox::new();
+        let context = AgentCapabilityContext {
+            layout: &fixture.layout,
+            local_peer_id: "peer-local-1",
+            inbox: &inbox,
+            default_file_roots: &default_roots,
+            log_dir: None,
+        };
+
+        let in_config_root = fixture.root.join("inner.txt");
+        std::fs::write(&in_config_root, b"cfg").expect("写配置根内文件");
         let payload = dispatch_agent_capability(
-            &fixture.context(),
-            &stat_request(other_file.to_str().expect("沙箱路径")),
+            &context,
+            &stat_request(in_config_root.to_str().expect("沙箱路径")),
         )
-        .expect("另一配置根内的文件必须放行");
+        .expect("配置根内的文件必须放行");
         assert_eq!(payload["exists"], true);
         assert_eq!(payload["isFile"], true);
+
+        let error = dispatch_agent_capability(
+            &context,
+            &stat_request(default_file.to_str().expect("沙箱路径")),
+        )
+        .expect_err("配置根非空时，默认根内的文件必须拒绝（默认根不参与）");
+        assert!(error.contains("根目录"), "错误须说明原因（实际 {error:?}）");
     }
 
     #[test]
@@ -3207,10 +3458,7 @@ mod tests {
         // 旧日志（更早 mtime）+ 当前日志（最新 mtime）：必须选中后者。
         let old = log_dir.join("mykvm-old.log");
         std::fs::write(&old, "旧轮转日志\n").expect("写旧日志");
-        let file_stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("时钟")
-            .as_secs();
+        std::thread::sleep(Duration::from_millis(20));
         let new = log_dir.join("mykvm.log");
         std::fs::write(&new, "第一行\n第二行\n第三行\n").expect("写当前日志");
 
@@ -3230,7 +3478,6 @@ mod tests {
             std::fs::metadata(&new).expect("元数据").len()
         );
         assert_eq!(payload["truncatedFromHead"], false);
-        let _ = file_stamp;
     }
 
     #[test]

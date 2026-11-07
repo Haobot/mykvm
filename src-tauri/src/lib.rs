@@ -961,9 +961,19 @@ impl AppRuntime {
         // Agent 通道（RFC §6.3）的运行期依赖：on_stream 闭包先于 transport
         // 创建，response 回发只能经由槽位；transport 就绪后填充（见下方 start
         // 之后）。capability 分发同样经由 runtime 注入（P1a 起在独立线程执行）。
+        // P1b：文件能力线程没有 AppHandle，日志目录与默认可读根在此解析一次注入
+        // （log_dir 照 write_own_log_tail 的 app_log_dir 真相源；默认根 =
+        // [日志目录, 文件接收根（file_transfer_receive_root）]）。
         let agent_transport_slot = Arc::new(Mutex::new(None::<quic_transport::TransportHandle>));
-        let agent_runtime_for_stream =
+        let mut agent_runtime_for_stream =
             agent_channel::AgentChannelRuntime::production(Arc::clone(&agent_transport_slot));
+        let agent_log_dir = self.app_handle.path().app_log_dir().ok();
+        agent_runtime_for_stream.log_dir = agent_log_dir.clone();
+        agent_runtime_for_stream.file_roots =
+            Arc::new(agent_file_access::default_agent_file_roots(
+                agent_log_dir.as_deref(),
+                file_transfer_receive_root(&self.app_handle).ok().as_deref(),
+            ));
 
         // P4 cross-machine focus: install the receive hook once at transport
         // startup. The hook is the only place that turns an authorized halo
@@ -10531,7 +10541,8 @@ fn client_log_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Read at most the last `max_bytes` bytes of `path`.
-fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+/// Agent 通道 log.read（P1b）同样用它做尾部读取，见 agent_channel::agent_handle_log_read。
+pub(crate) fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -10543,16 +10554,11 @@ fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     Ok(tail)
 }
 
-/// Copy the tail of this machine's newest log file into a temp file named after
-/// this device, ready to stream back to whoever asked. Returns the temp path.
-fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, String> {
-    let log_dir = app
-        .path()
-        .app_log_dir()
-        .map_err(|error| format!("failed to resolve log dir: {error}"))?;
-    // The plugin keeps the live log plus rotated copies; the newest by mtime is
-    // the one currently being written.
-    let newest = fs::read_dir(&log_dir)
+/// The newest `.log` file under `log_dir` — the one the log plugin is currently
+/// writing. Agent 通道 log.read（P1b）复用同一真相源，见
+/// agent_channel::agent_handle_log_read。
+pub(crate) fn newest_log_file_in(log_dir: &Path) -> Result<PathBuf, String> {
+    fs::read_dir(log_dir)
         .map_err(|error| format!("failed to read log dir: {error}"))?
         .flatten()
         .filter(|entry| {
@@ -10569,7 +10575,19 @@ fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, Str
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
         })
         .map(|entry| entry.path())
-        .ok_or_else(|| "no log file found".to_string())?;
+        .ok_or_else(|| "no log file found".to_string())
+}
+
+/// Copy the tail of this machine's newest log file into a temp file named after
+/// this device, ready to stream back to whoever asked. Returns the temp path.
+fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log dir: {error}"))?;
+    // The plugin keeps the live log plus rotated copies; the newest by mtime is
+    // the one currently being written.
+    let newest = newest_log_file_in(&log_dir)?;
 
     let tail = tail_of_file(&newest, CLIENT_LOG_TAIL_BYTES)
         .map_err(|error| format!("failed to read log: {error}"))?;
