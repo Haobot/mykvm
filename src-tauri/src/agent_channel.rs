@@ -139,6 +139,11 @@ pub(crate) const AGENT_AUDIT_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 /// 审计摘要的最大字符数（按 Unicode 字符计，参数摘要 ≤200 字）。
 pub(crate) const AGENT_AUDIT_SUMMARY_MAX_CHARS: usize = 200;
 
+/// 审计条目里 peer/capability/request_id 的最大字符数。鉴权失败也要留痕，
+/// 而这些字段来自未鉴权的对端——不设上限的话，伪造包可用超长字段把内存
+/// 环形（2000 条）与落盘文件撑爆。
+pub(crate) const AGENT_AUDIT_FIELD_MAX_CHARS: usize = 128;
+
 /// 一条 agent 动作审计记录（RFC §5.3 对策二）。summary 由各记录点构造，
 /// 只含参数摘要/来源地址——**任何路径都不得写入 pair_secret/cluster_id**。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,7 +249,10 @@ impl AgentAuditLog {
         self.append_line_to_file(&line);
     }
 
-    /// 环形快照（按时间升序；后续 P1c 审计查看 UI 消费）。
+    /// 环形快照（按时间升序）。生产读取方是 P1c 的审计查看 Tauri 命令，
+    /// P1a 只有测试消费——照 lib.rs DRAG_CONTROL_FAILED 的 cfg_attr 惯例
+    /// 压制该构建下的 dead_code。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> Vec<AgentAuditEntry> {
         self.ring
             .lock()
@@ -307,13 +315,19 @@ pub(crate) fn global_audit_log() -> std::sync::Arc<AgentAuditLog> {
         .clone()
 }
 
-/// setup 期注入审计落盘路径（配置目录下 agent-audit.jsonl）。重复调用
-/// （理论不发生）静默忽略，保持首次注入。
+/// setup 期注入审计落盘路径（配置目录下 agent-audit.jsonl）。若全局实例已
+/// 先被取用（退化为仅内存），注入失败并留 warn——落盘缺失必须可被发现。
 pub(crate) fn init_global_audit_log(config_dir: &std::path::Path) {
-    let _ = global_audit_slot().set(std::sync::Arc::new(AgentAuditLog::with_rotation_threshold(
-        Some(config_dir.join("agent-audit.jsonl")),
-        AGENT_AUDIT_MAX_FILE_BYTES,
-    )));
+    let path = config_dir.join("agent-audit.jsonl");
+    let installed = global_audit_slot().set(std::sync::Arc::new(
+        AgentAuditLog::with_rotation_threshold(Some(path.clone()), AGENT_AUDIT_MAX_FILE_BYTES),
+    ));
+    if installed.is_err() {
+        log::warn!(
+            "agent: 审计全局实例已先行初始化，落盘路径 {} 未生效",
+            path.display()
+        );
+    }
 }
 
 fn global_audit_slot() -> &'static OnceLock<std::sync::Arc<AgentAuditLog>> {
@@ -576,7 +590,8 @@ pub(crate) fn agent_packet_targets_local(
 /// 向对端发出 agent request 并等待对应 response（两段式，阻塞至超时）。
 /// 流程：先注册 pending 再发包（防响应先到无处安放）→ 流发送（自带 ack 确认
 /// 到达对端 handler）→ 等待 response 完成等待者。任何失败路径都清理 pending。
-/// P0 仅供测试与后续 Tauri 命令接线使用。
+/// 结果写一条 out 审计（ok / err / timeout）。P1c 前仅供测试使用。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_agent_request(
     transport: &crate::quic_transport::TransportHandle,
     peer: &crate::quic_transport::PeerEndpoint,
@@ -587,7 +602,9 @@ pub(crate) fn send_agent_request(
     capability: &str,
     payload: Value,
     timeout: Duration,
+    audit: &AgentAuditLog,
 ) -> Result<AgentResponse, String> {
+    let _ = audit;
     if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
         return Err("当前设备尚未完成配对，无法使用 Agent 通道。".into());
     }
@@ -654,11 +671,14 @@ pub(crate) struct AgentChannelRuntime {
     pub transport_slot: Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
     pub dispatch: AgentCapabilityHandler,
     pub inbox: Arc<AgentInbox>,
+    /// 审计落点（RFC §5.3 对策二）。
+    pub audit: Arc<AgentAuditLog>,
 }
 
 impl AgentChannelRuntime {
     /// 生产构造：capability 分发固定为 [`dispatch_agent_capability`]，
-    /// 收件箱为进程全局实例。
+    /// 收件箱/审计为进程全局实例（审计落盘路径由 setup 的
+    /// init_global_audit_log 注入）。
     pub(crate) fn production(
         transport_slot: Arc<Mutex<Option<crate::quic_transport::TransportHandle>>>,
     ) -> Self {
@@ -666,6 +686,7 @@ impl AgentChannelRuntime {
             transport_slot,
             dispatch: Arc::new(dispatch_agent_capability),
             inbox: global_agent_inbox(),
+            audit: global_audit_log(),
         }
     }
 }
@@ -673,6 +694,8 @@ impl AgentChannelRuntime {
 /// on_stream 的 agent 分支入口（lib.rs 调度链在 pairing 之后、drag 之前调用）。
 /// 返回 true = 该包属于 agent 协议且已处理；false = 交回调度链继续尝试
 /// （decode 失败/协议不符/鉴权失败——与 clipboard 分支相同的静默拒绝策略）。
+/// 鉴权失败对外保持静默（return false → QUIC reject），但在本机审计留痕
+/// （RFC §5.3：只记来源地址，绝不写入凭据）。
 pub(crate) fn handle_agent_stream_packet(
     payload: &[u8],
     layout: &crate::LayoutState,
@@ -846,6 +869,15 @@ fn handle_agent_response(packet: &AgentChannelPacket, layout: &crate::LayoutStat
         Err(agent_error_message(&packet.payload, &status))
     };
     global_pending_table().resolve(&packet.request_id, result)
+}
+
+/// 审计用参数摘要：payload 的紧凑 JSON（AgentAuditEntry::new 负责 200 字封顶）。
+fn payload_summary(payload: &Value) -> String {
+    serde_json::to_string(payload).unwrap_or_default()
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// 生产 capability 分发（P1a：echo + status.get + msg.send；log.read/file.*
@@ -1442,6 +1474,7 @@ mod tests {
             AGENT_CAPABILITY_ECHO,
             serde_json::json!({ "ping": 42 }),
             Duration::from_secs(15),
+            &AgentAuditLog::in_memory(),
         );
 
         let response = result.expect("echo 往返必须成功");
@@ -1525,6 +1558,7 @@ mod tests {
             transport_slot: slot,
             dispatch: Arc::new(move |context, packet| dispatch(context, packet)),
             inbox: Arc::new(AgentInbox::new()),
+            audit: Arc::new(AgentAuditLog::in_memory()),
         }
     }
 
@@ -2193,5 +2227,485 @@ mod tests {
         );
         assert_eq!(messages[0].text, "msg-3", "最老的 3 条被挤出");
         assert_eq!(messages[messages.len() - 1].text, "msg-102");
+    }
+
+    // ---- j. level gate 接线 + 审计记录点（P1a，RFC §5.3 对策一/二）----
+
+    /// 测试统一的伪来源地址（审计 summary 必须记录它）。
+    const TEST_SOURCE: &str = "10.0.0.9:50000";
+
+    fn test_source() -> SocketAddr {
+        TEST_SOURCE.parse().expect("测试来源地址")
+    }
+
+    /// 生产分发 + 独立收件箱/审计的 runtime（不碰进程全局实例）。
+    fn isolated_production_runtime(
+        slot: Arc<Mutex<Option<quic_transport::TransportHandle>>>,
+    ) -> AgentChannelRuntime {
+        AgentChannelRuntime {
+            transport_slot: slot,
+            dispatch: Arc::new(dispatch_agent_capability),
+            inbox: Arc::new(AgentInbox::new()),
+            audit: Arc::new(AgentAuditLog::in_memory()),
+        }
+    }
+
+    /// 记录 capability 是否被执行的 runtime（gate 拒绝时必须为 0）。
+    fn counting_runtime() -> (AgentChannelRuntime, Arc<AtomicU64>) {
+        let dispatched = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&dispatched);
+        let runtime = runtime_with_dispatch(Arc::new(Mutex::new(None)), move |_context, packet| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(packet.payload.clone())
+        });
+        (runtime, dispatched)
+    }
+
+    /// 轮询审计直到出现满足条件的条目（异步线程写入），超时返回 false。
+    fn wait_for_audit(
+        audit: &AgentAuditLog,
+        predicate: impl Fn(&AgentAuditEntry) -> bool,
+        timeout: Duration,
+    ) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if audit.snapshot().iter().any(&predicate) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn deliver(
+        packet: &AgentChannelPacket,
+        layout: &LayoutState,
+        runtime: &AgentChannelRuntime,
+    ) -> bool {
+        handle_agent_stream_packet(
+            &crate::encode_wire_packet(packet).expect("编码"),
+            layout,
+            "peer-local",
+            runtime,
+            test_source(),
+        )
+    }
+
+    #[test]
+    fn readonly_rejects_cmd_run_and_audits_denied() {
+        let (runtime, dispatched) = counting_runtime();
+        let layout = test_agent_layout("server", Vec::new()); // 默认 readonly
+        let packet = capability_packet("cmd.run", serde_json::json!({ "cmd": "whoami" }));
+
+        assert!(
+            !deliver(&packet, &layout, &runtime),
+            "readonly 下 cmd.run 必须被拒（对外静默：QUIC reject）"
+        );
+        let entries = runtime.audit.snapshot();
+        assert_eq!(entries.len(), 1, "level 拒绝必须恰好留一条审计");
+        assert_eq!(entries[0].direction, "in");
+        assert_eq!(entries[0].status, "denied");
+        assert_eq!(entries[0].capability, "cmd.run");
+        assert_eq!(entries[0].peer_id, "controller-1");
+        assert!(
+            entries[0].summary.contains(TEST_SOURCE),
+            "denied 摘要必须含来源地址（实际 {:?}）",
+            entries[0].summary
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            dispatched.load(Ordering::Relaxed),
+            0,
+            "被 gate 拒绝的请求不得进入 capability 执行"
+        );
+    }
+
+    #[test]
+    fn readonly_allows_status_get_and_audits_execution() {
+        let runtime = isolated_production_runtime(Arc::new(Mutex::new(None)));
+        let layout = test_agent_layout("server", Vec::new());
+        let packet = capability_packet(AGENT_CAPABILITY_STATUS_GET, Value::Null);
+
+        assert!(
+            deliver(&packet, &layout, &runtime),
+            "readonly 必须放行 status.get"
+        );
+        assert!(
+            wait_for_audit(
+                &runtime.audit,
+                |entry| entry.direction == "in"
+                    && entry.status == "ok"
+                    && entry.capability == AGENT_CAPABILITY_STATUS_GET
+                    && entry.request_id == "1-abcdef"
+                    && entry.peer_id == "controller-1",
+                Duration::from_secs(5),
+            ),
+            "执行完成必须记 (in, ok)，实际 {:?}",
+            runtime.audit.snapshot()
+        );
+        // transport 槽位为空：response 无法回发，必须记 (out, err)。
+        assert!(
+            wait_for_audit(
+                &runtime.audit,
+                |entry| entry.direction == "out"
+                    && entry.status == "err"
+                    && entry.capability == AGENT_CAPABILITY_STATUS_GET,
+                Duration::from_secs(5),
+            ),
+            "response 回发失败必须记 (out, err)，实际 {:?}",
+            runtime.audit.snapshot()
+        );
+    }
+
+    #[test]
+    fn disabled_channel_rejects_every_capability_and_audits_denied() {
+        let (runtime, dispatched) = counting_runtime();
+        let mut layout = test_agent_layout("server", Vec::new());
+        layout.agent_channel.enabled = false;
+        layout.agent_channel.level = "full".into(); // 熔断开关优先于级别
+
+        for capability in [
+            AGENT_CAPABILITY_ECHO,
+            AGENT_CAPABILITY_STATUS_GET,
+            AGENT_CAPABILITY_MSG_SEND,
+        ] {
+            let packet = capability_packet(capability, serde_json::json!({ "text": "hi" }));
+            assert!(
+                !deliver(&packet, &layout, &runtime),
+                "enabled=false 时 {capability} 必须被拒"
+            );
+        }
+        let entries = runtime.audit.snapshot();
+        assert_eq!(entries.len(), 3, "每个被拒请求各留一条审计");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.direction == "in" && entry.status == "denied"),
+            "全部记 (in, denied)：{entries:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            dispatched.load(Ordering::Relaxed),
+            0,
+            "熔断后不得执行任何能力"
+        );
+    }
+
+    #[test]
+    fn auth_failure_is_audited_with_source_but_no_credentials() {
+        let dir = std::env::temp_dir().join(format!(
+            "mykvm-audit-auth-{}-{}",
+            std::process::id(),
+            crate::random_hex(4)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let audit_path = dir.join("agent-audit.jsonl");
+
+        let (mut runtime, dispatched) = counting_runtime();
+        runtime.audit = Arc::new(AgentAuditLog::with_rotation_threshold(
+            Some(audit_path.clone()),
+            AGENT_AUDIT_MAX_FILE_BYTES,
+        ));
+        let layout = test_agent_layout(
+            "client",
+            vec![test_controller("controller-1", "peer-key-1")],
+        );
+        let forged_secret = "forged-secret-value-123";
+        let mut packet = authorized_packet("controller-1", "peer-key-1");
+        packet.pair_secret = forged_secret.into();
+
+        assert!(
+            !deliver(&packet, &layout, &runtime),
+            "鉴权失败对外必须保持静默拒绝（return false → QUIC reject）"
+        );
+        let entries = runtime.audit.snapshot();
+        assert_eq!(entries.len(), 1, "鉴权失败必须在本机留痕");
+        assert_eq!(entries[0].direction, "in");
+        assert_eq!(entries[0].status, "denied");
+        assert!(
+            entries[0].summary.contains(TEST_SOURCE),
+            "鉴权失败摘要必须记来源地址（实际 {:?}）",
+            entries[0].summary
+        );
+
+        // 内存条目 + 落盘文件：任何凭据值（本机真值、对端伪造值、cluster）都不得出现。
+        let mut serialized: String = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).expect("序列化"))
+            .collect();
+        serialized.push_str(&std::fs::read_to_string(&audit_path).expect("审计必须落盘"));
+        for secret in [TEST_SECRET, TEST_CLUSTER, forged_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "审计文本不得含凭据值 {secret:?}：{serialized}"
+            );
+        }
+        assert_eq!(dispatched.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forged_response_failing_auth_is_audited() {
+        let (runtime, _dispatched) = counting_runtime();
+        let layout = test_agent_layout(
+            "client",
+            vec![test_controller("controller-1", "peer-key-1")],
+        );
+        let mut packet = authorized_packet("controller-1", "peer-key-1");
+        packet.kind = AGENT_KIND_RESPONSE.into();
+        packet.status = Some("ok".into());
+        packet.cluster_id = "cluster-forged".into();
+
+        assert!(
+            !deliver(&packet, &layout, &runtime),
+            "伪造 response 必须被拒"
+        );
+        let entries = runtime.audit.snapshot();
+        assert_eq!(entries.len(), 1, "response 鉴权失败同样留痕");
+        assert_eq!(entries[0].status, "denied");
+        assert!(entries[0].summary.contains(TEST_SOURCE));
+        assert!(
+            !serde_json::to_string(&entries[0])
+                .expect("序列化")
+                .contains("cluster-forged"),
+            "伪造的 cluster_id 不得写入审计"
+        );
+    }
+
+    #[test]
+    fn forged_oversized_fields_are_bounded_in_audit() {
+        // 未鉴权的伪造包可携带超长字段：审计必须封顶，否则 2000 条环形 +
+        // 落盘文件会被单个大包撑爆（鉴权失败留痕引入的新攻击面）。
+        let (runtime, _dispatched) = counting_runtime();
+        let layout = test_agent_layout("server", Vec::new());
+        let mut packet = authorized_packet(&"o".repeat(100_000), "peer-key-1");
+        packet.capability = "c".repeat(100_000);
+        packet.request_id = "r".repeat(100_000);
+        packet.pair_secret = "wrong".into();
+
+        assert!(!deliver(&packet, &layout, &runtime));
+        let entries = runtime.audit.snapshot();
+        assert_eq!(entries.len(), 1);
+        for (name, value) in [
+            ("peer_id", &entries[0].peer_id),
+            ("capability", &entries[0].capability),
+            ("request_id", &entries[0].request_id),
+        ] {
+            assert!(
+                value.chars().count() <= AGENT_AUDIT_FIELD_MAX_CHARS + 1,
+                "{name} 必须封顶在 {AGENT_AUDIT_FIELD_MAX_CHARS} 字符内（实际 {}）",
+                value.chars().count()
+            );
+        }
+    }
+
+    /// 起一对真实 QUIC loopback 端点：A 发起、B 受控（client 白名单只认 A）。
+    /// 返回 (A transport, B transport, A runtime, B runtime, A layout, 临时目录)。
+    fn quic_pair(
+        tag: &str,
+        dispatch_b: Option<AgentCapabilityHandler>,
+    ) -> (
+        quic_transport::TransportHandle,
+        quic_transport::TransportHandle,
+        AgentChannelRuntime,
+        AgentChannelRuntime,
+        LayoutState,
+        std::path::PathBuf,
+    ) {
+        init_test_logger();
+        let dir = temp_identity_dir(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let layout_a = test_agent_layout("server", Vec::new());
+        let slot_a: Arc<Mutex<Option<quic_transport::TransportHandle>>> =
+            Arc::new(Mutex::new(None));
+        let runtime_a = isolated_production_runtime(Arc::clone(&slot_a));
+        let runtime_a_stream = runtime_a.clone();
+        let layout_a_stream = layout_a.clone();
+        let sender = quic_transport::start(
+            free_quic_port(),
+            dir.join("sender"),
+            Arc::new(|_, _| {}),
+            Arc::new(move |payload: Vec<u8>, source: SocketAddr| {
+                handle_agent_stream_packet(
+                    &payload,
+                    &layout_a_stream,
+                    "peer-a",
+                    &runtime_a_stream,
+                    source,
+                )
+            }),
+        )
+        .expect("发起端 transport 启动");
+        *slot_a.lock().expect("槽位锁") = Some(sender.clone());
+
+        let layout_b = test_agent_layout(
+            "client",
+            vec![test_controller("peer-a", sender.public_key())],
+        );
+        let slot_b: Arc<Mutex<Option<quic_transport::TransportHandle>>> =
+            Arc::new(Mutex::new(None));
+        let mut runtime_b = isolated_production_runtime(Arc::clone(&slot_b));
+        if let Some(dispatch) = dispatch_b {
+            runtime_b.dispatch = dispatch;
+        }
+        let runtime_b_stream = runtime_b.clone();
+        let receiver = quic_transport::start(
+            free_quic_port(),
+            dir.join("receiver"),
+            Arc::new(|_, _| {}),
+            Arc::new(move |payload: Vec<u8>, source: SocketAddr| {
+                handle_agent_stream_packet(&payload, &layout_b, "peer-b", &runtime_b_stream, source)
+            }),
+        )
+        .expect("受控端 transport 启动");
+        *slot_b.lock().expect("槽位锁") = Some(receiver.clone());
+
+        (sender, receiver, runtime_a, runtime_b, layout_a, dir)
+    }
+
+    #[test]
+    fn echo_roundtrip_records_audit_on_both_sides() {
+        let (sender, receiver, runtime_a, runtime_b, layout_a, dir) = quic_pair("audit-echo", None);
+        let peer = sender.peer(
+            format!("127.0.0.1:{}", receiver.port()),
+            receiver.public_key().into(),
+            quic_transport::PROTOCOL_VERSION,
+        );
+        let response = send_agent_request(
+            &sender,
+            &peer,
+            &layout_a,
+            "peer-a",
+            sender.public_key(),
+            "peer-b",
+            AGENT_CAPABILITY_ECHO,
+            serde_json::json!({ "ping": 7 }),
+            Duration::from_secs(15),
+            &runtime_a.audit,
+        )
+        .expect("echo 往返必须成功");
+        assert_eq!(response.payload, serde_json::json!({ "ping": 7 }));
+
+        // 发起端 A：本地发起请求的最终结果 (out, ok)，peer 为目标设备。
+        let a_entries = runtime_a.audit.snapshot();
+        assert!(
+            a_entries.iter().any(|entry| entry.direction == "out"
+                && entry.status == "ok"
+                && entry.capability == AGENT_CAPABILITY_ECHO
+                && entry.peer_id == "peer-b"),
+            "发起端必须记 (out, ok)：{a_entries:?}"
+        );
+        // 受控端 B：执行完成 (in, ok) + response 回发完成 (out, ok)。
+        for direction in ["in", "out"] {
+            assert!(
+                wait_for_audit(
+                    &runtime_b.audit,
+                    |entry| entry.direction == direction
+                        && entry.status == "ok"
+                        && entry.capability == AGENT_CAPABILITY_ECHO
+                        && entry.peer_id == "peer-a",
+                    Duration::from_secs(5),
+                ),
+                "受控端必须记 ({direction}, ok)：{:?}",
+                runtime_b.audit.snapshot()
+            );
+        }
+
+        sender.stop_and_wait().expect("发起端停止");
+        receiver.stop_and_wait().expect("受控端停止");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_request_timeout_is_audited_as_timeout() {
+        // 受控端处理 2.5s，发起端只等 300ms(+1s 宽限)：发起端必须记 (out, timeout)。
+        let slow: AgentCapabilityHandler = Arc::new(|_context, packet| {
+            std::thread::sleep(Duration::from_millis(2500));
+            Ok(packet.payload.clone())
+        });
+        let (sender, receiver, runtime_a, _runtime_b, layout_a, dir) =
+            quic_pair("audit-timeout", Some(slow));
+        let peer = sender.peer(
+            format!("127.0.0.1:{}", receiver.port()),
+            receiver.public_key().into(),
+            quic_transport::PROTOCOL_VERSION,
+        );
+        let result = send_agent_request(
+            &sender,
+            &peer,
+            &layout_a,
+            "peer-a",
+            sender.public_key(),
+            "peer-b",
+            AGENT_CAPABILITY_ECHO,
+            Value::Null,
+            Duration::from_millis(300),
+            &runtime_a.audit,
+        );
+        assert!(result.is_err(), "超时必须返回错误");
+        let entries = runtime_a.audit.snapshot();
+        assert!(
+            entries.iter().any(|entry| entry.direction == "out"
+                && entry.status == "timeout"
+                && entry.peer_id == "peer-b"),
+            "发起端超时必须记 (out, timeout)：{entries:?}"
+        );
+
+        sender.stop_and_wait().expect("发起端停止");
+        receiver.stop_and_wait().expect("受控端停止");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_request_rejected_by_peer_is_audited_as_err() {
+        // 对端（旧版等价物）reject：发送阶段即失败，发起端必须记 (out, err)。
+        let dir = temp_identity_dir("audit-reject");
+        let _ = std::fs::remove_dir_all(&dir);
+        let receiver = quic_transport::start(
+            free_quic_port(),
+            dir.join("receiver"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| false),
+        )
+        .expect("拒绝端 transport 启动");
+        let sender = quic_transport::start(
+            free_quic_port(),
+            dir.join("sender"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        )
+        .expect("发送端 transport 启动");
+        let peer = sender.peer(
+            format!("127.0.0.1:{}", receiver.port()),
+            receiver.public_key().into(),
+            quic_transport::PROTOCOL_VERSION,
+        );
+        let audit = AgentAuditLog::in_memory();
+        let result = send_agent_request(
+            &sender,
+            &peer,
+            &test_agent_layout("server", Vec::new()),
+            "peer-a",
+            sender.public_key(),
+            "peer-b",
+            AGENT_CAPABILITY_ECHO,
+            Value::Null,
+            Duration::from_secs(5),
+            &audit,
+        );
+        assert!(result.is_err(), "对端拒绝必须返回错误");
+        let entries = audit.snapshot();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.direction == "out" && entry.status == "err"),
+            "发送失败必须记 (out, err)：{entries:?}"
+        );
+
+        sender.stop_and_wait().expect("发送端停止");
+        receiver.stop_and_wait().expect("拒绝端停止");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
