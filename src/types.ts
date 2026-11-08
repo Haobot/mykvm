@@ -247,3 +247,34 @@ export interface AgentChannelAnnounce {
   enabled: boolean
   level: AgentChannelLevel
 }
+
+/** Mirrors the Rust `agent_channel::AgentAuditEntry` (serde camelCase)。 */
+export interface AgentChannelAuditEntry {
+  tsMs: number
+  /** "in" = 本机收到并处理；"out" = 本机发起/回发。 */
+  direction: string
+  peerId: string
+  capability: string
+  requestId: string
+  /** "ok" | "err" | "denied" | "timeout" */
+  status: string
+  durationMs: number
+  summary: string
+}
+
+/** Mirrors the Rust `agent_channel::AgentInboxMessage` (serde camelCase)。 */
+export interface AgentChannelInboxMessage {
+  tsMs: number
+  /** 发送方 device id。 */
+  peerId: string
+  title: string | null
+  text: string
+  /** text 超过 4KiB 被截断时为 true。 */
+  truncated: boolean
+}
+
+/** Mirrors the Rust `agent_channel::AgentChannelResponse` (serde camelCase)。 */
+export interface AgentChannelResponse {
+  status: string
+  payload: unknown
+}

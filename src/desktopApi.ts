@@ -1,6 +1,12 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { APP_VERSION, RELEASES_URL, REPOSITORY_URL } from './constants'
 import { defaultLayout } from './defaultLayout'
+import {
+  agentChannelAuditVia,
+  agentChannelInboxClearVia,
+  agentChannelInboxVia,
+  agentChannelRequestVia,
+} from './agentChannelPanel'
 import type {
   AppStateSnapshot,
   DiagnosticInfo,
@@ -9,7 +15,12 @@ import type {
   PerformanceSample,
   RuntimeStatus,
 } from './runtime'
-import type { LayoutState } from './types'
+import type {
+  AgentChannelAuditEntry,
+  AgentChannelInboxMessage,
+  AgentChannelResponse,
+  LayoutState,
+} from './types'
 import type { HaloDebugSnapshot, HaloStatus } from './types'
 
 export interface AppUpdateInfo {
@@ -344,6 +355,52 @@ export async function fetchClientLog(deviceId: string): Promise<string> {
   }
 
   return invoke<string>('fetch_client_log', { deviceId })
+}
+
+// 跨机 Agent 通道（P1c，RFC §6.3）：本机主动发起 agent 请求 + 审计/收件箱。
+// 命令名与参数名契约锁定在 agentChannelPanel.ts 的 *Via 函数（有测试钉住）。
+
+export async function agentChannelRequest(
+  deviceId: string,
+  capability: string,
+  payload: unknown,
+  timeoutMs?: number,
+): Promise<AgentChannelResponse> {
+  if (!isTauri()) {
+    throw new Error('Agent 通道仅在 Tauri 桌面运行时可用。')
+  }
+
+  return agentChannelRequestVia(
+    invoke,
+    deviceId,
+    capability,
+    payload,
+    timeoutMs,
+  ) as Promise<AgentChannelResponse>
+}
+
+export async function agentChannelAudit(limit?: number): Promise<AgentChannelAuditEntry[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return agentChannelAuditVia(invoke, limit) as Promise<AgentChannelAuditEntry[]>
+}
+
+export async function agentChannelInbox(): Promise<AgentChannelInboxMessage[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return agentChannelInboxVia(invoke) as Promise<AgentChannelInboxMessage[]>
+}
+
+export async function agentChannelInboxClear(): Promise<number> {
+  if (!isTauri()) {
+    return 0
+  }
+
+  return agentChannelInboxClearVia(invoke) as Promise<number>
 }
 
 export async function relaunchApp(): Promise<void> {
