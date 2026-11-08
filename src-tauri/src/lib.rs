@@ -408,6 +408,11 @@ struct LanPeer {
     /// 落空 Vec（跨版本兼容见 RFC §6，已用字节层探测测试锁定）。
     #[serde(default)]
     pub ips: Vec<String>,
+    /// 对端的 Agent 通道能力宣告（RFC §6.3 P1c）。None = 旧版对端（无此
+    /// 字段）；Some(enabled:false) = 对端显式关闭。旧包解码落 None，
+    /// 兼容性已用跨版本双向测试锁定。
+    #[serde(default)]
+    agent_channel: Option<agent_channel::AgentChannelAnnounce>,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
     #[serde(default)]
@@ -11952,6 +11957,9 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         host,
         ip,
         ips: announcement_ips,
+        // P1c：enabled=false 也宣告（enabled:false），让对端区分「已关」与
+        //「旧版」；钳制内聚在 announce_from_config。
+        agent_channel: Some(agent_channel::announce_from_config(&layout.agent_channel)),
         transport_port: layout.transport_port,
         quic_port: normalize_quic_port(layout.transport_port, layout.quic_port),
         transport_public_key: local_device
@@ -14029,6 +14037,7 @@ mod tests {
             host: "client".into(),
             ip: "10.0.0.2".into(),
             ips: Vec::new(),
+            agent_channel: None,
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "peer-public-key".into(),
@@ -16359,6 +16368,7 @@ mod tests {
             host: "server.local".into(),
             ip: "10.0.0.1".into(),
             ips: Vec::new(),
+            agent_channel: None,
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "server-public-key".into(),
@@ -17369,8 +17379,9 @@ mod tests {
         assert_eq!(decoded.peer.ip, "10.0.0.2");
     }
 
-    /// 与旧版（无 ips 字段）LanPeer 逐字段一致的镜像结构：跨版本编解码
-    /// 双向测试的"另一端"。新增 ips 后此镜像就代表已部署的旧版客户端。
+    /// 与旧版（无 ips / agent_channel 字段）LanPeer 逐字段一致的镜像结构：
+    /// 跨版本编解码双向测试的"另一端"。新增字段后此镜像就代表已部署的
+    /// 旧版客户端——它不认识任何 serde(default) 的新键，但必须忽略它们。
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct LegacyLanPeerMirror {
@@ -17478,6 +17489,125 @@ mod tests {
         let legacy_decoded = decode_wire_packet::<LegacyDiscoveryPacketMirror>(&new_bytes)
             .expect("旧版镜像解码新包（含 ips）必须成功");
         assert_eq!(legacy_decoded.peer.ip, "10.0.0.2");
+    }
+
+    // ---- Agent 互联 P1c：LanPeer.agent_channel 能力宣告（先写失败测试） ----
+
+    #[test]
+    fn legacy_peer_without_agent_channel_field_decodes_to_none() {
+        // RFC §6.3 P1c：LanPeer 新增 agent_channel 宣告。旧版 announce 没有
+        // 该键——新版解码必须落 None（serde(default)），不得报错。
+        let old_packet = LegacyDiscoveryPacketMirror {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer: legacy_mirror_peer(&test_peer()),
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let old_bytes = rmp_serde::to_vec_named(&old_packet).expect("旧版 announce 编码成功");
+
+        let decoded = decode_discovery_packet(&old_bytes)
+            .expect("新版解码旧版 announce（无 agent_channel）必须成功");
+        assert!(
+            decoded.peer.agent_channel.is_none(),
+            "旧包解码后 agent_channel 必须是 None"
+        );
+    }
+
+    #[test]
+    fn announce_with_agent_channel_roundtrips_and_legacy_mirror_ignores_it() {
+        // 双向：① 新版带 agent_channel 的 announce 编码 → 新版解码逐字段一致；
+        // ② 同一份新字节流 → 旧版镜像解码：未知 agent_channel 键被忽略不报错
+        //（P1c 验收「跨版本混跑」：新版先升级的一端能宣告，旧端不受影响）。
+        let mut peer = test_peer();
+        peer.agent_channel = Some(agent_channel::AgentChannelAnnounce {
+            enabled: true,
+            level: "readonly".into(),
+        });
+        let new_packet = DiscoveryPacket {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer,
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let new_bytes = rmp_serde::to_vec_named(&new_packet).expect("新版 announce 编码成功");
+
+        let decoded =
+            decode_discovery_packet(&new_bytes).expect("新版解码自己带 agent_channel 的包必须成功");
+        let announce = decoded
+            .peer
+            .agent_channel
+            .expect("往返后 agent_channel 必须保留");
+        assert!(announce.enabled);
+        assert_eq!(announce.level, "readonly");
+
+        let legacy_decoded = decode_wire_packet::<LegacyDiscoveryPacketMirror>(&new_bytes)
+            .expect("旧版镜像解码新包（含 agent_channel）必须成功");
+        assert_eq!(legacy_decoded.peer.id, "peer-client-10-0-0-2");
+    }
+
+    #[test]
+    fn local_peer_from_layout_announces_agent_channel_even_when_disabled() {
+        // enabled=false 也要宣告（enabled:false, level 取 sanitized 值）：
+        // 让对端知道「此端 agent 通道已关」，而不是当成「旧版对端」。
+        let mut layout = test_layout();
+        layout.agent_channel = agent_channel::AgentChannelConfig {
+            enabled: false,
+            // 故意用非法 level：宣告必须取钳制后的有效值，不外泄脏值。
+            level: "bogus".into(),
+            file_roots: Vec::new(),
+            cmd_whitelist: Vec::new(),
+            approval_ttl_secs: 300,
+        };
+        let local_peer = local_peer_from_layout(&layout);
+        let announce = local_peer
+            .agent_channel
+            .expect("通道关闭也必须宣告（enabled:false）");
+        assert!(!announce.enabled);
+        assert_eq!(
+            announce.level, "readonly",
+            "非法 level 必须钳回 readonly（与 gate 判定一致）"
+        );
+
+        layout.agent_channel.enabled = true;
+        layout.agent_channel.level = "files".into();
+        let announce = local_peer_from_layout(&layout)
+            .agent_channel
+            .expect("通道开启时必须宣告");
+        assert!(announce.enabled);
+        assert_eq!(announce.level, "files");
+    }
+
+    #[test]
+    fn merge_peer_entry_replaces_agent_channel_announcement_with_latest() {
+        // discovery 的 peers 表合并是整体替换：对端先宣告关闭、再宣告开启，
+        // 合并后必须跟随最新 announce，不残留旧值。
+        let mut peers: Vec<LanPeer> = Vec::new();
+        let mut peer = test_peer();
+        peer.agent_channel = Some(agent_channel::AgentChannelAnnounce {
+            enabled: false,
+            level: "readonly".into(),
+        });
+        merge_peer_entry(&mut peers, peer.clone());
+
+        peer.agent_channel = Some(agent_channel::AgentChannelAnnounce {
+            enabled: true,
+            level: "files".into(),
+        });
+        merge_peer_entry(&mut peers, peer);
+
+        assert_eq!(peers.len(), 1);
+        let announce = peers[0]
+            .agent_channel
+            .as_ref()
+            .expect("合并后 agent_channel 必须保留");
+        assert!(announce.enabled, "必须跟随最新 announce（开启）");
+        assert_eq!(announce.level, "files");
     }
 
     #[test]

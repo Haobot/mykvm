@@ -241,3 +241,9 @@ export interface AgentChannelConfig {
   /** L3 审批窗口秒数（P3 消费）。 */
   approvalTtlSecs: number
 }
+
+/** Mirrors the Rust `agent_channel::AgentChannelAnnounce` (serde camelCase)。 */
+export interface AgentChannelAnnounce {
+  enabled: boolean
+  level: AgentChannelLevel
+}

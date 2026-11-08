@@ -425,6 +425,29 @@ pub(crate) fn default_agent_channel() -> AgentChannelConfig {
     AgentChannelConfig::default()
 }
 
+/// LanPeer 随 discovery announce 携带的 Agent 通道能力宣告（RFC §6.3 P1c）。
+/// 对端据此得知「此端是否具备 agent 通道、开放到哪一级」；旧版对端的包
+/// 没有该字段，LanPeer 侧 serde(default) 落 None（跨版本兼容已用字节层
+/// 测试锁定，见 lib.rs 的跨版本双向探测）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentChannelAnnounce {
+    pub enabled: bool,
+    pub level: String,
+}
+
+/// 从用户意图配置构造宣告。enabled=false 也照常宣告（enabled:false +
+/// sanitized 级别）——语义是「此端已显式关闭」，与「旧版对端（无字段）」
+/// 区分开；level 在此钳制为有效值，与 gate 判定一致（调用方不必记得
+/// 先 sanitized，钳制内聚在本函数）。
+pub(crate) fn announce_from_config(config: &AgentChannelConfig) -> AgentChannelAnnounce {
+    let sanitized = config.sanitized();
+    AgentChannelAnnounce {
+        enabled: sanitized.enabled,
+        level: sanitized.level,
+    }
+}
+
 /// Agent 通道协议包（RFC §6.1）。字段命名与既有线上包一致（camelCase），
 /// 新增字段一律带 `#[serde(default)]` 以保证向前兼容（旧解码器忽略未知字段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3631,5 +3654,28 @@ mod tests {
         )
         .expect("默认根内的路径必须放行");
         assert_eq!(payload["exists"], true);
+    }
+
+    #[test]
+    fn announce_from_config_clamps_level_and_announces_disabled() {
+        // P1c：enabled=false 也宣告（enabled:false），level 取钳制后的有效值，
+        // 不外泄脏值（与 gate 判定一致）。
+        let config = AgentChannelConfig {
+            enabled: false,
+            level: "bogus".into(),
+            ..AgentChannelConfig::default()
+        };
+        let announce = announce_from_config(&config);
+        assert!(!announce.enabled);
+        assert_eq!(announce.level, "readonly");
+
+        let config = AgentChannelConfig {
+            enabled: true,
+            level: "files".into(),
+            ..AgentChannelConfig::default()
+        };
+        let announce = announce_from_config(&config);
+        assert!(announce.enabled);
+        assert_eq!(announce.level, "files");
     }
 }
