@@ -10,6 +10,7 @@
     "beforeBuildCommand": "node scripts/build-tauri-assets.mjs"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "MyKVM",
