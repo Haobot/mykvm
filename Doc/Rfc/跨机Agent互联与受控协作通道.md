@@ -119,7 +119,7 @@ struct AgentChannelPacket {
 ### 6.3 模块划分
 
 ```
-src-tauri/src/agent_channel.rs        # 新模块：协议结构、鉴权、请求分发、pending 表（HashMap<request_id, oneshot>）、审计环形日志
+src-tauri/src/agent_channel/           # 目录模块（2026-11-08 拆分）：protocol（协议包）/auth（鉴权路由）/pending（挂起表）/config（配置与 level gate）/audit（审计环形+jsonl）/inbox（收件箱）/transport（on_stream 入口+异步执行+回发）/capabilities（能力分发与处理）/command（发起侧目标解析与超时钳制）/test_support
 src-tauri/src/agent_exec.rs           # 命令执行面：白名单匹配、spawn、超时、UTF-8 输出采集（P3）
 lib.rs                                # on_stream 插一个分支；LayoutState 加 agent_channel 配置；新增 Tauri 命令
 src/types.ts + Settings 页             # 配置 UI（开关/级别/白名单/审计查看）

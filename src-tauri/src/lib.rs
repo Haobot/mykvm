@@ -10622,7 +10622,7 @@ fn client_log_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Read at most the last `max_bytes` bytes of `path`.
-/// Agent 通道 log.read（P1b）同样用它做尾部读取，见 agent_channel::agent_handle_log_read。
+/// Agent 通道 log.read（P1b）同样用它做尾部读取，见 agent_channel::capabilities 的 log.read 处理。
 pub(crate) fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path)?;
@@ -10637,7 +10637,7 @@ pub(crate) fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u
 
 /// The newest `.log` file under `log_dir` — the one the log plugin is currently
 /// writing. Agent 通道 log.read（P1b）复用同一真相源，见
-/// agent_channel::agent_handle_log_read。
+/// agent_channel::capabilities 的 log.read 处理。
 pub(crate) fn newest_log_file_in(log_dir: &Path) -> Result<PathBuf, String> {
     fs::read_dir(log_dir)
         .map_err(|error| format!("failed to read log dir: {error}"))?

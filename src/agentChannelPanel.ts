@@ -63,7 +63,7 @@ export const AGENT_CHANNEL_LEVELS: Array<{
 
 /**
  * 旧快照缺省兜底：与 Rust `AgentChannelConfig::default()` 一致
- * （enabled=true, readonly，见 agent_channel.rs Default impl）。
+ * （enabled=true, readonly，见 agent_channel/config.rs Default impl）。
  */
 export function resolveAgentChannelConfig(
   config: AgentChannelConfig | undefined,
