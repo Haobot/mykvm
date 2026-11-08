@@ -2324,3 +2324,21 @@
 .theme-light .form-modal-heading p, .theme-light .modal-help, .theme-light .modal-maintenance { color: #626570; }
 .theme-light .modal-error { color: #b91c1c; }
 @media (max-width: 480px) { .modal-field-grid { grid-template-columns: 1fr; } .form-modal { padding: 20px; } }
+
+/* ---- Agent 通道（P1c）：审计折叠列表与收件箱（Settings 区块内，克制排版） ---- */
+.agent-audit-details { margin-top: 12px; font-size: 13px; }
+.agent-audit-details summary { cursor: pointer; color: #d4d4d8; font-weight: 700; user-select: none; }
+.agent-audit-details .inline-actions { margin: 10px 0 4px; }
+.agent-audit-list, .agent-inbox-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
+.agent-audit-list li { display: grid; grid-template-columns: 64px 28px minmax(90px, 1.4fr) minmax(70px, 1fr) 40px 2fr; gap: 8px; align-items: baseline; padding: 8px 10px; border: 1px solid #7773; border-radius: 8px; font-size: 12px; color: #d4d4d8; }
+.agent-audit-time, .agent-inbox-meta { color: #71717a; font-variant-numeric: tabular-nums; }
+.agent-audit-peer { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-audit-status { font-weight: 700; }
+.agent-audit-summary { color: #a1a1aa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-inbox-row { margin-top: 14px; }
+.agent-inbox-row h3 { margin: 0; font-size: 13px; }
+.agent-inbox-list li { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid #7773; border-radius: 8px; font-size: 13px; color: #e4e4e7; }
+.agent-inbox-title { font-size: 12px; }
+.agent-inbox-text { word-break: break-word; line-height: 1.6; }
+.theme-light .agent-audit-details summary, .theme-light .agent-audit-list li, .theme-light .agent-inbox-list li { color: #3f3f46; border-color: #d4d4d8; }
+.theme-light .agent-audit-time, .theme-light .agent-inbox-meta, .theme-light .agent-audit-summary { color: #626570; }

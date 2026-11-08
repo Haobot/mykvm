@@ -136,6 +136,19 @@ export const TEXT = {
       lockSync: "锁屏同步",
       lockSyncCopy:
         "本机锁屏时同步锁定客户端，解锁各自操作。",
+      agentChannel: "Agent 通道",
+      agentChannelCopy:
+        "允许已配对对端的 AI 助手通过 MyKVM 读取本机只读信息（运行状态、日志、白名单目录文件），全部动作留审计。",
+      agentChannelSwitch: "对端 Agent 访问",
+      agentChannelLevel: "能力级别",
+      agentChannelLevelNote:
+        "带 * 的 files / commands / full 对应能力将在后续版本开放，当前仅只读（L0）能力生效。",
+      agentChannelAuditTitle: "最近审计",
+      agentChannelAuditEmpty: "暂无审计记录。",
+      agentChannelAuditRefresh: "刷新审计",
+      agentChannelInboxTitle: "对端消息",
+      agentChannelInboxEmpty: "暂无消息。",
+      agentChannelInboxClear: "清空",
       modifierTitle: "跨平台改键",
       modifierCopy:
         "Windows 与 Mac 之间改键，默认 Ctrl 与 Command 对调。",
@@ -537,6 +550,19 @@ export const TEXT = {
       lockSync: "Lock sync",
       lockSyncCopy:
         "Lock clients with this computer; unlock each separately.",
+      agentChannel: "Agent Channel",
+      agentChannelCopy:
+        "Let the AI assistant on a paired peer read local read-only info (status, logs, whitelisted files) through MyKVM; every action is audited.",
+      agentChannelSwitch: "Peer agent access",
+      agentChannelLevel: "Capability Level",
+      agentChannelLevelNote:
+        "The starred files / commands / full capabilities arrive in later versions; only read-only (L0) works today.",
+      agentChannelAuditTitle: "Recent Audit",
+      agentChannelAuditEmpty: "No audit entries yet.",
+      agentChannelAuditRefresh: "Refresh audit",
+      agentChannelInboxTitle: "Peer Messages",
+      agentChannelInboxEmpty: "No messages.",
+      agentChannelInboxClear: "Clear",
       modifierTitle: "Cross-platform Keys",
       modifierCopy:
         "Remap Windows and Mac keys; Ctrl and Command swap by default.",

@@ -8,6 +8,7 @@ import {
   agentChannelAuditVia,
   agentChannelInboxVia,
   agentChannelRequestVia,
+  formatAgentAuditTime,
   resolveAgentChannelConfig,
   setAgentChannelLevel,
   toggleAgentChannel,
@@ -137,4 +138,14 @@ test('审计方向/状态标签映射为中文', () => {
   assert.equal(agentAuditStatusLabel('denied'), '拒绝');
   assert.equal(agentAuditStatusLabel('timeout'), '超时');
   assert.equal(agentAuditStatusLabel('weird'), 'weird');
+});
+
+test('审计时间格式化为本地时区 HH:MM:SS', () => {
+  // 固定时间戳：2026-11-08T08:09:10.000Z（UTC）。本地时区显示 HH:MM:SS，
+  // 断言只锁定「时:分:秒 数字与分隔符形状」，不依赖构建机时区。
+  const formatted = formatAgentAuditTime(Date.UTC(2026, 10, 8, 8, 9, 10));
+  assert.match(formatted, /^\d{2}:\d{2}:\d{2}$/);
+  const sameDay = formatAgentAuditTime(Date.UTC(2026, 10, 8, 8, 9, 10) + 1000);
+  assert.notEqual(sameDay, formatted, '不同时间必须给出不同显示');
+  assert.equal(formatAgentAuditTime(0), '--:--:--', '缺省时间戳不渲染 1970');
 });

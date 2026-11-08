@@ -110,3 +110,14 @@ export function agentAuditStatusLabel(status: string): string {
   if (status === 'timeout') return '超时'
   return status
 }
+
+/**
+ * 审计/收件箱时间戳 → 本地时区 HH:MM:SS（审计条目都在当天附近，日期由
+ * 会话上下文补足）。缺省 0 渲染占位符，不渲染误导性的 1970。
+ */
+export function formatAgentAuditTime(tsMs: number): string {
+  if (!Number.isFinite(tsMs) || tsMs <= 0) return '--:--:--'
+  const date = new Date(tsMs)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}

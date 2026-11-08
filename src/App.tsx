@@ -131,6 +131,7 @@ import type {
 } from "./runtime";
 import type {
   AppLanguage,
+  AgentChannelConfig,
   Device,
   FocusHaloSettings,
   HaloDebugSnapshot,
@@ -143,6 +144,7 @@ import type {
   ThemeMode,
   TransportPortMode,
 } from "./types";
+import { AgentChannelPanel } from "./agentChannelSection";
 import {
   blockingRuntimeDetail,
   createIdentityDriftTracker,
@@ -1789,6 +1791,12 @@ function App() {
 
   function setLockSync(lockSync: boolean) {
     updateLayout((layoutState) => ({ ...layoutState, lockSync }));
+  }
+
+  // P1c：Agent 通道配置（前端所有），照其它用户意图字段走 updateLayout
+  // → save_layout 既有链路；钳制由后端 save/载入路径负责。
+  function setAgentChannelConfig(agentChannel: AgentChannelConfig) {
+    updateLayout((layoutState) => ({ ...layoutState, agentChannel }));
   }
 
   function setModifierRemap(modifierRemap: boolean) {
@@ -3836,6 +3844,13 @@ function App() {
                   </div>
                 ) : null}
               </section>
+
+              {/* P1c：Agent 通道区块——紧邻「本机信息」（网络身份）就近放置。 */}
+              <AgentChannelPanel
+                config={layout.agentChannel}
+                onChange={setAgentChannelConfig}
+                ui={ui}
+              />
 
               <section className="surface-card settings-card update-card">
                 <div className="card-title-row">
