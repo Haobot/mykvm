@@ -5363,6 +5363,78 @@ async fn request_client_update(app: tauri::AppHandle, device_id: String) -> Resu
     .map_err(|error| format!("请求客户端更新任务失败: {error}"))?
 }
 
+// ---- Agent 互联 P1c 集成面（RFC §6.3）：本机主动发起 agent 请求 + 审计/收件箱查看 ----
+
+/// P1c：向对端 agent 通道发一条请求并等待响应（两段式 RPC）。对端不在线 /
+/// 未配对 / 版本过旧各返回明确中文错误；超时默认 10s、钳上限 60s。
+/// 网络等待在线程池执行（照 fetch_client_log 先例）：send_agent_request
+/// 阻塞至超时，不允许占用 Tauri 命令线程。
+#[tauri::command]
+async fn agent_channel_request(
+    app: tauri::AppHandle,
+    device_id: String,
+    capability: String,
+    payload: serde_json::Value,
+    timeout_ms: Option<u64>,
+) -> Result<agent_channel::AgentChannelResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppRuntime>();
+        let state = state.inner();
+        state.start_discovery()?;
+        let layout = state.layout_snapshot();
+        let quic_transport = state
+            .quic_transport_handle()
+            .ok_or_else(|| "QUIC transport 尚未就绪，请先启动运行时。".to_string())?;
+        let peers = active_peer_snapshot(&state.peers);
+        let target = agent_channel::agent_channel_target_for_device(&layout, &peers, &device_id)?;
+        let local_peer = local_peer_from_layout(&layout);
+        let timeout = agent_channel::clamped_agent_request_timeout(timeout_ms);
+        // PeerEndpoint 构造照 send_peer_request 先例（实时地址 + 证书钉扎公钥）。
+        let peer = quic_transport.peer(
+            target.addr.clone(),
+            target.transport_public_key.clone(),
+            target.protocol_version,
+        );
+        let response = agent_channel::send_agent_request(
+            &quic_transport,
+            &peer,
+            &layout,
+            &local_peer.id,
+            quic_transport.public_key(),
+            &target.device_id,
+            &capability,
+            payload,
+            timeout,
+            &agent_channel::global_audit_log(),
+        )
+        .map_err(|error| format!("agent 请求失败: {error}"))?;
+        Ok(agent_channel::AgentChannelResponse {
+            status: response.status,
+            payload: response.payload,
+        })
+    })
+    .await
+    .map_err(|error| format!("agent 请求任务失败: {error}"))?
+}
+
+/// P1c：Agent 通道审计快照，最新在前；limit 缺省 100、钳制 2000。
+#[tauri::command]
+fn agent_channel_audit(limit: Option<usize>) -> Vec<agent_channel::AgentAuditEntry> {
+    agent_channel::recent_audit_snapshot(&agent_channel::global_audit_log(), limit)
+}
+
+/// P1c：Agent 通道收件箱快照（按时间升序）。
+#[tauri::command]
+fn agent_channel_inbox() -> Vec<agent_channel::AgentInboxMessage> {
+    agent_channel::global_agent_inbox().snapshot()
+}
+
+/// P1c：清空收件箱，返回清掉的条数。
+#[tauri::command]
+fn agent_channel_inbox_clear() -> usize {
+    agent_channel::drain_agent_inbox(&agent_channel::global_agent_inbox())
+}
+
 #[tauri::command]
 fn sync_window_chrome(window: tauri::WebviewWindow, theme: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -6636,6 +6708,10 @@ pub fn run() {
             send_files_to_device,
             fetch_client_log,
             request_client_update,
+            agent_channel_request,
+            agent_channel_audit,
+            agent_channel_inbox,
+            agent_channel_inbox_clear,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -17608,6 +17684,79 @@ mod tests {
             .expect("合并后 agent_channel 必须保留");
         assert!(announce.enabled, "必须跟随最新 announce（开启）");
         assert_eq!(announce.level, "files");
+    }
+
+    #[test]
+    fn agent_channel_target_requires_pairing_and_online_peer() {
+        // P1c 命令 agent_channel_request 的目标解析（模式照抄
+        // file_transfer_target_for_device，Agent 语境的错误文案）。
+        let layout = test_layout();
+        let mut peer = test_peer();
+        peer.agent_channel = Some(agent_channel::AgentChannelAnnounce {
+            enabled: true,
+            level: "readonly".into(),
+        });
+        let peers = vec![peer];
+
+        // 未配对（cluster/secret 任一为空）直接报错。
+        let mut unpaired = test_layout();
+        unpaired.pair_secret = String::new();
+        let error = agent_channel::agent_channel_target_for_device(
+            &unpaired,
+            &peers,
+            "peer-client-10-0-0-2",
+        )
+        .expect_err("未配对必须报错");
+        assert!(error.contains("配对"), "未配对错误要指明配对: {error}");
+
+        // 对端真正离线的语义 = 实时 peers 表没有它（announce 已过期）且
+        // device 表也标记 offline：必须报「不在线」，不盲发请求。
+        let mut offline_layout = test_layout();
+        offline_layout.devices[1].online = false;
+        let error = agent_channel::agent_channel_target_for_device(
+            &offline_layout,
+            &[],
+            "peer-client-10-0-0-2",
+        )
+        .expect_err("对端离线必须报「不在线」");
+        assert!(error.contains("不在线"), "离线错误文案: {error}");
+
+        // peers 表命中即在线（announce 新鲜），device.online 滞后不影响：
+        // presence 同步可能落后于 discovery（两表不一致时信 peers 表，
+        // 避免「显示离线但实际可达」误伤）。
+        let mut stale_presence_layout = test_layout();
+        stale_presence_layout.devices[1].online = false;
+        let target = agent_channel::agent_channel_target_for_device(
+            &stale_presence_layout,
+            &peers,
+            "peer-client-10-0-0-2",
+        )
+        .expect("peers 表命中时即使 presence 滞后也必须命中");
+        assert_eq!(target.device_id, "peer-client-10-0-0-2");
+
+        // 在线命中：地址取 peers 表实时值（id 内嵌 IP 会漂移，见 AGENTS.md 坑 6）。
+        let target =
+            agent_channel::agent_channel_target_for_device(&layout, &peers, "peer-client-10-0-0-2")
+                .expect("在线对端必须命中");
+        assert_eq!(target.device_id, "peer-client-10-0-0-2");
+        assert_eq!(target.addr, "10.0.0.2:52001");
+        assert_eq!(target.transport_public_key, "peer-public-key");
+
+        // 版本过旧（protocol_version 不一致）明确报错，不发请求。
+        let mut stale_peers = peers.clone();
+        stale_peers[0].protocol_version = quic_transport::PROTOCOL_VERSION - 1;
+        let error = agent_channel::agent_channel_target_for_device(
+            &layout,
+            &stale_peers,
+            "peer-client-10-0-0-2",
+        )
+        .expect_err("版本过旧必须报错");
+        assert!(error.contains("升级"), "版本错误文案: {error}");
+
+        // 查无此设备。
+        let error = agent_channel::agent_channel_target_for_device(&layout, &peers, "peer-unknown")
+            .expect_err("未知设备必须报错");
+        assert!(!error.is_empty());
     }
 
     #[test]

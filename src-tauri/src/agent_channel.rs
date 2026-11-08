@@ -1392,6 +1392,203 @@ fn agent_error_message(payload: &Value, status: &str) -> String {
         .unwrap_or_else(|| format!("对端返回 {status}"))
 }
 
+// ---- P1c 集成面：Tauri 命令辅助（纯函数，可独立测试） ----
+
+/// agent_channel_request 命令的返回结构（serde camelCase → 前端 wrapper）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentChannelResponse {
+    /// response 的 status："ok" | "err"（对端返回什么就是什么）。
+    pub status: String,
+    pub payload: Value,
+}
+
+/// 请求超时钳制（P1c 命令）：默认 10s；Some(0) 视为未指定；上限 60s
+///（防调用方误传超大值占住线程池——send_agent_request 是阻塞等待）。
+pub(crate) fn clamped_agent_request_timeout(timeout_ms: Option<u64>) -> Duration {
+    const DEFAULT_MS: u64 = 10_000;
+    const MAX_MS: u64 = 60_000;
+    match timeout_ms {
+        None | Some(0) => Duration::from_millis(DEFAULT_MS),
+        Some(ms) => Duration::from_millis(ms.min(MAX_MS)),
+    }
+}
+
+/// 审计快照（P1c 命令 agent_channel_audit）：**最新在前**（倒序）；
+/// limit 缺省 100、显式 0 视为未指定（避免调用方误传 0 拿到空列表
+/// 误判「没有审计」）、超过环形容量按容量封顶。
+pub(crate) fn recent_audit_snapshot(
+    log: &AgentAuditLog,
+    limit: Option<usize>,
+) -> Vec<AgentAuditEntry> {
+    const DEFAULT_LIMIT: usize = 100;
+    let cap = limit.filter(|limit| *limit > 0).unwrap_or(DEFAULT_LIMIT);
+    let mut entries = log.snapshot();
+    entries.reverse();
+    entries.truncate(cap.min(AGENT_AUDIT_RING_CAPACITY));
+    entries
+}
+
+/// 清空收件箱并返回清掉的条数（P1c 命令 agent_channel_inbox_clear）。
+pub(crate) fn drain_agent_inbox(inbox: &AgentInbox) -> usize {
+    let Ok(mut messages) = inbox.messages.lock() else {
+        return 0;
+    };
+    let cleared = messages.len();
+    messages.clear();
+    cleared
+}
+
+/// agent_channel_request 的目标解析结果：不含凭据（cluster/secret 由
+/// 命令从 layout 快照取），只含把 PeerEndpoint 拼出来所需的实时寻址。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentChannelTarget {
+    /// 目标当前 announce 的 device id（内嵌 LAN 地址会漂移，发送时按它
+    /// 填 target_id——与路由消歧的前缀放行语义一致，见 AGENTS.md 坑 6）。
+    pub device_id: String,
+    pub name: String,
+    pub addr: String,
+    pub transport_public_key: String,
+    pub protocol_version: u16,
+}
+
+/// 目标解析（P1c 命令 agent_channel_request；模式照抄 lib.rs
+/// `file_transfer_target_for_device` 先例，Agent 语境的两处差异）：
+/// ① **不要求 input_ready**——agent 通道不注入输入，被控端
+///    inputReady=false 只影响键鼠，不影响 agent 响应；
+/// ② server 角色也**优先实时 peers 表**拿地址（id 内嵌 LAN 地址会漂移，
+///    announce 表是最新真相源，见 AGENTS.md 坑 6），device 表兜底。
+/// 错误文案为面向调用方的中文（未配对 / 不在线 / 版本过旧）。
+pub(crate) fn agent_channel_target_for_device(
+    layout: &crate::LayoutState,
+    peers: &[crate::LanPeer],
+    device_id: &str,
+) -> Result<AgentChannelTarget, String> {
+    if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        return Err("当前设备尚未完成配对，无法使用 Agent 通道。".into());
+    }
+
+    // client 角色唯一目标是其控制器（照 file_transfer_target_for_device：
+    // devices 里可能残留做 server 时期的旧条目，先查控制器）。
+    if layout.machine_role == "client" {
+        if let Some(controller) = layout
+            .paired_controllers
+            .iter()
+            .find(|controller| controller.id == device_id)
+        {
+            let peer = peers
+                .iter()
+                .find(|peer| {
+                    peer.id == controller.id
+                        || (!controller.transport_public_key.trim().is_empty()
+                            && peer.transport_public_key == controller.transport_public_key)
+                })
+                .ok_or_else(|| format!("{} 当前不在线，无法使用 Agent 通道。", controller.name))?;
+            if peer.protocol_version != crate::quic_transport::PROTOCOL_VERSION
+                || peer.transport_public_key.trim().is_empty()
+                || peer.quic_port == 0
+            {
+                return Err(format!(
+                    "{} 的 MyKVM 版本过旧，请先升级后重试。",
+                    controller.name
+                ));
+            }
+            let host = if !peer.ip.trim().is_empty() {
+                peer.ip.clone()
+            } else {
+                crate::file_transfer_host(&peer.host)
+                    .or_else(|| crate::file_transfer_host(&controller.ip))
+                    .or_else(|| crate::file_transfer_host(&controller.host))
+                    .ok_or_else(|| format!("{} 缺少可用地址。", controller.name))?
+            };
+            return Ok(AgentChannelTarget {
+                device_id: peer.id.clone(),
+                name: controller.name.clone(),
+                addr: format!("{}:{}", host, peer.quic_port),
+                transport_public_key: peer.transport_public_key.clone(),
+                protocol_version: peer.protocol_version,
+            });
+        }
+    }
+
+    // 实时 peers 表优先（同 id，或同 transport_public_key 钉扎的已保存
+    // 设备——id 会随 IP 漂移，证书公钥才是稳定身份，与控制器查找同因）。
+    if let Some(peer) = peers
+        .iter()
+        .find(|peer| peer.id == device_id || peer_matches_device(layout, peer, device_id))
+    {
+        if peer.protocol_version != crate::quic_transport::PROTOCOL_VERSION
+            || peer.transport_public_key.trim().is_empty()
+            || peer.quic_port == 0
+        {
+            return Err(format!("{} 的 MyKVM 版本过旧，请先升级后重试。", peer.name));
+        }
+        let host = if !peer.ip.trim().is_empty() {
+            peer.ip.clone()
+        } else {
+            crate::file_transfer_host(&peer.host)
+                .ok_or_else(|| format!("{} 缺少可用地址。", peer.name))?
+        };
+        return Ok(AgentChannelTarget {
+            device_id: peer.id.clone(),
+            name: peer.name.clone(),
+            addr: format!("{}:{}", host, peer.quic_port),
+            transport_public_key: peer.transport_public_key.clone(),
+            protocol_version: peer.protocol_version,
+        });
+    }
+
+    // peers 表没有（announce 刚过期等）：device 表兜底，但必须在线。
+    if let Some(device) = layout
+        .devices
+        .iter()
+        .find(|device| device.id == device_id && device.role != "local")
+    {
+        if !device.online {
+            return Err(format!("{} 当前不在线，无法使用 Agent 通道。", device.name));
+        }
+        let quic_port = crate::normalize_quic_port(device.transport_port, device.quic_port);
+        if device.protocol_version != crate::quic_transport::PROTOCOL_VERSION
+            || device.transport_public_key.trim().is_empty()
+            || quic_port == 0
+        {
+            return Err(format!(
+                "{} 的 MyKVM 版本过旧，请先升级后重试。",
+                device.name
+            ));
+        }
+        let host = crate::file_transfer_host(&device.host)
+            .ok_or_else(|| format!("{} 缺少可用地址。", device.name))?;
+        return Ok(AgentChannelTarget {
+            device_id: device.id.clone(),
+            name: device.name.clone(),
+            addr: format!("{}:{}", host, quic_port),
+            transport_public_key: device.transport_public_key.clone(),
+            protocol_version: device.protocol_version,
+        });
+    }
+
+    Err("没有找到可使用 Agent 通道的目标设备。".into())
+}
+
+/// peer 的 transport_public_key 是否与 device_id 对应已保存设备的钉扎
+/// 公钥一致（id 漂移场景的稳定身份匹配；先例见
+/// file_transfer_target_for_device 的控制器分支同款匹配）。
+fn peer_matches_device(
+    layout: &crate::LayoutState,
+    peer: &crate::LanPeer,
+    device_id: &str,
+) -> bool {
+    if peer.transport_public_key.trim().is_empty() {
+        return false;
+    }
+    layout.devices.iter().any(|device| {
+        device.id == device_id
+            && !device.transport_public_key.trim().is_empty()
+            && device.transport_public_key == peer.transport_public_key
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3677,5 +3874,85 @@ mod tests {
         let announce = announce_from_config(&config);
         assert!(announce.enabled);
         assert_eq!(announce.level, "files");
+    }
+
+    #[test]
+    fn recent_audit_snapshot_returns_newest_first_with_clamped_limit() {
+        // P1c 命令 agent_channel_audit 的实现：最新在前（倒序），
+        // limit 缺省 100、显式 0 视为未指定、超大值钳到环形容量。
+        let log = AgentAuditLog::in_memory();
+        for index in 0..3 {
+            log.record(AgentAuditEntry::new(
+                "in",
+                "peer-1",
+                "log.read",
+                &format!("req-{index}"),
+                "ok",
+                0,
+                "",
+            ));
+        }
+
+        let recent = recent_audit_snapshot(&log, None);
+        assert_eq!(recent.len(), 3, "默认 limit=100 不截短 3 条");
+        assert_eq!(recent[0].request_id, "req-2", "最新在前");
+        assert_eq!(recent[2].request_id, "req-0");
+
+        let recent = recent_audit_snapshot(&log, Some(2));
+        assert_eq!(recent.len(), 2, "显式 limit 截短");
+        assert_eq!(recent[0].request_id, "req-2", "截短后仍最新在前");
+
+        let recent = recent_audit_snapshot(&log, Some(0));
+        assert_eq!(recent.len(), 3, "Some(0) 视为未指定，按默认 100 处理");
+
+        let recent = recent_audit_snapshot(&log, Some(usize::MAX));
+        assert_eq!(recent.len(), 3, "超大 limit 钳到 2000，实际以环形条数为准");
+    }
+
+    #[test]
+    fn drain_agent_inbox_returns_cleared_count_and_empties() {
+        let inbox = AgentInbox::new();
+        inbox.push(AgentInboxMessage {
+            ts_ms: 1,
+            peer_id: "peer-1".into(),
+            title: None,
+            text: "a".into(),
+            truncated: false,
+        });
+        inbox.push(AgentInboxMessage {
+            ts_ms: 2,
+            peer_id: "peer-1".into(),
+            title: None,
+            text: "b".into(),
+            truncated: false,
+        });
+
+        assert_eq!(drain_agent_inbox(&inbox), 2, "返回清掉的条数");
+        assert!(inbox.snapshot().is_empty(), "清空后收件箱为空");
+        assert_eq!(drain_agent_inbox(&inbox), 0, "再清一次为 0");
+    }
+
+    #[test]
+    fn clamped_agent_request_timeout_defaults_to_10s_and_caps_at_60s() {
+        // P1c 命令 agent_channel_request 的超时钳制：默认 10s，Some(0)
+        // 视为未指定，上限 60s。
+        assert_eq!(
+            clamped_agent_request_timeout(None),
+            Duration::from_millis(10_000)
+        );
+        assert_eq!(
+            clamped_agent_request_timeout(Some(0)),
+            Duration::from_millis(10_000),
+            "Some(0) 视为未指定"
+        );
+        assert_eq!(
+            clamped_agent_request_timeout(Some(500)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            clamped_agent_request_timeout(Some(600_000)),
+            Duration::from_millis(60_000),
+            "钳上限 60s"
+        );
     }
 }
