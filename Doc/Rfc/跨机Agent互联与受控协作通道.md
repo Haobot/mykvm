@@ -158,7 +158,7 @@ Agent 侧工具命名建议：`peer_status` / `peer_log` / `peer_file_read` / `p
 | P0 协议骨架 ✅ 2026-11-07（4ed881c） | `agent_channel.rs` + 协议包 + on_stream 分支 + 鉴权 + 两段式 RPC 闭环（echo 能力）+ 跨版本混跑测试 | 双端真实 QUIC 上 echo 往返 ✓；**旧版对端收到 agent 包优雅拒绝不崩不挂起** ✓；`cargo test --lib` 515 全绿 ✓；鉴权否定路径（错 cluster/一位差 secret/白名单外/空 secret）✓ |
 | P1a 基础设施 ✅ 2026-11-08（ab22da4） | 异步执行模型 + `AgentChannelConfig`/level gate + 审计环形日志 + 路由函数与 input.rs 统一 + `status.get` / `msg.send` | level 不足被拒且审计记 `denied` ✓；鉴权失败也留痕（对外仍静默）✓；echo 闭环在异步模型下仍绿 ✓（545 测试） |
 | P1b 只读能力 ✅ 2026-11-08（69ca131） | `file.stat` / `file.read`（≤1MiB 内联）/ `log.read`（尾部） | 白名单根目录外、`..` 穿越、junction 逃逸全部拒绝 ✓；大小参数被钳制 ✓（588 测试）。已知限制：log.read 窗口恰从行首开始时仍丢第一完整行 |
-| P1c 集成面 | Tauri 命令 + `LanPeer` 能力宣告 + `desktopApi.ts` + 最小 Settings 开关 | A 端（通过手动 invoke）能拉到 B 端日志与状态；审计记录完整；L0 为默认级别 |
+| P1c 集成面 ✅ 2026-11-08（d192825） | Tauri 命令（request/audit/inbox/clear） + `LanPeer` 能力宣告 + `desktopApi.ts` + Settings「Agent 通道」区块 | invoke 契约测试锁定 ✓；旧字节流解码 None、enabled=false 也宣告 ✓；cargo 597 + npm 63 全绿 ✓。已知限制：仅拨 peer 首选地址，多接口容错随 Happy Eyeballs P1 |
 | P2 文件交换 | `file.write` + transfer_id 大载荷集成 + 进度 UI（复用 `file-transfer-progress`） | ≥100MiB 文件双向传输带进度与断点续传；与剪贴板并发不互饿（并发预算处理） |
 | P3 命令控制 | `cmd.run` L2 白名单 + L3 审批 UI + 熔断开关 | 白名单外命令被拒并审计；L3 全流程：请求→对端弹窗（完整命令可见）→批准/拒绝→结果回传；熔断后键鼠/剪贴板不受影响 |
 | P4 Agent 集成 | MCP stdio server + `human.ask` halo 联动 | ZCode 在 A 机通过 MCP 工具驱动 B 机完成一次真实联调循环（拉日志→改→构建→回传产物）；`human.ask` 光环提示可见 |
