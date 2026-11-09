@@ -560,7 +560,10 @@ pub(crate) fn step(
         );
         (park_board.0 - state.screen.x, park_board.1 - state.screen.y)
     } else {
-        (state.norm.0 * state.screen.width, state.norm.1 * state.screen.height)
+        (
+            state.norm.0 * state.screen.width,
+            state.norm.1 * state.screen.height,
+        )
     };
     let local = (
         state.servo_x.step(target_x, tick_dt, &tuning),
@@ -1064,6 +1067,21 @@ fn handle_command(
             false
         }
         EngineCommand::SetScreens(screens) => {
+            // A topology change can retire the tracked screen (display
+            // unplugged): re-anchor to the first entry so the halo keeps
+            // rendering on a real display instead of a dead geometry. The
+            // held region re-points the tracked screen on its next tick when
+            // it still resolves, and the run loop re-hosts the overlay on the
+            // next tick because `pushed_screen` no longer matches.
+            if !screens.iter().any(|entry| entry.geometry == state.screen) {
+                if let Some(first) = screens.first() {
+                    log::info!(
+                        "halo: tracked screen left the layout; re-anchoring to {}",
+                        first.screen_id
+                    );
+                    state.screen = first.geometry;
+                }
+            }
             state.screens = screens;
             false
         }
@@ -2417,6 +2435,35 @@ mod tests {
     // is superseded by `s4_remote_commit_latches_once_without_local_warp_and_
     // records_undo` below: a commit whose screen is not in the local list now
     // takes the S4 remote path instead of silently doing nothing.)
+
+    #[test]
+    fn set_screens_reanchors_when_the_tracked_screen_disappears() {
+        let (mut s, _warps) = s3_state(true);
+        // Commit region 1 so the tracked screen moves to s2.
+        step(&mut s, Some(s3_sample(0, 6.0)), 0, false);
+        let _ = s3_hold_until(&mut s, 33, 6.0, 5.0, 1000, true);
+        assert_eq!(s.screen, s3_screen("s2", 1000.0).geometry);
+        // The display behind s2 is unplugged and the survivor moved: the new
+        // list no longer contains the tracked geometry, so the engine must
+        // re-anchor to the surviving entry instead of rendering on a dead
+        // screen.
+        drive(
+            &mut s,
+            EngineCommand::SetScreens(vec![s3_screen("s1", 500.0)]),
+            2000,
+        );
+        assert_eq!(s.screen, s3_screen("s1", 500.0).geometry);
+        // Adding a screen while the tracked one survives must NOT move the
+        // anchor (a topology change alone is not a screen switch).
+        let mut grown = vec![s3_screen("s1", 500.0), s3_screen("s2", 1000.0)];
+        grown.push(s3_screen("s3", 2000.0));
+        drive(&mut s, EngineCommand::SetScreens(grown), 2100);
+        assert_eq!(
+            s.screen,
+            s3_screen("s1", 500.0).geometry,
+            "anchor unchanged when the tracked screen stays in the list"
+        );
+    }
 
     // ------------------------------------------------------------------
     // S4 tests: cross-machine switches (remote region targets)

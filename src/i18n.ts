@@ -285,7 +285,7 @@ export const TEXT = {
       haloScreenCalCornerTr: "右上",
       haloScreenCalCornerBr: "右下",
       haloScreenCalCornerBl: "左下",
-      haloScreenCalTopologyWarning: "显示器布局已变化，建议重新校准",
+      haloScreenCalTopologyWarning: "显示器布局已变化，转头切屏已暂停（暂用单屏跟踪），请重新校准",
       haloScreenCalRemoteTag: "对端",
       haloLeanTitle: "坐姿微移采样（可选，提升坐姿移动后的切屏准确性）",
       haloLeanCopy:
@@ -686,7 +686,7 @@ export const TEXT = {
       haloScreenCalCornerTr: "top-right",
       haloScreenCalCornerBr: "bottom-right",
       haloScreenCalCornerBl: "bottom-left",
-      haloScreenCalTopologyWarning: "Display layout changed — recalibrate the screens",
+      haloScreenCalTopologyWarning: "Display layout changed — head-turn switching paused (single-screen tracking); recalibrate to resume",
       haloScreenCalRemoteTag: "Remote",
       haloLeanTitle: "Lean capture (optional, improves switching accuracy after you shift seat)",
       haloLeanCopy:

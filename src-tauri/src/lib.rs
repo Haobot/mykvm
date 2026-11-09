@@ -1859,14 +1859,17 @@ fn save_layout(
         // S3: the saved layout can also change this machine's screen list,
         // so the engine's region-switch targets follow the saved topology
         // in both branches (the multi-screen calibration itself rides
-        // inside SetSettings).
+        // inside SetSettings). `halo_engine_settings` additionally gates a
+        // stale calibration (topology changed since capture) out of the
+        // engine in both branches.
         halo.set_screens(halo_screen_entries(&saved_layout));
+        let gated = halo_engine_settings(&saved_layout.focus_halo, &saved_layout);
         if halo.is_running() {
             // Parameters take effect immediately on save while tracking runs.
-            halo.set_settings(saved_layout.focus_halo.clone());
+            halo.set_settings(gated);
         } else {
             // Disabled: just refresh the snapshot the P0 test overlay reads.
-            halo.configure(saved_layout.focus_halo.clone());
+            halo.configure(gated);
         }
     }
     Ok(state.snapshot())
@@ -2165,17 +2168,20 @@ fn apply_halo_enabled(state: &AppRuntime, enabled: bool) -> Result<String, Strin
             .unwrap_or("FocusHalo overlay is not supported on this platform")
             .to_string());
     }
-    let settings = halo_settings_snapshot(state);
-    let geometry = halo_tracking_geometry(state)?;
-    // S3: the engine's screen list follows the live topology (layout lock
-    // released before the halo lock is taken, per the lock-order contract).
-    let screen_entries = {
+    // Settings + screen entries in one layout hold: `halo_engine_settings`
+    // also gates a stale multi-screen calibration out of the engine (the
+    // topology flag lives in lib because the engine cannot see peers).
+    let (settings, screen_entries) = {
         let layout = state
             .layout
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
-        halo_screen_entries(&layout)
+        (
+            halo_engine_settings(&layout.focus_halo, &layout),
+            halo_screen_entries(&layout),
+        )
     };
+    let geometry = halo_tracking_geometry(state)?;
     let mut runtime = state
         .halo
         .lock()
@@ -2397,24 +2403,42 @@ fn halo_recenter(state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
 /// the layout lock (`update_layout_focus_halo`), sleeps in
 /// `sample_latest_pose`, and finally takes the halo lock.
 ///
-/// With a multi-screen calibration present, the recenter also shifts every
-/// region quad so the current (seat-compensated) pose maps to the active
-/// screen's center; the single-screen profile recenter still applies on top
-/// as before, keeping both paths calibrated from one hotkey press.
+/// With a multi-screen calibration present (and still matching the live
+/// display topology), the recenter also shifts every region quad so the
+/// current (seat-compensated) pose maps to the active screen's center; the
+/// single-screen profile recenter still applies on top as before, keeping
+/// both paths calibrated from one hotkey press. A calibration left stale by a
+/// topology change is NOT shifted — see the gate inside.
 fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
     let (yaw, pitch, u, v) = sample_latest_pose(state, true)?;
     let pose = (yaw, pitch);
+    // A stale multi-screen calibration (display topology changed since
+    // capture) must not be recentered: shifting stale pose quads cannot fix a
+    // topology change and would anchor them to the wrong screen, pushing the
+    // halo further from the native screen's center. The stored calibration
+    // stays untouched and dormant until the topology matches again; only the
+    // single-screen profile shifts below, which is what pulls the halo back
+    // to the tracked (primary) screen's center.
+    let screen_cal_usable = {
+        let layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        screen_cal_topology_flag(&layout.focus_halo, &layout) != Some(false)
+    };
     let mut calibration = None;
     let mut screen_calibration = None;
     update_layout_focus_halo(state, |focus_halo| {
         // S3: shift the region quads first so the pose lands on the active
         // region's centroid (a first-order (0.5, 0.5) alignment; see
         // `recenter_screen_calibration`).
-        if let Some(cal) = focus_halo.screen_calibration.clone() {
-            let compensated = halo::screen_map::compensate(pose, (u, v), &cal);
-            let shifted = halo::screen_map::recenter_screen_calibration(&cal, compensated);
-            focus_halo.screen_calibration = Some(shifted.clone());
-            screen_calibration = Some(shifted);
+        if screen_cal_usable {
+            if let Some(cal) = focus_halo.screen_calibration.clone() {
+                let compensated = halo::screen_map::compensate(pose, (u, v), &cal);
+                let shifted = halo::screen_map::recenter_screen_calibration(&cal, compensated);
+                focus_halo.screen_calibration = Some(shifted.clone());
+                screen_calibration = Some(shifted);
+            }
         }
         let shifted = halo::mapping::recenter_calibration(
             &focus_halo.calibration.clone().unwrap_or_default(),
@@ -2424,6 +2448,14 @@ fn halo_recenter_impl(state: &AppRuntime) -> Result<(), String> {
         calibration = Some(shifted);
         Ok(())
     })?;
+    log::info!(
+        "halo: recenter pose=({yaw:.1}, {pitch:.1}) u={u:.2} v={v:.2} multi_screen={}",
+        if screen_cal_usable {
+            "shifted"
+        } else {
+            "suspended (display topology changed since calibration)"
+        }
+    );
     let calibration = calibration.ok_or_else(|| "failed to apply recenter".to_string())?;
     let mut runtime = state
         .halo
@@ -2850,6 +2882,32 @@ fn screen_cal_topology_flag(
         &filtered,
         &screen_cal_live_board_rects(layout, &calibrated_ids),
     ))
+}
+
+/// Settings as the engine may consume them: a stored multi-screen calibration
+/// that no longer matches the live display topology (a display was added,
+/// moved or removed after capture) must not drive the engine — its stale pose
+/// quads attribute gaze to screens that moved away (observed: looking at a
+/// newly connected display latched a remote takeover to a peer), and a
+/// recenter would shift those quads into garbage instead of restoring the
+/// halo. The calibration is stripped here and stays dormant in the layout
+/// until the topology matches again (the extra display is unplugged) or a
+/// fresh wizard run replaces it; tracking meanwhile falls back to the
+/// single-screen path on the tracked (primary) screen, which is exactly what
+/// "recenter back to the native screen center" expects.
+fn halo_engine_settings(
+    focus_halo: &halo::FocusHaloSettings,
+    layout: &LayoutState,
+) -> halo::FocusHaloSettings {
+    let mut settings = focus_halo.clone().sanitized();
+    if screen_cal_topology_flag(focus_halo, layout) == Some(false) {
+        if settings.screen_calibration.take().is_some() {
+            log::info!(
+                "halo: display topology changed since the screen calibration; multi-screen switching suspended until recalibration"
+            );
+        }
+    }
+    settings
 }
 
 /// Parse the wizard's corner parameter (`"tl"|"tr"|"br"|"bl"`).
@@ -3330,7 +3388,38 @@ fn halo_screen_cal_finish_impl(state: &AppRuntime) -> Result<HaloScreenCalSummar
         Ok(())
     })?;
 
-    // 4. Teardown the wizard (wizard lock alone; badge hide dispatches).
+    // 4. Hand the fresh calibration to a running engine immediately — until
+    //    now the wizard only persisted, leaving the engine on whatever it had
+    //    (possibly the suspended stale one) until the next settings save. The
+    //    freshly captured regions describe the live topology by construction,
+    //    but the same gate as everywhere else decides, so a display that
+    //    changed mid-wizard still cannot smuggle a stale calibration in.
+    {
+        let usable = {
+            let layout = state
+                .layout
+                .lock()
+                .map_err(|_| "layout state lock poisoned".to_string())?;
+            screen_cal_topology_flag(&layout.focus_halo, &layout) != Some(false)
+        };
+        if usable {
+            if let Ok(mut runtime) = state.halo.lock() {
+                if runtime.is_running() {
+                    runtime.set_screen_calibration(Some(calibration.clone()));
+                    log::info!(
+                        "halo: screen calibration finished ({} regions); pushed to the running engine",
+                        calibration.regions.len()
+                    );
+                }
+            }
+        } else {
+            log::warn!(
+                "halo: screen calibration finished but the display topology changed during capture; engine keeps single-screen tracking"
+            );
+        }
+    }
+
+    // 5. Teardown the wizard (wizard lock alone; badge hide dispatches).
     if let Ok(mut wizard) = state.halo_screen_cal.lock() {
         wizard.reset();
     }
@@ -3410,9 +3499,31 @@ fn halo_screen_cal_lean_impl(state: &AppRuntime) -> Result<HaloLeanStatus, Strin
             update_layout_focus_halo(state, |focus_halo| {
                 apply_lean_alphas(focus_halo, alpha_u, alpha_v)
             })?;
-            if let Ok(mut runtime) = state.halo.lock() {
-                let updated = halo_settings_snapshot(state).screen_calibration;
-                runtime.set_screen_calibration(updated);
+            // Push the refined calibration to a running engine, but only when
+            // it still matches the live topology: handing a stale calibration
+            // (display changed since capture) to the engine would re-activate
+            // region switching with misattributing quads — exactly what the
+            // settings gate suspends elsewhere. The refined alphas stay
+            // persisted for whenever the calibration becomes usable again.
+            let (updated, usable) = {
+                let layout = match state.layout.lock() {
+                    Ok(layout) => layout,
+                    Err(_) => {
+                        return Ok(HaloLeanStatus::Fitted {
+                            trans_alpha_yaw: alpha_u,
+                            trans_alpha_pitch: alpha_v,
+                        })
+                    }
+                };
+                (
+                    layout.focus_halo.screen_calibration.clone(),
+                    screen_cal_topology_flag(&layout.focus_halo, &layout) != Some(false),
+                )
+            };
+            if usable {
+                if let Ok(mut runtime) = state.halo.lock() {
+                    runtime.set_screen_calibration(updated);
+                }
             }
             log::info!(
                 "halo: lean capture fitted trans_alpha_yaw={alpha_u:.2} trans_alpha_pitch={alpha_v:.2}; persisted and pushed"
@@ -7284,8 +7395,18 @@ fn refresh_local_screens(app: &AppHandle) {
         // S3: push the fresh screen list to a running halo engine so region
         // switching and cursor warping follow the new topology (a no-op when
         // tracking is disabled — the list is stored for the next enable).
+        // The settings ride along: a topology change is exactly what can
+        // strand a stale multi-screen calibration in the engine (or make a
+        // stored one valid again), and the gate in `halo_engine_settings`
+        // needs the layout to decide.
         if let Ok(mut halo) = state.halo.lock() {
             halo.set_screens(halo_screen_entries(&snapshot));
+            let gated = halo_engine_settings(&snapshot.focus_halo, &snapshot);
+            if halo.is_running() {
+                halo.set_settings(gated);
+            } else {
+                halo.configure(gated);
+            }
         }
         // Capture also caches native cursor geometry. Rebuild it on a real
         // display change; the live QUIC receiver reads the same native layout.
@@ -18052,6 +18173,49 @@ mod tests {
             screen_cal_topology_flag(&settings, &extra),
             Some(false),
             "screen count change breaks the topology"
+        );
+    }
+
+    #[test]
+    fn halo_engine_settings_strips_a_stale_calibration_only() {
+        let mut settings = halo::FocusHaloSettings::default();
+        // No calibration stored: the gate is a no-op.
+        let layout = test_layout();
+        assert_eq!(
+            halo_engine_settings(&settings, &layout).screen_calibration,
+            None
+        );
+
+        // A calibration whose topology still matches reaches the engine.
+        let mut matched = test_layout();
+        matched.devices[0].screens = vec![wizard_screen("screen-0", 0, 0)];
+        settings.screen_calibration = Some(topology_calibration(&["screen-0"], 0));
+        let gated = halo_engine_settings(&settings, &matched);
+        assert_eq!(
+            gated.screen_calibration, settings.screen_calibration,
+            "matching topology keeps the calibration"
+        );
+
+        // The display topology then changes (an extra screen appears, the
+        // calibration-capture scenario of this fix): the engine must not get
+        // the stale calibration ...
+        let mut extra = test_layout();
+        extra.devices[0].screens = vec![
+            wizard_screen("screen-0", 0, 0),
+            wizard_screen("screen-1", 1920, 0),
+        ];
+        let gated = halo_engine_settings(&settings, &extra);
+        assert_eq!(
+            gated.screen_calibration, None,
+            "stale calibration is stripped from the engine settings"
+        );
+        // ... while the stored layout keeps it dormant (only the engine copy
+        // is stripped; unplug the extra screen and the gate passes again).
+        assert!(settings.screen_calibration.is_some());
+        let gated = halo_engine_settings(&settings, &matched);
+        assert!(
+            gated.screen_calibration.is_some(),
+            "calibration resumes when the topology matches again"
         );
     }
 
