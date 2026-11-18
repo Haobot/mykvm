@@ -17,7 +17,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest]
+        # ubuntu-24.04：ort 静态链接的 onnxruntime 预构建库依赖 glibc 2.38+
+        # 的符号（__isoc23_strtol 等），22.04 的 glibc 2.35 链接不过。
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
 
     steps:

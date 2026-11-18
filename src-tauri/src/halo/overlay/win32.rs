@@ -657,9 +657,11 @@ mod tests {
             halo_window_origin(&geometry(2.0), (0.0, 0.0), 160.0),
             (-60, 40)
         );
+        // 160 logical × scale 1 = 160 physical diameter → offset 80；
+        // 中心点 = native (100,200) + local (500,400) = (600,600)。
         assert_eq!(
             halo_window_origin(&geometry(1.0), (500.0, 400.0), 160.0),
-            (500, 460)
+            (520, 520)
         );
     }
 
