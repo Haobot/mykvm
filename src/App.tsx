@@ -920,6 +920,22 @@ function App() {
     () => (displayLayout ? flattenScreens(displayLayout) : []),
     [displayLayout],
   );
+  // 画布磁贴的序号（设备内 1 起编）：两块同型号外接屏在画布上长得一样，
+  // 序号是区分它们的最快参照。
+  const screenIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    if (displayLayout) {
+      for (const device of displayLayout.devices) {
+        device.screens.forEach((screen, index) => {
+          map.set(screen.id, index + 1);
+        });
+      }
+    }
+    return map;
+  }, [displayLayout]);
+  // 选中光圈用本地状态：轮询会整体替换快照，选中若写进快照 2s 内就会被
+  // 后端值覆盖掉（点击不落盘）。
+  const [selectedScreenId, setSelectedScreenId] = useState<string | null>(null);
   const bounds = useMemo(
     () => getLayoutBounds(screens.length > 0 ? screens : [fallbackScreen()]),
     [screens],
@@ -1674,6 +1690,7 @@ function App() {
     event.preventDefault();
     const target = event.currentTarget;
     target.setPointerCapture(event.pointerId);
+    setSelectedScreenId(screen.id);
     setSnapshot((current) =>
       current
         ? {
@@ -2995,7 +3012,7 @@ function App() {
                   <button
                     key={screen.id}
                     type="button"
-                    className={`screen-rect ${layout.selectedScreenId === screen.id ? "selected" : ""} ${
+                    className={`screen-rect ${selectedScreenId === screen.id ? "selected" : ""} ${
                       dragState?.screenId === screen.id ? "dragging" : ""
                     } ${fileTargetId ? "file-target" : ""} ${
                       isFileTargetHovering ? "file-drag-over" : ""
@@ -3019,6 +3036,9 @@ function App() {
                     }
                     onKeyDown={(event) => handleScreenKeyDown(event, screen)}
                   >
+                    <em className="screen-index" aria-hidden="true">
+                      {screenIndexById.get(screen.id)}
+                    </em>
                     {statusKind === "local" ||
                     statusKind === "online" ||
                     statusKind === "offline" ? (

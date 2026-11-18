@@ -117,8 +117,15 @@
   border-color: #1f7af2;
   background: rgba(191, 219, 254, 0.5);
   box-shadow:
+    0 0 0 3px rgba(31, 122, 242, 0.45),
+    0 0 22px rgba(31, 122, 242, 0.32),
     inset 0 0 0 1px rgba(31, 122, 242, 0.36),
     0 18px 34px rgba(31, 73, 125, 0.16);
+}
+
+.theme-light .screen-index {
+  background: rgba(255, 255, 255, 0.78);
+  color: #172033;
 }
 
 .theme-light .board-zoom-controls {
@@ -830,11 +837,35 @@
 }
 
 .screen-rect.selected {
-  border-color: #2786ff;
-  background: rgba(39, 134, 255, 0.22);
+  border-color: #4d94ff;
+  background: rgba(39, 134, 255, 0.24);
   box-shadow:
+    0 0 0 3px rgba(77, 148, 255, 0.55),
+    0 0 22px rgba(77, 148, 255, 0.4),
     inset 0 0 0 1px var(--screen-color, #2786ff),
     0 20px 36px rgba(0, 0, 0, 0.32);
+}
+
+.screen-rect:focus-visible {
+  outline: 2px solid #4d94ff;
+  outline-offset: 2px;
+}
+
+.screen-index {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  min-width: 20px;
+  padding: 4px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--screen-color, #2786ff);
+  background: rgba(0, 0, 0, 0.4);
+  color: #f4f4f5;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1;
+  text-align: center;
 }
 
 .screen-rect.dragging {
