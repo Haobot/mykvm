@@ -16,10 +16,28 @@ pub const SERVICE_OWNER_SID_ARG: &str = "--owner-sid";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum InputEvent {
-    MouseMove { screen_id: String, x: i32, y: i32 },
-    MouseButton { button: MouseButton, down: bool },
-    Scroll { delta_x: i32, delta_y: i32 },
-    Key { key_code: u16, down: bool },
+    MouseMove {
+        screen_id: String,
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: MouseButton,
+        down: bool,
+    },
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    Key {
+        key_code: u16,
+        down: bool,
+    },
+    /// 布局画布点选远端磁贴：让被控机在指定物理屏上闪一圈光圈。
+    /// 旧客户端解码失败按普通坏包丢弃，无需协议版本升级。
+    FlashScreen {
+        screen_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +81,13 @@ pub enum InputCommand {
     },
     ReleaseAll,
     SecureAttention,
+    /// 接收端把 wire 的 screen_id 换算成自己 native 屏矩形后触发本机光圈。
+    FlashScreen {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
 }
 
 pub fn input_pipe_name(session_id: u32) -> String {

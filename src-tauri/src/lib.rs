@@ -1831,7 +1831,18 @@ fn flash_screen_indicator(
             screen.height as f64,
         )
     };
+    run_screen_flash_window(&app, x, y, width, height)
+}
 
+/// 在逻辑矩形对应的物理显示器上闪光圈窗口。本机画布点击与被控端收到
+/// FlashScreen 事件共用这一条路径。
+fn run_screen_flash_window(
+    app: &AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
     let label = format!(
         "screen-flash-{}",
         SCREEN_FLASH_SEQ.fetch_add(1, Ordering::SeqCst)
@@ -1872,6 +1883,28 @@ fn flash_screen_indicator(
         });
     })
     .map_err(|error| format!("failed to dispatch to main thread: {error}"))
+}
+
+/// 布局画布点选远端（被控）磁贴：通过 QUIC 输入通道向对端发 FlashScreen
+/// 事件，由被控机在自己的对应物理屏上闪光圈。
+#[tauri::command]
+fn flash_peer_screen(state: tauri::State<'_, AppRuntime>, screen_id: String) -> Result<(), String> {
+    let transport = state
+        .quic_transport
+        .lock()
+        .map_err(|_| "quic transport lock poisoned".to_string())?
+        .clone()
+        .ok_or_else(|| "输入运行时未运行，无法向被控机发送点亮请求".to_string())?;
+    let layout = state
+        .layout
+        .lock()
+        .map_err(|_| "layout lock poisoned".to_string())?;
+    let native = state
+        .native_layout
+        .lock()
+        .map_err(|_| "native layout lock poisoned".to_string())?;
+    let input_events = Arc::clone(&state.input_events);
+    input::send_flash_screen_to_peer(&layout, &native, &screen_id, &transport, &input_events)
 }
 
 /// tauri 的 always-on-top 是 floating 层（3），会被菜单栏（25）和程序坞
@@ -1921,12 +1954,19 @@ fn style_screen_indicator_window(
             let same_origin = (frame.x - tx).abs() < 1.0 && (visual_y - ty).abs() < 1.0;
             if same_size && same_origin {
                 let _: () = msg_send![window, setFrame: frame, display: true];
+                // 后台 app 建窗可能被 macOS 抑制显示：orderFrontRegardless
+                // 绕过激活检查强制上屏。
+                let _: () = msg_send![window, orderFrontRegardless];
+                let level: i64 = msg_send![window, level];
+                let frame_now: NsRect = msg_send![window, frame];
                 log::info!(
-                    "screen indicator covering display at cocoa ({:.0},{:.0}) [{:.0}x{:.0}]",
+                    "screen indicator covering display at cocoa ({:.0},{:.0}) [{:.0}x{:.0}] level={level} now=({:.0},{:.0})",
                     frame.x,
                     frame.y,
                     frame.w,
-                    frame.h
+                    frame.h,
+                    frame_now.x,
+                    frame_now.y
                 );
                 return;
             }
@@ -5074,6 +5114,19 @@ pub fn run() {
         .setup(|app| {
             let _ = APP_VERSION.set(app.config().version.clone().unwrap_or_else(|| app.package_info().version.to_string()));
             spawn_lock_sync_watcher(app.handle().clone());
+            // 被控端收到 FlashScreen 事件后需要开 Tauri 窗口，而输入数据链
+            // 没有 AppHandle：与 halo focus 的 receive hook 同一模式，把执行
+            // 器（捕获本 handle）交给 input.rs 的分发点。
+            {
+                let app_handle_for_flash = app.handle().clone();
+                input::install_screen_flash_dispatcher(Box::new(move |x, y, width, height| {
+                    if let Err(error) =
+                        run_screen_flash_window(&app_handle_for_flash, x, y, width, height)
+                    {
+                        log::warn!("screen flash failed: {error}");
+                    }
+                }));
+            }
             let silent_launch = launched_from_autostart();
             #[cfg(target_os = "macos")]
             {
@@ -5379,6 +5432,7 @@ pub fn run() {
             read_diagnostic_info,
             open_log_directory,
             flash_screen_indicator,
+            flash_peer_screen,
             save_layout,
             cancel_file_transfer,
             paste_remote_clipboard,

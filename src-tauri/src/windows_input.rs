@@ -107,6 +107,9 @@ pub fn inject_command_without_tracking(command: &InputCommand) -> Result<(), u32
             let _ = send_secure_attention();
             Ok(())
         }
+        // dispatch_input_command 已把 FlashScreen 分流给光圈执行器，注入
+        // 路径不会收到；穷尽匹配仍需覆盖该变体。
+        InputCommand::FlashScreen { .. } => Ok(()),
     }
 }
 

@@ -3326,6 +3326,22 @@ fn update_remote_mouse_button(button: MouseButton, down: bool) -> (i32, i32) {
 /// Executes a mapped input command on this machine. Runs outside the layout
 /// lock — injection is syscalls and must not stretch the critical section.
 fn dispatch_input_command(command: InputCommand) -> bool {
+    // 光圈提示属于接收端 app 自身的 UI（要在正常桌面上开窗口），任何平台
+    // 都不进注入管线，也不下发给 Windows 助手服务。
+    if let InputCommand::FlashScreen {
+        x,
+        y,
+        width,
+        height,
+    } = command
+    {
+        return dispatch_screen_flash(
+            f64::from(x),
+            f64::from(y),
+            f64::from(width),
+            f64::from(height),
+        );
+    }
     #[cfg(target_os = "windows")]
     {
         if matches!(command, InputCommand::SecureAttention) {
@@ -3370,6 +3386,65 @@ fn dispatch_input_command(command: InputCommand) -> bool {
     {
         inject_input_command(command);
         true
+    }
+}
+
+/// 接收端光圈的实际执行者由宿主（lib.rs）在启动时安装——输入数据链没有
+/// AppHandle，开 Tauri 窗口需要它（与 halo focus 的 receive hook 同一模式）。
+static SCREEN_FLASH_DISPATCH: OnceLock<Box<dyn Fn(f64, f64, f64, f64) + Send + Sync>> =
+    OnceLock::new();
+
+/// 宿主安装光圈执行器：参数为目标屏的逻辑矩形（与 detect_local_screens
+/// 同一空间）。
+pub fn install_screen_flash_dispatcher(dispatcher: Box<dyn Fn(f64, f64, f64, f64) + Send + Sync>) {
+    let _ = SCREEN_FLASH_DISPATCH.set(dispatcher);
+}
+
+fn dispatch_screen_flash(x: f64, y: f64, width: f64, height: f64) -> bool {
+    match SCREEN_FLASH_DISPATCH.get() {
+        Some(dispatch) => {
+            dispatch(x, y, width, height);
+            true
+        }
+        None => false,
+    }
+}
+
+/// 布局画布点选远端磁贴：在 targets 里找到配对该屏的 target，向对端发
+/// FlashScreen 事件（复用 send_packet 的凭据刷新与对端端点管理）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn send_flash_screen_to_peer(
+    layout: &LayoutState,
+    native: &LayoutState,
+    screen_id: &str,
+    quic_transport: &quic_transport::TransportHandle,
+    input_events: &Arc<AtomicU64>,
+) -> Result<(), String> {
+    let targets = build_input_targets(layout, native);
+    let target = targets
+        .iter()
+        .find(|target| target.remote_screen.id == screen_id)
+        .ok_or_else(|| {
+            format!(
+                "screen {screen_id} has no crossable target (device offline or protocol mismatch)"
+            )
+        })?;
+    let layout_for_send = Arc::new(Mutex::new(layout.clone()));
+    if send_packet(
+        quic_transport,
+        target,
+        InputEvent::FlashScreen {
+            screen_id: target.screen_id.clone(),
+        },
+        &layout_for_send,
+        input_events,
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to send flash request to {}",
+            target.target_addr
+        ))
     }
 }
 
@@ -3485,6 +3560,18 @@ fn input_event_to_command(
         }
         InputEvent::Scroll { delta_x, delta_y } => Some(InputCommand::Scroll { delta_x, delta_y }),
         InputEvent::Key { key_code, down } => Some(InputCommand::Key { key_code, down }),
+        InputEvent::FlashScreen { screen_id } => {
+            // 光圈窗口用逻辑坐标定位（与 detect_local_screens 同一空间），
+            // 不做 platform_native_screen 缩放。
+            local_screen_for_event(native_layout, &screen_id).map(|screen| {
+                InputCommand::FlashScreen {
+                    x: screen.x,
+                    y: screen.y,
+                    width: screen.width,
+                    height: screen.height,
+                }
+            })
+        }
     }
 }
 
@@ -3509,6 +3596,10 @@ fn inject_input_command(command: InputCommand) {
         InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
         InputCommand::ReleaseAll | InputCommand::SecureAttention => {}
+        // dispatch_input_command 在进入注入前就把 FlashScreen 分流给光圈
+        // 执行器；走到这里说明没有安装执行器（接收运行时未启动），无需
+        // 任何注入动作。
+        InputCommand::FlashScreen { .. } => {}
     }
 }
 

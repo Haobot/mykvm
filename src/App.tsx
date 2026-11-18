@@ -66,6 +66,7 @@ import {
   saveLayout,
   sendFilesToDevice,
   fetchClientLog,
+  flashPeerScreen,
   flashScreenIndicator,
   requestClientUpdate,
   setAutostart,
@@ -1692,10 +1693,12 @@ function App() {
     const target = event.currentTarget;
     target.setPointerCapture(event.pointerId);
     setSelectedScreenId(screen.id);
-    // 点亮对应的物理显示器，帮助确认"这块磁贴 = 那块屏幕"。远端屏属于
-    // 对端机器，物理上点不亮，只保留画布高亮。
+    // 点亮对应的物理显示器，帮助确认"这块磁贴 = 那块屏幕"。远端屏通过
+    // QUIC 请求对端自己闪光圈（需对端已升级到支持 FlashScreen 的版本）。
     if (screen.role === "local") {
       void flashScreenIndicator(screen.id).catch(() => {});
+    } else {
+      void flashPeerScreen(screen.id).catch(() => {});
     }
     setSnapshot((current) =>
       current

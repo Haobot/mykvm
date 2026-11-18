@@ -141,6 +141,15 @@ export async function flashScreenIndicator(screenId: string): Promise<void> {
   await invoke('flash_screen_indicator', { screenId })
 }
 
+/** 请求被控机在 wire 屏幕 id 对应的物理显示器上闪一圈光圈。 */
+export async function flashPeerScreen(screenId: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('flash_peer_screen', { screenId })
+}
+
 export async function setAutostart(enabled: boolean): Promise<boolean> {
   if (!isTauri()) {
     return enabled
