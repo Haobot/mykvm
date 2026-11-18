@@ -213,16 +213,31 @@ mod tests {
     #[test]
     fn four_calibrated_extremes_map_to_four_edges() {
         let cal = default_cal();
-        assert_eq!(map_pose((cal.right_yaw, 0.0), &cal, 0.0, 1.0, false, false).0, 1.0);
-        assert_eq!(map_pose((cal.left_yaw, 0.0), &cal, 0.0, 1.0, false, false).0, 0.0);
-        assert_eq!(map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, false).1, 0.0);
+        assert_eq!(
+            map_pose((cal.right_yaw, 0.0), &cal, 0.0, 1.0, false, false).0,
+            1.0
+        );
+        assert_eq!(
+            map_pose((cal.left_yaw, 0.0), &cal, 0.0, 1.0, false, false).0,
+            0.0
+        );
+        assert_eq!(
+            map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, false).1,
+            0.0
+        );
         assert_eq!(
             map_pose((0.0, -cal.down_pitch), &cal, 0.0, 1.0, false, false).1,
             1.0
         );
         // Extremes leave the other axis at center.
-        assert_eq!(map_pose((cal.right_yaw, 0.0), &cal, 0.0, 1.0, false, false).1, 0.5);
-        assert_eq!(map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, false).0, 0.5);
+        assert_eq!(
+            map_pose((cal.right_yaw, 0.0), &cal, 0.0, 1.0, false, false).1,
+            0.5
+        );
+        assert_eq!(
+            map_pose((0.0, cal.up_pitch), &cal, 0.0, 1.0, false, false).0,
+            0.5
+        );
     }
 
     #[test]

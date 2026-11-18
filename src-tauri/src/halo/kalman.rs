@@ -68,7 +68,10 @@ impl Kalman1D {
         let q11 = q * dt;
         let (p00, p01, p11) = (self.p[0][0], self.p[0][1], self.p[1][1]);
         self.p = [
-            [p00 + dt * (p01 + p01) + dt2 * p11 + q00, p01 + dt * p11 + q01],
+            [
+                p00 + dt * (p01 + p01) + dt2 * p11 + q00,
+                p01 + dt * p11 + q01,
+            ],
             [p01 + dt * p11 + q01, p11 + q11],
         ];
 
@@ -113,7 +116,9 @@ mod tests {
 
     /// Deterministic pseudo-noise so assertions are stable.
     fn lcg(seed: &mut u64) -> f64 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*seed >> 33) as f64 / (u64::MAX >> 33) as f64) * 2.0 - 1.0
     }
 
@@ -137,11 +142,7 @@ mod tests {
         }
         let steady = &outputs[50..];
         let mean = steady.iter().sum::<f64>() / steady.len() as f64;
-        let var = steady
-            .iter()
-            .map(|v| (v - mean) * (v - mean))
-            .sum::<f64>()
-            / steady.len() as f64;
+        let var = steady.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / steady.len() as f64;
         let out_sigma = var.sqrt();
         assert!(
             out_sigma < sigma * 0.35,

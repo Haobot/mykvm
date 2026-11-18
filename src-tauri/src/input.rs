@@ -2228,7 +2228,6 @@ fn start_platform_capture(
     _stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
     _main_window_visible: Arc<AtomicBool>,
-    _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     _input_events: Arc<AtomicU64>,
     _switch_request: Arc<Mutex<Option<SwitchDirection>>>,

@@ -12,14 +12,14 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::halo::activator::WindowActivator;
-use crate::halo::kalman::Kalman1D;
-use crate::halo::smoothing::{ServoAxis, ServoTuning};
 use crate::halo::input_probe::InputActivityProbe;
+use crate::halo::kalman::Kalman1D;
 use crate::halo::mapping::{map_pose, CalibrationProfile};
 use crate::halo::overlay::{
     BorderFrame, HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry,
 };
 use crate::halo::params::{CameraPosition, FocusHaloSettings};
+use crate::halo::smoothing::{ServoAxis, ServoTuning};
 use crate::halo::state_machine::{advance, DwellConfig, DwellInput, DwellPhase, DwellState};
 use crate::halo::tracker::HeadSample;
 use crate::halo::windows_layer::WindowService;

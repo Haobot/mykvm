@@ -32,11 +32,17 @@ mod status_tests {
     #[test]
     fn unavailable_desktop_does_not_receive_new_keys() {
         use mykvm_lib::shared_input::InputCommand;
-        let key = InputCommand::Key { key_code: 0x41, down: true };
+        let key = InputCommand::Key {
+            key_code: 0x41,
+            down: true,
+        };
         assert!(!super::worker_can_inject(false, &key));
         assert!(super::worker_can_inject(true, &key));
         assert!(super::worker_can_inject(false, &InputCommand::ReleaseAll));
-        assert!(super::worker_can_inject(false, &InputCommand::SecureAttention));
+        assert!(super::worker_can_inject(
+            false,
+            &InputCommand::SecureAttention
+        ));
     }
 
     #[test]
@@ -73,9 +79,12 @@ mod status_tests {
 
 #[cfg(any(target_os = "windows", test))]
 fn worker_can_inject(desktop_ready: bool, command: &mykvm_lib::shared_input::InputCommand) -> bool {
-    desktop_ready || matches!(command,
-        mykvm_lib::shared_input::InputCommand::ReleaseAll
-        | mykvm_lib::shared_input::InputCommand::SecureAttention)
+    desktop_ready
+        || matches!(
+            command,
+            mykvm_lib::shared_input::InputCommand::ReleaseAll
+                | mykvm_lib::shared_input::InputCommand::SecureAttention
+        )
 }
 
 #[cfg(target_os = "windows")]
@@ -162,9 +171,8 @@ mod windows_helper {
                 service_dispatcher::start(INPUT_SERVICE_NAME, ffi_service_main)
                     .map_err(|error| format!("start service dispatcher: {error}"))
             }
-            Some("--worker") => {
-                run_worker().inspect_err(|error| log_service_error("input worker stopped with error", error))
-            }
+            Some("--worker") => run_worker()
+                .inspect_err(|error| log_service_error("input worker stopped with error", error)),
             _ => Err("expected --service or --worker".into()),
         }
     }
@@ -254,7 +262,10 @@ mod windows_helper {
 
         let mut worker = WorkerProcess::default();
         restart_worker(&mut worker);
-        let mut receiver = service_args.config_path.as_ref().and_then(|path| start_receiver(path));
+        let mut receiver = service_args
+            .config_path
+            .as_ref()
+            .and_then(|path| start_receiver(path));
         let mut network_leased = false;
         let mut network_shutdown_failed = false;
         if let Some(owner_sid) = service_args.owner_sid.clone() {
@@ -290,14 +301,20 @@ mod windows_helper {
                         log_service_error("stop headless receiver after GUI lease", &error);
                     }
                     network_leased = false;
-                    receiver = service_args.config_path.as_ref().and_then(|path| start_receiver(path));
+                    receiver = service_args
+                        .config_path
+                        .as_ref()
+                        .and_then(|path| start_receiver(path));
                 }
                 Ok(ServiceEvent::SessionChange) | Err(mpsc::RecvTimeoutError::Timeout) => {
                     if worker.needs_restart() {
                         restart_worker(&mut worker);
                     }
                     if !network_leased && receiver.is_none() {
-                        receiver = service_args.config_path.as_ref().and_then(|path| start_receiver(path));
+                        receiver = service_args
+                            .config_path
+                            .as_ref()
+                            .and_then(|path| start_receiver(path));
                     }
                 }
             }

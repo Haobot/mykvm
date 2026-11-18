@@ -164,7 +164,11 @@ mod tests {
         let mut prev = 0.0;
         let mut max_jump = 0.0f64;
         for i in 0..120 {
-            let target = if i % 2 == 0 { (i as f64 / 2.0) * 12.0 } else { ((i - 1) as f64 / 2.0) * 12.0 };
+            let target = if i % 2 == 0 {
+                (i as f64 / 2.0) * 12.0
+            } else {
+                ((i - 1) as f64 / 2.0) * 12.0
+            };
             let p = s.step(target, dt, &tuning());
             max_jump = max_jump.max((p - prev).abs());
             prev = p;
@@ -190,7 +194,11 @@ mod tests {
             distinct.insert((p * 10.0).round() as i64);
         }
         // With sub-pixel noise the halo must settle essentially still.
-        assert!(distinct.len() <= 3, "distinct positions: {}", distinct.len());
+        assert!(
+            distinct.len() <= 3,
+            "distinct positions: {}",
+            distinct.len()
+        );
     }
 
     #[test]
