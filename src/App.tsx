@@ -1686,7 +1686,7 @@ function App() {
 
   function handleScreenPointerDown(
     event: React.PointerEvent<HTMLButtonElement>,
-    screen: Screen,
+    screen: FlattenedScreen,
   ) {
     event.preventDefault();
     const target = event.currentTarget;
@@ -1695,7 +1695,7 @@ function App() {
     // 点亮对应的物理显示器，帮助确认"这块磁贴 = 那块屏幕"。远端屏属于
     // 对端机器，物理上点不亮，只保留画布高亮。
     if (screen.role === "local") {
-      void desktopApi.flashScreenIndicator(screen.id).catch(() => {});
+      void flashScreenIndicator(screen.id).catch(() => {});
     }
     setSnapshot((current) =>
       current
