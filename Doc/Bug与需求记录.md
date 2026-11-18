@@ -24,7 +24,7 @@
 | BUG-002 | Bug | 操作被控端时，本机一侧光标同时移动（双光标同时动） | 高 | 已定位（待复验） | 2026-11-17 |
 | BUG-003 | Bug | 布局中「本机外扩屏」与「被控屏」并排时，可能无法左右互相穿越 | 高 | 待验收 | 2026-11-17 |
 | BUG-004 | Bug | 切换屏幕分辨率后，「屏幕排布」界面中屏幕可能重叠导致错误 | 高 | 待验收 | 2026-11-18 |
-| BUG-005 | Bug | 布局点选磁贴的光圈在 Mac 外接屏上不显示（仅主屏能闪） | 中 | 待验收 | 2026-11-18 |
+| BUG-005 | Bug | 布局点选磁贴的光圈在 Mac 外接屏上不显示（仅主屏能闪） | 中 | 已关闭 | 2026-11-18 |
 
 ---
 
@@ -197,7 +197,7 @@
 
 ## BUG-005 布局点选磁贴的光圈在 Mac 外接屏上不显示（仅主屏能闪）
 
-- 类型：Bug　严重度：中　状态：待验收　记录日期：2026-11-18
+- 类型：Bug　严重度：中　状态：已关闭　记录日期：2026-11-18
 - 发现方式：真机使用（用户报告，属「点选磁贴闪光圈」需求上线后的缺陷）
 
 **现象**
@@ -216,6 +216,11 @@
   - Windows：`WS_EX_LAYERED` 分层窗 + GDI DIB 像素脉冲（复用 halo win32 的渲染思路），用 `GetDpiForMonitor` 按逻辑矩形选屏，自带消息循环线程 1.4s 自毁；`windows-sys` 补 `Win32_UI_HiDpi` feature。
 - 删除 `public/screen-indicator.html` 与 lib.rs 的 WebView 光圈路径；新实现集中在 `src-tauri/src/screen_flash.rs`，本机画布点击与被控端 FlashScreen 事件共用同一入口。
 - 视觉规格对齐原 html：内缩 8px、10px 蓝色描边（rgba(56,150,255,.92)）、圆角 18、三拍脉冲。
+
+**验收记录（2026-11-19，已关闭）**
+
+- 修复最终形态：光圈实现抽成 `flash-core` crate；macOS 27 上 Tauri 进程内创建的跨显示器 NSWindow 无法进入窗口服务器的当前 Space（`onscreen=false` 永不显示，三层取证：AppKit 回读正常 / CGWindowList 差分 / 分屏截图），故 macOS 端闪光由 `mykvm --flash x y w h` 独立子进程执行（单实例锁之前分支、NSApp accessory、2s 自退出），Windows 端保持进程内分层窗实现不变。另修复 `setLevel:`/`setCollectionBehavior:` 的整数 ABI 漂移（f64 传参进错寄存器）。清理提交后用户真机确认外接屏光圈正常。
+- 经验沉淀：窗口可见性问题用 CGWindowList 差分 + `screencapture -D` 分屏截图直取事实；objc2 数值型 setter 在 macOS 27 一律"设+回读校验"；CGWindowList 差分必须做前后对照（存量辅助窗曾误判为缺陷产物）。
 
 **验收要点**
 

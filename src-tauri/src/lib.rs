@@ -5050,51 +5050,6 @@ pub fn run() {
             input::install_screen_flash_dispatcher(Box::new(|x, y, width, height| {
                 run_screen_flash((x, y, width, height));
             }));
-            // TODO(临时诊断): 启动 12s 后对本机每块屏自动闪一次光圈，定位
-            // BUG-005 外接屏不显示（现在走 helper 进程路径）。验收后删除。
-            #[cfg(target_os = "macos")]
-            {
-                let app_for_flash_test = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(12));
-                    let Some(state) = app_for_flash_test.try_state::<AppRuntime>() else {
-                        return;
-                    };
-                    let rects: Vec<(String, f64, f64, f64, f64)> = {
-                        let Ok(native) = state.native_layout.lock() else {
-                            return;
-                        };
-                        native
-                            .devices
-                            .iter()
-                            .find(|device| device.role == "local")
-                            .map(|device| {
-                                device
-                                    .screens
-                                    .iter()
-                                    .map(|screen| {
-                                        (
-                                            screen.id.clone(),
-                                            screen.x as f64,
-                                            screen.y as f64,
-                                            screen.width as f64,
-                                            screen.height as f64,
-                                        )
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    };
-                    for (id, x, y, width, height) in rects {
-                        log::info!(
-                            "flash selftest begin screen={id} rect=({x},{y}) {width}x{height}"
-                        );
-                        run_screen_flash((x, y, width, height));
-                        std::thread::sleep(Duration::from_millis(2500));
-                    }
-                    log::info!("flash selftest done");
-                });
-            }
             let silent_launch = launched_from_autostart();
             #[cfg(target_os = "macos")]
             {
