@@ -53,6 +53,8 @@ pub fn flash_logical_rect(rect: (f64, f64, f64, f64)) {
 
 #[cfg(target_os = "macos")]
 use macos_imp as imp;
+#[cfg(target_os = "macos")]
+pub use macos_imp::create_variant;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use other_imp as imp;
 #[cfg(target_os = "windows")]
@@ -65,6 +67,8 @@ use windows_imp as imp;
 #[cfg(target_os = "macos")]
 mod macos_imp {
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use core_graphics::geometry::{CGAffineTransform, CGPoint, CGRect, CGSize};
     use objc2::runtime::AnyObject;
@@ -72,6 +76,9 @@ mod macos_imp {
     use objc2_foundation::NSString;
 
     use super::{pulse_alpha, RING_RGBA};
+
+    /// 连续点击/自测时区分每次光圈的取证文件序号。
+    static SCREEN_FLASH_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// 光圈内缘离屏幕边的距离、描边宽与圆角（点），对齐原 html 的样式。
     const RING_INSET: f64 = 8.0;
@@ -98,6 +105,7 @@ mod macos_imp {
     // CGPathCreateWithRoundedCGRect 已从 macOS 27 SDK 移除，用 mutable+add。
     extern "C" {
         fn CGPathCreateMutable() -> *mut c_void;
+        fn pthread_main_np() -> i32;
         fn CGPathAddRoundedRect(
             path: *mut c_void,
             transform: *const CGAffineTransform,
@@ -124,6 +132,31 @@ mod macos_imp {
         on_main(create_flash, Box::into_raw(Box::new(rect)) as *mut c_void);
     }
 
+    /// 诊断对照路径：由调用方保证已在主线程（tauri run_on_main_thread /
+    /// tao 事件循环体内）时直接建窗。`activate` 变体先激活本 app 并用
+    /// makeKeyAndOrderFront 排序（短暂抢焦点，验证 Space 归属能否被
+    /// 激活态纠正）。
+    pub fn create_variant(rect: (f64, f64, f64, f64), activate: bool) {
+        unsafe {
+            let Some(frame) = match_screen_frame(rect) else {
+                log::warn!("screen indicator: no NSScreen found");
+                return;
+            };
+            let Some(window) = build_flash_window(frame, activate) else {
+                return;
+            };
+            log::info!(
+                "screen indicator(now-path, activate={activate}) covering display at cocoa ({:.0},{:.0}) [{:.0}x{:.0}]",
+                frame.x,
+                frame.y,
+                frame.w,
+                frame.h
+            );
+            log_window_state(window);
+            schedule_close(window);
+        }
+    }
+
     fn on_main(work: extern "C" fn(*mut c_void), ctx: *mut c_void) {
         unsafe { dispatch_async_f(std::ptr::addr_of!(_dispatch_main_q).cast_mut(), ctx, work) }
     }
@@ -135,7 +168,7 @@ mod macos_imp {
                 log::warn!("screen indicator: no NSScreen found");
                 return;
             };
-            let Some(window) = build_flash_window(frame) else {
+            let Some(window) = build_flash_window(frame, false) else {
                 return;
             };
             log::info!(
@@ -145,8 +178,44 @@ mod macos_imp {
                 frame.w,
                 frame.h
             );
+            log_process_state();
+            log_window_state(window);
             schedule_close(window);
         }
+    }
+
+    /// 诊断回读：执行线程是否主线程（pthread_main_np）与 NSApp 的隐藏/
+    /// 激活状态——区分"回调不在主线程"与"app 整体被隐藏"两类根因。
+    unsafe fn log_process_state() {
+        let on_main_thread = pthread_main_np();
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            log::info!("screen indicator process on_main={on_main_thread} app=nil");
+            return;
+        }
+        let app_ref = &*app;
+        let active: bool = msg_send![app_ref, isActive];
+        let hidden: bool = msg_send![app_ref, isHidden];
+        let policy: isize = msg_send![app_ref, activationPolicy];
+        log::info!(
+            "screen indicator process on_main={on_main_thread} app_active={active} app_hidden={hidden} policy={policy}"
+        );
+    }
+
+    /// 诊断回读：AppKit/窗口服务器认为的窗口状态。visible=NO 或 occlusion
+    /// 缺 visible 位说明排序/空格环节出了问题；都正常则进一步看截屏。
+    /// level 按整数回读（macOS 27 的 ABI），异常时另有 f64 对照。
+    unsafe fn log_window_state(window: *mut AnyObject) {
+        let w = &*window;
+        let visible: bool = msg_send![w, isVisible];
+        let occlusion: usize = msg_send![w, occlusionState];
+        let alpha: f64 = msg_send![w, alphaValue];
+        let number: isize = msg_send![w, windowNumber];
+        let level_i: i64 = msg_send![w, level];
+        let level_f: f64 = msg_send![w, level];
+        log::info!(
+            "screen indicator state visible={visible} occlusion={occlusion:#x} alpha={alpha} number={number} level_i={level_i} level_f={level_f}"
+        );
     }
 
     /// 在 NSScreen 列表里按点级几何匹配目标屏，返回它自己的 Cocoa frame；
@@ -182,10 +251,29 @@ mod macos_imp {
     /// halo 同款样板：无边框、透明、无阴影、点击穿透、屏幕保护层、跨空间
     /// （CanJoinAllSpaces | FullScreenAuxiliary）窗口，承载 layer-backed
     /// 内容视图。后台 app 建窗会被抑制显示，用 orderFrontRegardless 强制上屏。
-    unsafe fn build_flash_window(frame: NsRect) -> Option<*mut AnyObject> {
+    /// `activate`：建窗前先激活本 app 并用 makeKeyAndOrderFront 排序（诊断
+    /// 变体：允许短暂抢焦点，验证 Space 归属是否能被激活态纠正）。
+    unsafe fn build_flash_window(frame: NsRect, activate: bool) -> Option<*mut AnyObject> {
+        if activate {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            if !app.is_null() {
+                let app_ref = &*app;
+                let _: () = msg_send![app_ref, activateIgnoringOtherApps: true];
+            }
+        }
         let alloc: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+        // macOS 27 实测：initWithContentRect: 的大结构体参数会被吞掉（窗口
+        // 被建成显示器顶部的 30px 窄条），而 setFrame: 的同布局参数工作正常
+        // （旧版 frame 回读一直是正确的全屏框）。所以先按小矩形建窗，随后
+        // 用 setFrame: 撑到目标框——init 的传参坑就此绕开。
+        let seed = NsRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
         let window: *mut AnyObject = msg_send![alloc,
-            initWithContentRect: frame,
+            initWithContentRect: seed,
             styleMask: 0usize,      // borderless
             backing: 2usize,        // buffered
             defer: false,
@@ -198,15 +286,31 @@ mod macos_imp {
         let _: () = msg_send![window_ref, setBackgroundColor: clear];
         let _: () = msg_send![window_ref, setOpaque: false];
         let _: () = msg_send![window_ref, setHasShadow: false];
-        let _: () = msg_send![window_ref, setIgnoresMouseEvents: true];
+        if !activate {
+            // 激活变体保留可聚焦性，让 makeKeyAndOrderFront 能把窗口拉到
+            // 所在显示器的当前 Space。
+            let _: () = msg_send![window_ref, setIgnoresMouseEvents: true];
+        }
         // tauri 的 always-on-top 是 floating 层（3），会被菜单栏（25）和
         // 程序坞（20）遮住光圈的上/下边缘；抬到 NSScreenSaverWindowLevel。
+        //
+        // setLevel: 的参数 ABI 在 macOS 27 上实测也变了：按传统 CGFloat(f64)
+        // 传参时，实现从整数寄存器读值（读回 level 得到垃圾/1），层级实际
+        // 只有 ≈0~1，压不过副屏的全屏空间。改为先按 i64 设并回读，读不到
+        // 1000 再按 f64 兜底，两种 ABI 下都保证最终是 1000。
         let _: () = msg_send![window_ref, setLevel: 1000_i64];
+        let probe: i64 = msg_send![window_ref, level];
+        if probe != 1000 {
+            let _: () = msg_send![window_ref, setLevel: 1000.0_f64];
+        }
         // CanJoinAllSpaces (1<<0) | FullScreenAuxiliary (1<<8)。
+        //
+        // 注意：setCollectionBehavior: 在 macOS 27 上也是整数 ABI（f64 兜底
+        // 会写入垃圾标志直接崩溃），usize 传参回读位值正确。
         let _: () = msg_send![window_ref, setCollectionBehavior: 257_usize];
 
         let view_alloc: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let view: *mut AnyObject = msg_send![view_alloc, initWithFrame: frame];
+        let view: *mut AnyObject = msg_send![view_alloc, initWithFrame: seed];
         if !view.is_null() {
             let view_ref = &*view;
             let _: () = msg_send![view_ref, setWantsLayer: true];
@@ -217,6 +321,24 @@ mod macos_imp {
             if !host.is_null() {
                 attach_ring(&*host, frame, window_ref);
             }
+        }
+        // 撑到目标全屏框（setFrame 的 rect 传参已证可靠），并把内容视图
+        // 跟着放大（borderless 窗口无自动跟随）。
+        let _: () = msg_send![window_ref, setFrame: frame, display: true];
+        if !view.is_null() {
+            let view_ref = &*view;
+            let _: () = msg_send![view_ref, setFrame: NsRect { x: 0.0, y: 0.0, w: frame.w, h: frame.h }];
+        }
+        let frame_now: NsRect = msg_send![window_ref, frame];
+        log::info!(
+            "screen indicator after setFrame now=({:.0},{:.0}) [{:.0}x{:.0}]",
+            frame_now.x,
+            frame_now.y,
+            frame_now.w,
+            frame_now.h
+        );
+        if activate {
+            let _: () = msg_send![window_ref, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         }
         let _: () = msg_send![window_ref, orderFrontRegardless];
         Some(window)
@@ -297,12 +419,52 @@ mod macos_imp {
     }
 
     /// 倒计时归零后回主队列收尾：orderOut 再 release，窗与内容一起释放。
+    /// 450ms 时（脉冲进行中）由本进程调 screencapture 截下各显示器——
+    /// 本 app 有屏幕录制权限，子进程可继承，取证光圈是否真的合成上屏。
     fn schedule_close(window: *mut AnyObject) {
         let ptr = window as usize;
+        let seq = SCREEN_FLASH_SEQ.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
-            std::thread::sleep(super::FLASH_DURATION);
+            // 100ms 后补刀一次 setFrame+orderFrontRegardless：窗口服务器注册
+            // 若在首拍被吞，下一拍重排可能救回来（诊断阶段）。
+            std::thread::sleep(Duration::from_millis(100));
+            on_main(reorder_flash, Box::into_raw(Box::new(ptr)) as *mut c_void);
+            std::thread::sleep(Duration::from_millis(350));
+            for display in 1..=4 {
+                match std::process::Command::new("/usr/sbin/screencapture")
+                    .args([
+                        "-x",
+                        "-D",
+                        &display.to_string(),
+                        &format!("/tmp/app-flash-{seq}-d{display}.png"),
+                    ])
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {}
+                    Ok(output) => log::warn!(
+                        "screen indicator capture d{display} failed: {} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    Err(error) => log::warn!("screen indicator capture d{display} error: {error}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(950));
             on_main(close_flash, Box::into_raw(Box::new(ptr)) as *mut c_void);
         });
+    }
+
+    extern "C" fn reorder_flash(ctx: *mut c_void) {
+        let ptr = unsafe { Box::from_raw(ctx as *mut usize) };
+        let window = *ptr as *mut AnyObject;
+        unsafe {
+            let window_ref = &*window;
+            let frame: NsRect = msg_send![window_ref, frame];
+            let _: () = msg_send![window_ref, setFrame: frame, display: true];
+            let _: () = msg_send![window_ref, orderFrontRegardless];
+            let visible: bool = msg_send![window_ref, isVisible];
+            log::info!("screen indicator reorder done visible={visible}");
+        }
     }
 
     extern "C" fn close_flash(ctx: *mut c_void) {
@@ -312,6 +474,8 @@ mod macos_imp {
             let window_ref = &*window;
             let _: () = msg_send![window_ref, orderOut: std::ptr::null::<AnyObject>()];
             let _: () = msg_send![window_ref, release];
+            let visible: bool = msg_send![window_ref, isVisible];
+            log::info!("screen indicator closed, still visible={visible}");
         }
     }
 }

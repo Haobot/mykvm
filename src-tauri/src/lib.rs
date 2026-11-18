@@ -39,7 +39,7 @@ mod native_drag;
 mod performance;
 mod quic_transport;
 mod rich_clipboard;
-mod screen_flash;
+pub mod screen_flash;
 pub mod shared_input;
 #[cfg(any(target_os = "windows", test))]
 mod shortcut_keys;
@@ -4973,6 +4973,61 @@ pub fn run() {
             input::install_screen_flash_dispatcher(Box::new(|x, y, width, height| {
                 screen_flash::flash_logical_rect((x, y, width, height));
             }));
+            // TODO(临时诊断): 启动 12s 后对本机每块屏自动闪一次光圈（窗口
+            // 会在 450ms 时自截取证），定位 BUG-005 外接屏不显示。验收后删除。
+            #[cfg(target_os = "macos")]
+            {
+                let app_for_flash_test = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(12));
+                    let Some(state) = app_for_flash_test.try_state::<AppRuntime>() else {
+                        return;
+                    };
+                    let rects: Vec<(String, f64, f64, f64, f64)> = {
+                        let Ok(native) = state.native_layout.lock() else {
+                            return;
+                        };
+                        native
+                            .devices
+                            .iter()
+                            .find(|device| device.role == "local")
+                            .map(|device| {
+                                device
+                                    .screens
+                                    .iter()
+                                    .map(|screen| {
+                                        (
+                                            screen.id.clone(),
+                                            screen.x as f64,
+                                            screen.y as f64,
+                                            screen.width as f64,
+                                            screen.height as f64,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    for (id, x, y, width, height) in rects {
+                        log::info!("flash selftest begin screen={id} rect=({x},{y}) {width}x{height}");
+                        // 诊断对照：走 tauri 主线程派发（tao 事件循环体内执行）。
+                        let _ = app_for_flash_test.run_on_main_thread(move || {
+                            screen_flash::create_variant((x, y, width, height), false);
+                        });
+                        // 外接屏（非首个屏）额外做一次"激活变体"：建窗前激活
+                        // 本 app 并 makeKeyAndOrderFront，验证 Space 归属能否
+                        // 被激活态纠正。
+                        if id != "local-display-1" {
+                            std::thread::sleep(Duration::from_millis(2200));
+                            let _ = app_for_flash_test.run_on_main_thread(move || {
+                                screen_flash::create_variant((x, y, width, height), true);
+                            });
+                        }
+                        std::thread::sleep(Duration::from_millis(2200));
+                    }
+                    log::info!("flash selftest done");
+                });
+            }
             let silent_launch = launched_from_autostart();
             #[cfg(target_os = "macos")]
             {
