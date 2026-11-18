@@ -4965,9 +4965,17 @@ function HaloListField(props: {
 }) {
   const joined = props.value.join(",");
   const [draft, setDraft] = useState(joined);
+  const lastKnownValue = useRef(joined);
 
+  // Same resync protocol as HaloNumberField: only snap the draft back when
+  // the persisted list actually changed behind us (save-time round-trip or a
+  // save from another window). Unconditional effect-sync trips the
+  // set-state-in-effect lint rule.
   useEffect(() => {
-    setDraft(joined);
+    if (lastKnownValue.current !== joined) {
+      lastKnownValue.current = joined;
+      setDraft(joined);
+    }
   }, [joined]);
 
   const commitDraft = () => {
