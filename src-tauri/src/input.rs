@@ -2465,8 +2465,12 @@ fn near(a: i32, b: i32) -> bool {
     (a - b).abs() <= EDGE_TOLERANCE
 }
 
+/// True when the two spans share a positive-length overlap. Any projection
+/// counts: a corner-tangent pair is visually adjacent, and a small projection
+/// only narrows the crossing zone rather than creating false edges (edge
+/// alignment within EDGE_TOLERANCE is the actual guard).
 fn ranges_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> bool {
-    i32::min(a_end, b_end) - i32::max(a_start, b_start) > EDGE_TOLERANCE
+    i32::min(a_end, b_end) - i32::max(a_start, b_start) > 0
 }
 
 fn peer_screen_id(device: &Device, screen: &Screen) -> String {
@@ -10049,6 +10053,23 @@ mod tests {
             scale: 1.0,
             is_primary: true,
         }
+    }
+
+    #[test]
+    fn touching_edge_accepts_any_positive_projection() {
+        // 边缘精确相切、y 投影仅 1px：旧阈值（>80）判不出贴边，正是
+        // BUG-003「并排却无法穿越」的窄投影场景。
+        let local = screen("local-device", "local-display-1", 0, 0, 1920, 1080);
+        let remote = screen("peer-device", "peer-display-1", 1920, 1079, 1920, 1080);
+        assert_eq!(touching_edge(&local, &remote), Some(Edge::Right));
+    }
+
+    #[test]
+    fn touching_edge_rejects_touching_corners_without_projection() {
+        // 对角点恰好相接：两轴投影均为 0，不构成贴边。
+        let local = screen("local-device", "local-display-1", 0, 0, 1920, 1080);
+        let remote = screen("peer-device", "peer-display-1", 1920, 1080, 1920, 1080);
+        assert_eq!(touching_edge(&local, &remote), None);
     }
 
     #[test]

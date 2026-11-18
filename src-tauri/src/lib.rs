@@ -5908,8 +5908,30 @@ fn refresh_local_screens(app: &AppHandle) {
         if !changed {
             None
         } else {
+            // A resolution change resizes local screens while peer screens
+            // keep their stored positions, which can leave an overlap on the
+            // canvas — and an overlap never becomes crossable. Separate
+            // before persisting so neither disk nor the UI ever shows one;
+            // this only nudges non-local screens.
+            let positions_before: Vec<(String, i32, i32)> = layout
+                .devices
+                .iter()
+                .flat_map(|device| device.screens.iter())
+                .map(|screen| (screen.id.clone(), screen.x, screen.y))
+                .collect();
+            separate_layout_screen_overlaps(&mut layout);
+            let separated = positions_before
+                != layout
+                    .devices
+                    .iter()
+                    .flat_map(|device| device.screens.iter())
+                    .map(|screen| (screen.id.clone(), screen.x, screen.y))
+                    .collect::<Vec<_>>();
             if let Err(error) = write_layout_to_disk(&state.config_path, &layout) {
                 log::warn!("failed to save refreshed display layout: {error}");
+            }
+            if separated {
+                log::info!("separated peer screens overlapping resized local screens");
             }
             Some(layout.clone())
         }
@@ -10414,11 +10436,25 @@ fn separated_position(a: &Screen, b: &Screen) -> (i32, i32) {
     }
 }
 
-/// Normalizes an assembled layout so no two screens overlap. Only non-local
-/// screens move: the local machine's own arrangement is the reference the user
-/// cares about, and a peer screen that a stored layout left sitting on top of
-/// it would otherwise never become crossable.
+/// How far two screens may sit apart on the tangent axis while still counting
+/// as a bare-corner contact worth aligning. Snap and keyboard placement land
+/// exactly on edges; the slack only covers rounding drift, so a deliberate
+/// wide gap is never "corrected".
+const TANGENT_ALIGNMENT_TOLERANCE: i32 = 8;
+
+/// Normalizes an assembled layout so no two screens overlap, then straightens
+/// bare-corner contacts into aligned adjacency. Only non-local screens move:
+/// the local machine's own arrangement is the reference the user cares about,
+/// and a peer screen that a stored layout left sitting on top of it would
+/// otherwise never become crossable.
 fn separate_layout_screen_overlaps(layout: &mut LayoutState) {
+    separate_overlapping_layout_screens(layout);
+    align_tangent_layout_screens(layout);
+    // Alignment can push a screen onto a third one; settle any new overlap.
+    separate_overlapping_layout_screens(layout);
+}
+
+fn separate_overlapping_layout_screens(layout: &mut LayoutState) {
     for device_index in 0..layout.devices.len() {
         if layout.devices[device_index].role == "local" {
             continue;
@@ -10426,21 +10462,113 @@ fn separate_layout_screen_overlaps(layout: &mut LayoutState) {
 
         for screen_index in 0..layout.devices[device_index].screens.len() {
             let moving = layout.devices[device_index].screens[screen_index].clone();
-            let mut others: Vec<Screen> = Vec::new();
-            for (other_device, device) in layout.devices.iter().enumerate() {
-                for (other_screen, screen) in device.screens.iter().enumerate() {
-                    if other_device == device_index && other_screen == screen_index {
-                        continue;
-                    }
-                    others.push(screen.clone());
-                }
-            }
+            let others = other_layout_screens(layout, device_index, screen_index);
 
             let separated = separate_screen_from_overlaps(moving, &others);
             let target = &mut layout.devices[device_index].screens[screen_index];
             target.x = separated.x;
             target.y = separated.y;
         }
+    }
+}
+
+fn other_layout_screens(
+    layout: &LayoutState,
+    device_index: usize,
+    screen_index: usize,
+) -> Vec<Screen> {
+    let mut others: Vec<Screen> = Vec::new();
+    for (other_device, device) in layout.devices.iter().enumerate() {
+        for (other_screen, screen) in device.screens.iter().enumerate() {
+            if other_device == device_index && other_screen == screen_index {
+                continue;
+            }
+            others.push(screen.clone());
+        }
+    }
+    others
+}
+
+/// Nudges non-local screens that touch another screen at a bare corner —
+/// tangent (within `TANGENT_ALIGNMENT_TOLERANCE`) on one axis with zero
+/// projection on the other — into aligned adjacency. A bare-corner pair is
+/// visually adjacent but can never cross: the crossing check needs the shared
+/// edge to project onto the other screen.
+fn align_tangent_layout_screens(layout: &mut LayoutState) {
+    for device_index in 0..layout.devices.len() {
+        if layout.devices[device_index].role == "local" {
+            continue;
+        }
+
+        for screen_index in 0..layout.devices[device_index].screens.len() {
+            let moving = layout.devices[device_index].screens[screen_index].clone();
+            let others = other_layout_screens(layout, device_index, screen_index);
+            let Some((x, y)) = aligned_tangent_position(&moving, &others) else {
+                continue;
+            };
+            let target = &mut layout.devices[device_index].screens[screen_index];
+            target.x = x;
+            target.y = y;
+        }
+    }
+}
+
+fn tangent_near(a: i32, b: i32) -> bool {
+    (a - b).abs() <= TANGENT_ALIGNMENT_TOLERANCE
+}
+
+fn projection_len(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> i32 {
+    i32::min(a_end, b_end) - i32::max(a_start, b_start)
+}
+
+fn aligned_tangent_position(screen: &Screen, others: &[Screen]) -> Option<(i32, i32)> {
+    for other in others {
+        let x_projection = projection_len(
+            screen.x,
+            screen.x + screen.width,
+            other.x,
+            other.x + other.width,
+        );
+        let y_projection = projection_len(
+            screen.y,
+            screen.y + screen.height,
+            other.y,
+            other.y + other.height,
+        );
+        if x_projection > 0 || y_projection > 0 {
+            // Real overlap belongs to the separation pass; a projecting
+            // tangent already crosses and must not be moved.
+            continue;
+        }
+        if tangent_near(screen.x + screen.width, other.x)
+            || tangent_near(screen.x, other.x + other.width)
+        {
+            return Some((
+                screen.x,
+                aligned_projection_start(screen.y, screen.height, other.y, other.height),
+            ));
+        }
+        if tangent_near(screen.y + screen.height, other.y)
+            || tangent_near(screen.y, other.y + other.height)
+        {
+            return Some((
+                aligned_projection_start(screen.x, screen.width, other.x, other.width),
+                screen.y,
+            ));
+        }
+    }
+    None
+}
+
+/// Edge-aligned placement of one axis against the other screen's span, chosen
+/// by which side of it the screen already leans toward.
+fn aligned_projection_start(start: i32, length: i32, other_start: i32, other_length: i32) -> i32 {
+    let a_center = start + length / 2;
+    let b_center = other_start + other_length / 2;
+    if a_center <= b_center {
+        other_start
+    } else {
+        other_start + other_length - length
     }
 }
 
@@ -15588,6 +15716,62 @@ mod tests {
         assert_eq!((local.x, local.y), (0, 0));
         assert_eq!(screen_overlap_area(local, peer), 0);
         assert_eq!(peer.y + peer.height, local.y);
+    }
+
+    #[test]
+    fn aligning_straightens_a_bare_corner_contact() {
+        // 扩展屏（竖屏）右侧、被控屏被拖到它的右下角：x 边恰好相切、y 范围
+        // 恰好相接——视觉相邻但对角相触，任何方向都无法穿越（BUG-003）。
+        let ext = screen_at("local-display-2", "local-device", 1920, 0, 1080, 1920);
+        let peer = screen_at("peer-display-1", "peer-device", 3000, 1920, 1920, 1080);
+
+        let (x, y) = aligned_tangent_position(&peer, &[ext.clone()])
+            .expect("bare corner contact should align");
+
+        assert_eq!(x, 3000);
+        // 底边对齐扩展屏底边：y 投影从 0 变为被控屏整个高度。
+        assert_eq!(y, 840);
+        assert_eq!(
+            projection_len(y, y + peer.height, ext.y, ext.y + ext.height),
+            1080
+        );
+    }
+
+    #[test]
+    fn alignment_keeps_crossing_tangents_and_deliberate_gaps_alone() {
+        let ext = screen_at("local-display-2", "local-device", 1920, 0, 1080, 1920);
+        // x 相切且 y 已有投影：已可穿越，不应移动。
+        let crossing = screen_at("peer-display-1", "peer-device", 3000, 700, 1920, 1080);
+        assert_eq!(aligned_tangent_position(&crossing, &[ext.clone()]), None);
+        // 斜向留白较远：用户刻意摆放，不应纠正。
+        let apart = screen_at("peer-display-1", "peer-device", 3200, 2400, 1920, 1080);
+        assert_eq!(aligned_tangent_position(&apart, &[ext]), None);
+    }
+
+    #[test]
+    fn layout_normalization_straightens_a_corner_tangent_peer_screen() {
+        let mut layout = test_layout();
+        layout.devices[0].screens[0] =
+            screen_at("local-display-1", "local-device", 1920, 0, 1080, 1920);
+        layout.devices[1].screens[0] =
+            screen_at("peer-display-1", "peer-device", 3000, 1920, 1920, 1080);
+
+        separate_layout_screen_overlaps(&mut layout);
+
+        let local = &layout.devices[0].screens[0];
+        let peer = &layout.devices[1].screens[0];
+        // 本机屏是参照系不动；被控屏只做对齐位移，不产生重叠。
+        assert_eq!((local.x, local.y), (1920, 0));
+        assert_eq!((peer.x, peer.y), (3000, 840));
+        assert_eq!(screen_overlap_area(local, peer), 0);
+        assert!(
+            projection_len(
+                local.y,
+                local.y + local.height,
+                peer.y,
+                peer.y + peer.height
+            ) > 0
+        );
     }
 
     // ---- 网络抗干扰 P0 §3-A：本机地址枚举与排序 ----
