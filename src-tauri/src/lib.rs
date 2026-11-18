@@ -10436,21 +10436,25 @@ fn separated_position(a: &Screen, b: &Screen) -> (i32, i32) {
     }
 }
 
-/// How far two screens may sit apart on the tangent axis while still counting
-/// as a bare-corner contact worth aligning. Snap and keyboard placement land
-/// exactly on edges; the slack only covers rounding drift, so a deliberate
-/// wide gap is never "corrected".
+/// How far two rectangles may sit from each other on BOTH axes while still
+/// counting as a bare-corner contact worth nudging. Snap and keyboard
+/// placement land exactly on edges; the slack only covers rounding drift, so
+/// a deliberate diagonal offset is never "corrected".
 const TANGENT_ALIGNMENT_TOLERANCE: i32 = 8;
+/// How far a bare-corner contact is nudged into the other screen's span: just
+/// enough for the shared edge to gain a real projection band, without the
+/// screen-high jump a full edge alignment would cause.
+const TANGENT_ALIGNMENT_NUDGE: i32 = 40;
 
-/// Normalizes an assembled layout so no two screens overlap, then straightens
-/// bare-corner contacts into aligned adjacency. Only non-local screens move:
-/// the local machine's own arrangement is the reference the user cares about,
-/// and a peer screen that a stored layout left sitting on top of it would
-/// otherwise never become crossable.
+/// Normalizes an assembled layout so no two screens overlap, then nudges
+/// bare-corner contacts into crossable adjacency. Only non-local screens
+/// move: the local machine's own arrangement is the reference the user cares
+/// about, and a peer screen that a stored layout left sitting on top of it
+/// would otherwise never become crossable.
 fn separate_layout_screen_overlaps(layout: &mut LayoutState) {
     separate_overlapping_layout_screens(layout);
     align_tangent_layout_screens(layout);
-    // Alignment can push a screen onto a third one; settle any new overlap.
+    // Kept for safety even though a valid nudge overlaps nothing.
     separate_overlapping_layout_screens(layout);
 }
 
@@ -10490,10 +10494,12 @@ fn other_layout_screens(
 }
 
 /// Nudges non-local screens that touch another screen at a bare corner —
-/// tangent (within `TANGENT_ALIGNMENT_TOLERANCE`) on one axis with zero
-/// projection on the other — into aligned adjacency. A bare-corner pair is
-/// visually adjacent but can never cross: the crossing check needs the shared
-/// edge to project onto the other screen.
+/// near-tangent on BOTH axes with no projection on either — a few pixels
+/// into the other screen's span, so the shared edge becomes crossable. A
+/// bare-corner pair is visually adjacent but can never cross: the crossing
+/// check needs the shared edge to project onto the other screen. Edge
+/// co-linearity alone does not count: screens that merely continue an edge
+/// line while sitting far apart are not adjacent and stay untouched.
 fn align_tangent_layout_screens(layout: &mut LayoutState) {
     for device_index in 0..layout.devices.len() {
         if layout.devices[device_index].role == "local" {
@@ -10513,12 +10519,17 @@ fn align_tangent_layout_screens(layout: &mut LayoutState) {
     }
 }
 
-fn tangent_near(a: i32, b: i32) -> bool {
-    (a - b).abs() <= TANGENT_ALIGNMENT_TOLERANCE
-}
-
 fn projection_len(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> i32 {
     i32::min(a_end, b_end) - i32::max(a_start, b_start)
+}
+
+/// Distance between two disjoint ranges; 0 when they merely touch.
+fn range_gap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> i32 {
+    if a_end <= b_start {
+        b_start - a_end
+    } else {
+        a_start - b_end
+    }
 }
 
 fn aligned_tangent_position(screen: &Screen, others: &[Screen]) -> Option<(i32, i32)> {
@@ -10540,36 +10551,60 @@ fn aligned_tangent_position(screen: &Screen, others: &[Screen]) -> Option<(i32, 
             // tangent already crosses and must not be moved.
             continue;
         }
-        if tangent_near(screen.x + screen.width, other.x)
-            || tangent_near(screen.x, other.x + other.width)
-        {
-            return Some((
-                screen.x,
-                aligned_projection_start(screen.y, screen.height, other.y, other.height),
-            ));
+        // A bare-corner contact nearly touches on BOTH axes. Sharing one
+        // edge line while sitting far apart on the other is not adjacency.
+        let x_gap = range_gap(
+            screen.x,
+            screen.x + screen.width,
+            other.x,
+            other.x + other.width,
+        );
+        let y_gap = range_gap(
+            screen.y,
+            screen.y + screen.height,
+            other.y,
+            other.y + other.height,
+        );
+        if x_gap > TANGENT_ALIGNMENT_TOLERANCE || y_gap > TANGENT_ALIGNMENT_TOLERANCE {
+            continue;
         }
-        if tangent_near(screen.y + screen.height, other.y)
-            || tangent_near(screen.y, other.y + other.height)
-        {
-            return Some((
-                aligned_projection_start(screen.x, screen.width, other.x, other.width),
-                screen.y,
-            ));
+        // Nudge along the axis whose centers are closer, toward the other
+        // screen: the shared edge gains a projection band at a fraction of
+        // the displacement a full edge alignment would need.
+        let x_offset = (screen.x + screen.width / 2) - (other.x + other.width / 2);
+        let y_offset = (screen.y + screen.height / 2) - (other.y + other.height / 2);
+        let (dx, dy) = if y_offset.abs() <= x_offset.abs() {
+            (
+                0,
+                if y_offset <= 0 {
+                    TANGENT_ALIGNMENT_NUDGE
+                } else {
+                    -TANGENT_ALIGNMENT_NUDGE
+                },
+            )
+        } else {
+            (
+                if x_offset <= 0 {
+                    TANGENT_ALIGNMENT_NUDGE
+                } else {
+                    -TANGENT_ALIGNMENT_NUDGE
+                },
+                0,
+            )
+        };
+        let nudged = Screen {
+            x: screen.x + dx,
+            y: screen.y + dy,
+            ..screen.clone()
+        };
+        // Only apply a nudge that overlaps nothing: the separation pass would
+        // otherwise undo it and the screen would jump back and forth.
+        if others.iter().any(|o| screen_overlap_area(&nudged, o) > 0) {
+            continue;
         }
+        return Some((nudged.x, nudged.y));
     }
     None
-}
-
-/// Edge-aligned placement of one axis against the other screen's span, chosen
-/// by which side of it the screen already leans toward.
-fn aligned_projection_start(start: i32, length: i32, other_start: i32, other_length: i32) -> i32 {
-    let a_center = start + length / 2;
-    let b_center = other_start + other_length / 2;
-    if a_center <= b_center {
-        other_start
-    } else {
-        other_start + other_length - length
-    }
 }
 
 fn unique_peer_screen_id(device_id: &str, screen: &LanPeerScreen, index: usize) -> String {
@@ -15720,20 +15755,22 @@ mod tests {
 
     #[test]
     fn aligning_straightens_a_bare_corner_contact() {
-        // 扩展屏（竖屏）右侧、被控屏被拖到它的右下角：x 边恰好相切、y 范围
-        // 恰好相接——视觉相邻但对角相触，任何方向都无法穿越（BUG-003）。
+        // 扩展屏（竖屏）右侧、被控屏被拖到它的右下角：两轴都恰好相切——
+        // 视觉相邻但对角点接触，任何方向都无法穿越（BUG-003）。
         let ext = screen_at("local-display-2", "local-device", 1920, 0, 1080, 1920);
         let peer = screen_at("peer-display-1", "peer-device", 3000, 1920, 1920, 1080);
 
         let (x, y) = aligned_tangent_position(&peer, &[ext.clone()])
-            .expect("bare corner contact should align");
+            .expect("bare corner contact should nudge");
 
-        assert_eq!(x, 3000);
-        // 底边对齐扩展屏底边：y 投影从 0 变为被控屏整个高度。
-        assert_eq!(y, 840);
+        // 最小推入：y 中心更近（平手取 y），向上推 40px 形成投影带。
+        assert_eq!((x, y), (3000, 1880));
+        let nudged = screen_at("peer-display-1", "peer-device", x, y, 1920, 1080);
+        assert_eq!(screen_overlap_area(&nudged, &ext), 0);
+        // 共享边获得正投影：贴边可穿越。
         assert_eq!(
             projection_len(y, y + peer.height, ext.y, ext.y + ext.height),
-            1080
+            40
         );
     }
 
@@ -15746,6 +15783,10 @@ mod tests {
         // 斜向留白较远：用户刻意摆放，不应纠正。
         let apart = screen_at("peer-display-1", "peer-device", 3200, 2400, 1920, 1080);
         assert_eq!(aligned_tangent_position(&apart, &[ext]), None);
+        // 顶边共线但水平相距 167px：不相邻，绝不能拉过去（振荡回归）。
+        let colinear_far = screen_at("local-display-3", "local-device", 1192, -1280, 2560, 1440);
+        let parked = screen_at("peer-display-1", "peer-device", -1268, -2240, 2293, 960);
+        assert_eq!(aligned_tangent_position(&parked, &[colinear_far]), None);
     }
 
     #[test]
@@ -15760,10 +15801,12 @@ mod tests {
 
         let local = &layout.devices[0].screens[0];
         let peer = &layout.devices[1].screens[0];
-        // 本机屏是参照系不动；被控屏只做对齐位移，不产生重叠。
+        // 本机屏是参照系不动；被控屏只做最小推入，不产生重叠。
         assert_eq!((local.x, local.y), (1920, 0));
-        assert_eq!((peer.x, peer.y), (3000, 840));
+        assert_eq!((peer.x, peer.y), (3000, 1880));
         assert_eq!(screen_overlap_area(local, peer), 0);
+        // 相切 + 正投影：贴边可穿越。
+        assert_eq!(local.x + local.width, peer.x);
         assert!(
             projection_len(
                 local.y,
@@ -15772,6 +15815,62 @@ mod tests {
                 peer.y + peer.height
             ) > 0
         );
+    }
+
+    #[test]
+    fn layout_normalization_leaves_a_real_resolution_changed_layout_stable() {
+        // 2026-11-18 真机回归：peer 与 local3 顶边共线但水平相距 167px，旧
+        // 对齐 pass 把它拉到 local2 上、分离又推回，形成每秒振荡（表现为
+        // 屏幕重叠 + 手动调整后跳回）。此布局必须原样保持且两两不重叠。
+        let mut layout = test_layout();
+        layout.devices[0].screens = vec![
+            screen_at("local-display-1", "local-device", -320, -1280, 1512, 982),
+            screen_at("local-display-2", "local-device", 1192, -2720, 2560, 1440),
+            screen_at("local-display-3", "local-device", 1192, -1280, 2560, 1440),
+        ];
+        layout.devices[1].screens = vec![screen_at(
+            "peer-gt37-local-display-1",
+            "peer-client-10-0-0-2",
+            -1268,
+            -2240,
+            2293,
+            960,
+        )];
+
+        // 连续两轮（模拟两个 presence tick）结果必须一致：不动即稳定。
+        separate_layout_screen_overlaps(&mut layout);
+        let positions_after_first_pass: Vec<(i32, i32)> = layout
+            .devices
+            .iter()
+            .flat_map(|device| device.screens.iter())
+            .map(|screen| (screen.x, screen.y))
+            .collect();
+        separate_layout_screen_overlaps(&mut layout);
+        let positions_after_second_pass: Vec<(i32, i32)> = layout
+            .devices
+            .iter()
+            .flat_map(|device| device.screens.iter())
+            .map(|screen| (screen.x, screen.y))
+            .collect();
+
+        assert_eq!(positions_after_first_pass, positions_after_second_pass);
+        assert_eq!(
+            positions_after_first_pass,
+            vec![(-320, -1280), (1192, -2720), (1192, -1280), (-1268, -2240)]
+        );
+        for a in layout.devices.iter().flat_map(|d| &d.screens) {
+            for b in layout.devices.iter().flat_map(|d| &d.screens) {
+                if a.id != b.id {
+                    assert_eq!(
+                        screen_overlap_area(a, b),
+                        0,
+                        "{} and {} must not overlap",
+                        a.id,
+                        b.id
+                    );
+                }
+            }
+        }
     }
 
     // ---- 网络抗干扰 P0 §3-A：本机地址枚举与排序 ----
