@@ -123,8 +123,11 @@ const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const AUTOSTART_ARG: &str = "--mykvm-autostart";
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
+#[allow(dead_code)] // Windows 服务安装参数；mac 构建上无用
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
+#[allow(dead_code)] // Windows 服务安装参数；mac 构建上无用
 const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
+#[allow(dead_code)] // Windows 服务安装参数；mac 构建上无用
 const HELPER_PATH_ARG: &str = "--helper-path";
 const RUNTIME_STATE_EVENT: &str = "runtime-state-changed";
 const FILE_TRANSFER_PROGRESS_EVENT: &str = "file-transfer-progress";
@@ -1975,13 +1978,6 @@ fn style_screen_indicator_window(
             "screen indicator: no NSScreen matched logical rect ({tx:.0},{ty:.0}) [{tw:.0}x{th:.0}]; keeping tao-positioned window"
         );
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn style_screen_indicator_window(
-    _ns_window: Option<*mut std::ffi::c_void>,
-    _target: (f64, f64, f64, f64),
-) {
 }
 
 #[tauri::command]
@@ -4624,6 +4620,7 @@ pub fn handle_process_control_args() -> bool {
     false
 }
 
+#[allow(dead_code)] // Windows 服务安装子命令在用；mac 构建上无用
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     args.windows(2)
         .find_map(|window| (window[0] == key).then(|| window[1].clone()))

@@ -105,6 +105,7 @@ pub(crate) struct GuardState {
     paused: AtomicBool,
     capture_available: AtomicBool,
     screenshot_active: AtomicBool,
+    #[allow(dead_code)] // 读取方在 Windows 截图守卫路径
     snipaste_running: AtomicBool,
     status: Mutex<GuardStatus>,
     notifier: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -207,9 +208,11 @@ pub(crate) fn spawn_monitor(
     });
 }
 
+#[allow(dead_code)] // Windows 截图/贴图守卫在用；mac 构建上无调用方
 pub(crate) fn screenshot_is_active(guard: &SharedGuard) -> bool {
     guard.screenshot_active.load(Ordering::Relaxed)
 }
+#[allow(dead_code)] // Windows 截图/贴图守卫在用；mac 构建上无调用方
 pub(crate) fn snipaste_is_running(guard: &SharedGuard) -> bool {
     guard.snipaste_running.load(Ordering::Relaxed)
 }

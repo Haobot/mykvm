@@ -45,6 +45,7 @@ impl ShortcutKeys {
         insert(&mut self.local_down, key);
     }
 
+    #[allow(dead_code)] // Windows 助手路径在用；mac 构建上无用
     pub(crate) fn physical_modifier_keys(&self) -> Vec<u16> {
         [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C]
             .into_iter()
@@ -75,6 +76,7 @@ impl ShortcutKeys {
         self.consumed = self.physical_down;
     }
 
+    #[allow(dead_code)] // Windows 助手路径在用；mac 构建上无用
     pub(crate) fn reconcile_physical(&mut self, observed: &Self) {
         self.physical_modifiers = observed.physical_modifiers;
         self.physical_down = observed.physical_down;

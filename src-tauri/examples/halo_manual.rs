@@ -28,6 +28,9 @@
 //!
 //! The process just pumps the main run loop; Ctrl-C exits.
 
+// 手动调试脚本：演示代码风格从简，不受 clippy 全量规则约束。
+#![allow(clippy::iter_nth, clippy::field_reassign_with_default)]
+
 use mykvm_lib::halo::{
     apply_focus_event, create_activator, create_window_service, BorderFrame, FocusHaloSettings,
     FocusScreen, HaloFocusEvent, HaloRuntime, HaloVisual, OverlayScreenGeometry,
@@ -553,4 +556,11 @@ fn subcommand_screen_geometries() -> Vec<OverlayScreenGeometry> {
         native_x: x as f64,
         native_y: y as f64,
     }]
+}
+
+/// Linux 没有接入浮层后端（见 halo::overlay::overlay_supported），手动调试
+/// 脚本给它一个空屏列表即可编译通过。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn subcommand_screen_geometries() -> Vec<OverlayScreenGeometry> {
+    Vec::new()
 }

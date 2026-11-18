@@ -2,6 +2,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+#[allow(dead_code)] // name/directory 由 Windows 拖拽链路填充；mac 构建不读取
 pub(crate) struct FileBuffer {
     pub name: String,
     pub size: u64,

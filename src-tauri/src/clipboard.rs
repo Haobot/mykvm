@@ -59,6 +59,7 @@ pub(crate) fn read_snapshot() -> Option<ClipboardSnapshot> {
     }
 }
 
+#[allow(dead_code)] // Image/Text 供下游扩展分类使用，当前只写 Unknown
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardContentHint {
     Image,

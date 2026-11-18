@@ -61,6 +61,7 @@ const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = 50;
 /// arriving (tap disabled mid-enter, no movement yet) the re-assert stays off
 /// and macOS's silent re-associate leaves the local cursor following the mouse
 /// while remote control is live — the "two cursors move at once" symptom.
+#[cfg(target_os = "macos")]
 const PENDING_DECOUPLE_TIMEOUT_MS: u64 = 1_000;
 #[cfg(target_os = "macos")]
 const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
@@ -404,6 +405,7 @@ pub(crate) fn set_hotkey_recording(recording: bool) {
 pub(crate) fn hotkey_recording() -> bool {
     HOTKEY_RECORDING.load(Ordering::Relaxed)
 }
+#[allow(dead_code)] // Windows 桌面会话在用；mac 构建上无注册 sender
 fn emit_runtime_toggle() {
     if let Some(sender) = RUNTIME_TOGGLE_SENDER.get() {
         sender();
@@ -829,6 +831,7 @@ impl From<crate::shortcut_keys::Modifiers> for HotkeyModifiers {
     }
 }
 
+#[allow(dead_code)] // Windows 热键路径在用；mac 用全局快捷键注册
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CapturedShortcut {
     Toggle,
@@ -836,6 +839,7 @@ enum CapturedShortcut {
     Paste,
 }
 
+#[allow(dead_code)] // Windows 热键路径在用；mac 用全局快捷键注册
 fn captured_shortcut(
     layout: &LayoutState,
     key: u16,
@@ -3461,6 +3465,7 @@ pub(crate) fn dispatch_input_command_to_windows_helper(command: InputCommand) ->
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)] // Windows 上的真实实现在此 cfg 下编译；对称 stub 仅保 API
 pub(crate) fn dispatch_input_command_to_windows_helper(_command: InputCommand) -> bool {
     false
 }
@@ -3474,6 +3479,7 @@ pub(crate) fn close_windows_input_helper_pipe() {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)] // Windows 上的真实实现在此 cfg 下编译；对称 stub 仅保 API
 pub(crate) fn close_windows_input_helper_pipe() {}
 
 /// Logs (at most once every 10s, since a single mouse move floods many packets)
@@ -3649,6 +3655,7 @@ pub fn windows_input_pipe_available() -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)] // Windows 上的真实实现在此 cfg 下编译；对称 stub 仅保 API
 pub fn windows_input_pipe_available() -> bool {
     false
 }
@@ -3810,6 +3817,7 @@ struct MacCaptureContext {
     main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
+    #[allow(dead_code)] // 供切换/重定位逻辑扩展使用；当前构建未读取
     targets: Vec<InputTarget>,
     switch_request: Arc<Mutex<Option<SwitchDirection>>>,
     input_guard: crate::input_guard::SharedGuard,
@@ -10204,7 +10212,10 @@ mod tests {
             macos_capture_loop_ms(true, false),
             MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS
         );
-        assert!(MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS > MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS);
+        // 两个常量的关系即本测试的意图，用 const 块在编译期断言。
+        const {
+            assert!(MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS > MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS);
+        }
     }
 
     fn screen(device_id: &str, id: &str, x: i32, y: i32, width: i32, height: i32) -> Screen {

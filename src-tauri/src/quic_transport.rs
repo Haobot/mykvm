@@ -259,6 +259,7 @@ pub fn start(
     start_inner(preferred_port, identity_dir, on_datagram, Some(on_stream))
 }
 
+#[allow(dead_code)] // 预留的纯数据报启动模式；当前所有调用方都走 on_stream
 pub fn start_datagram_only(
     preferred_port: u16,
     identity_dir: PathBuf,

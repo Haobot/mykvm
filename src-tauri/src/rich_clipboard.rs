@@ -103,6 +103,7 @@ pub(crate) fn write_files(paths: &[String]) -> Result<(), String> {
     }
 }
 
+#[allow(dead_code)] // Windows 剪贴板富文本解析在用；mac 构建上无用
 pub(crate) fn html_fragment(html: &str) -> Option<String> {
     let offset = |name: &str| {
         html.lines()

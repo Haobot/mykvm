@@ -1,4 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 单文件服务程序：测试模块保持紧跟头部，其余实现排在后面。
+#![allow(clippy::items_after_test_module)]
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
