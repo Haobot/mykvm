@@ -5066,6 +5066,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
                     dx,
                     dy,
                     &context.layout_state,
+                    &current_input_targets(&context.layout_state, &context.native_layout),
                     &mut gate,
                     Instant::now(),
                 )
@@ -5904,7 +5905,13 @@ fn handle_macos_mouse_move(
             active_target.x += dx * active_target.target.pointer_speed;
             active_target.y += dy * active_target.target.pointer_speed;
 
-            if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
+            if update_active_remote_screen(
+                active_target,
+                dx,
+                dy,
+                &context.layout_state,
+                &current_input_targets(&context.layout_state, &context.native_layout),
+            ) {
                 let point = local_return_point(active_target);
                 let target = active_target.target.clone();
                 // Control is returning to the local machine: park the controlled
@@ -6871,11 +6878,16 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
 /// desktop (e.g. onto a client's secondary monitor). Returns `true` when the
 /// cursor has left the remote desktop back toward the local machine, in which
 /// case the caller should hand control back.
+///
+/// A screen between two local displays borders the local machine on more than
+/// one side, so the return is honored through whichever edge a target actually
+/// pairs with the current screen — not just the edge the cursor entered from.
 fn update_active_remote_screen(
     active: &mut ActiveTarget,
     dx: f64,
     dy: f64,
     layout_state: &Arc<Mutex<LayoutState>>,
+    targets: &Arc<Vec<InputTarget>>,
 ) -> bool {
     // Still within the screen we're already on: nothing to reconcile.
     if point_in_local_bounds(&active.current_screen, active.x, active.y) {
@@ -6905,10 +6917,10 @@ fn update_active_remote_screen(
         return false;
     }
 
-    // Off the edge with no neighbor there. Only the entry screen borders the
-    // local machine, so only it can hand control back; every other outer edge
-    // just clamps the cursor in place.
-    let returned_to_local = active.current_screen_id == active.target.screen_id
+    // Off the edge with no neighbor there. Back through the entry edge is the
+    // classic return; any other edge hands control back only when the layout
+    // pairs that edge with one of the local screens.
+    let returned_through_entry = active.current_screen_id == active.target.screen_id
         && exited_entry_edge(
             active.target.edge,
             &active.current_screen,
@@ -6917,11 +6929,68 @@ fn update_active_remote_screen(
             dx,
             dy,
         );
-    if returned_to_local {
+    if returned_through_entry {
         pin_active_to_entry_edge(active);
+        return true;
     }
 
-    returned_to_local
+    let Some(exit_edge) = exited_screen_edge(&active.current_screen, active.x, active.y) else {
+        return false;
+    };
+    // `target.edge` names the local screen's bordering edge, which sits on the
+    // opposite side of the remote screen from the exit direction.
+    let required_edge = match exit_edge {
+        Edge::Left => Edge::Right,
+        Edge::Right => Edge::Left,
+        Edge::Top => Edge::Bottom,
+        Edge::Bottom => Edge::Top,
+    };
+    let Some(target) = targets.iter().find(|target| {
+        target.screen_id == active.current_screen_id && target.edge == required_edge
+    }) else {
+        // No local screen borders this edge: clamp the cursor in place.
+        return false;
+    };
+    active.target.edge = target.edge;
+    active.target.local_screen = target.local_screen.clone();
+    active.target.layout_local_screen = target.layout_local_screen.clone();
+    active.target.remote_screen = target.remote_screen.clone();
+    // Keep the along-edge coordinate so the landing point follows where the
+    // cursor left; pull the exit-axis coordinate back onto the edge.
+    active.x = active
+        .x
+        .clamp(0.0, (active.current_screen.width - 1) as f64);
+    active.y = active
+        .y
+        .clamp(0.0, (active.current_screen.height - 1) as f64);
+    true
+}
+
+/// Which side of `screen` the out-of-bounds point (local `x`/`y`) left
+/// through. A corner overshoot picks the axis with the larger overshoot.
+fn exited_screen_edge(screen: &Screen, x: f64, y: f64) -> Option<Edge> {
+    let left_overshoot = 0.0 - x;
+    let right_overshoot = x - (screen.width - 1) as f64;
+    let top_overshoot = 0.0 - y;
+    let bottom_overshoot = y - (screen.height - 1) as f64;
+    let x_overshoot = left_overshoot.max(right_overshoot);
+    let y_overshoot = top_overshoot.max(bottom_overshoot);
+    if x_overshoot <= 0.0 && y_overshoot <= 0.0 {
+        return None;
+    }
+    if x_overshoot > y_overshoot {
+        Some(if left_overshoot > 0.0 {
+            Edge::Left
+        } else {
+            Edge::Right
+        })
+    } else {
+        Some(if top_overshoot > 0.0 {
+            Edge::Top
+        } else {
+            Edge::Bottom
+        })
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -6930,10 +6999,11 @@ fn update_windows_remote_screen(
     dx: f64,
     dy: f64,
     layout: &Arc<Mutex<LayoutState>>,
+    targets: &Arc<Vec<InputTarget>>,
     gate: &mut crate::windows_mouse_motion::EdgeReturnGate,
     now: Instant,
 ) -> bool {
-    if update_active_remote_screen(active, dx, dy, layout) {
+    if update_active_remote_screen(active, dx, dy, layout, targets) {
         let outward = match active.target.edge {
             Edge::Right => -dx,
             Edge::Left => dx,
@@ -9758,6 +9828,7 @@ mod tests {
             dx,
             dy,
             &Arc::new(Mutex::new(layout)),
+            &Arc::new(targets),
         ));
         // Returning intentionally still lands on the shared edge, not center.
         assert_eq!(local_return_point(&active).0, 1919.0);
@@ -9770,6 +9841,7 @@ mod tests {
         let mut active = crossing_target(&targets, 1919.0, 540.0, 3.0, 0.0).unwrap();
         active.x = 0.0; // Reproduce the entry-edge position in the captured log.
         let layout = Arc::new(Mutex::new(layout));
+        let targets = Arc::new(targets);
         let now = Instant::now();
         let mut gate = crate::windows_mouse_motion::EdgeReturnGate::default();
         for second in 0..10 {
@@ -9779,6 +9851,7 @@ mod tests {
                 -1.0,
                 0.0,
                 &layout,
+                &targets,
                 &mut gate,
                 now + Duration::from_secs(second)
             ));
@@ -9790,6 +9863,7 @@ mod tests {
             5.0,
             0.0,
             &layout,
+            &targets,
             &mut gate,
             now + Duration::from_secs(10)
         ));
@@ -9799,6 +9873,7 @@ mod tests {
             -7.0,
             0.0,
             &layout,
+            &targets,
             &mut gate,
             now + Duration::from_secs(11)
         ));
@@ -9808,6 +9883,7 @@ mod tests {
             -1.0,
             0.0,
             &layout,
+            &targets,
             &mut gate,
             now + Duration::from_secs(11) + Duration::from_millis(10)
         ));
@@ -10540,6 +10616,7 @@ mod tests {
         let mut layout = layout_for_target_tests();
         layout.devices.retain(|device| device.id != "peer-device");
         layout.devices.push(device);
+        let targets = Arc::new(build_input_targets(&layout, &layout));
         let layout_state = Arc::new(Mutex::new(layout));
 
         let entry = screen("peer-device", "peer-device-scr-1", 1920, 0, 1920, 1080);
@@ -10574,7 +10651,7 @@ mod tests {
 
         // Pushing down past the primary's bottom edge roams onto the secondary.
         active.y += 5.0;
-        let returned = update_active_remote_screen(&mut active, 0.0, 5.0, &layout_state);
+        let returned = update_active_remote_screen(&mut active, 0.0, 5.0, &layout_state, &targets);
         assert!(
             !returned,
             "crossing onto a sibling screen must not return to local"
@@ -10585,13 +10662,13 @@ mod tests {
 
         // Moving back up crosses back onto the primary screen.
         active.y -= 6.0;
-        let returned = update_active_remote_screen(&mut active, 0.0, -6.0, &layout_state);
+        let returned = update_active_remote_screen(&mut active, 0.0, -6.0, &layout_state, &targets);
         assert!(!returned);
         assert_eq!(active.current_screen_id, "scr-1");
     }
 
     #[test]
-    fn cursor_returns_to_local_only_from_entry_edge() {
+    fn cursor_returns_to_local_through_the_entry_edge() {
         let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
         let entry = screen(
             "peer-device",
@@ -10619,6 +10696,7 @@ mod tests {
             edge: Edge::Right,
             modifier_map: None,
         };
+        let targets = Arc::new(vec![target.clone()]);
         let mut current_screen = entry.clone();
         current_screen.id = "local-display-1".into();
         let mut active = ActiveTarget {
@@ -10637,8 +10715,80 @@ mod tests {
             &mut active,
             -2.0,
             0.0,
-            &layout_state
+            &layout_state,
+            &targets
         ));
+    }
+
+    #[test]
+    fn cursor_returns_to_local_through_a_second_bordered_edge() {
+        // 2026-11-18 真机回归：被控屏左右贴外扩屏、底部贴本机主屏。从外扩屏
+        // 进入（entry edge = Right）后向下推光标，必须能从底边回到主屏，
+        // 而不是被钳在原地。
+        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
+        let entry = screen(
+            "peer-device",
+            "peer-device-local-display-1",
+            1920,
+            0,
+            1920,
+            1080,
+        );
+        let entry_target = InputTarget {
+            pointer_speed: 1.0,
+            scroll_speed: 1.0,
+            device_id: "peer-device".into(),
+            origin_device_id: "peer-local-192-168-66-92".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            target_addr: "10.0.0.2:47834".into(),
+            target_platform: "windows".into(),
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            screen_id: "local-display-1".into(),
+            local_screen: screen("local-device", "local-display-2", 0, -1080, 1920, 1080),
+            layout_local_screen: screen("local-device", "local-display-2", 0, -1080, 1920, 1080),
+            remote_screen: entry.clone(),
+            edge: Edge::Right,
+            modifier_map: None,
+        };
+        // The layout also pairs the peer screen's bottom edge with the main
+        // display below it: touching_edge(local-display-1, peer) == Top.
+        let below_target = InputTarget {
+            screen_id: "local-display-1".into(),
+            local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            remote_screen: entry.clone(),
+            edge: Edge::Top,
+            ..entry_target.clone()
+        };
+        let targets = Arc::new(vec![entry_target, below_target]);
+        let mut current_screen = entry.clone();
+        current_screen.id = "local-display-1".into();
+        let mut active = ActiveTarget {
+            target: targets[0].clone(),
+            return_point: None,
+            current_screen,
+            current_screen_id: "local-display-1".into(),
+            x: 960.0,
+            y: 1079.0,
+        };
+
+        // Push down off the peer screen's bottom edge: control returns and the
+        // effective target switches to the main display below.
+        active.y += 4.0;
+        assert!(
+            update_active_remote_screen(&mut active, 0.0, 4.0, &layout_state, &targets),
+            "exiting an edge that borders another local display must return"
+        );
+        assert_eq!(active.target.edge, Edge::Top);
+        assert_eq!(active.target.local_screen.id, "local-display-1");
+        assert_eq!(active.x, 960.0);
+        // The landing point sits on the main display's top edge, at the same
+        // along-edge position the cursor left the peer screen.
+        let (land_x, land_y) = local_return_point(&active);
+        assert!((0.0..1920.0).contains(&land_x), "land_x = {land_x}");
+        assert!((0.0..20.0).contains(&land_y), "land_y = {land_y}");
     }
 
     #[test]
@@ -10670,6 +10820,7 @@ mod tests {
             edge: Edge::Right,
             modifier_map: None,
         };
+        let targets = Arc::new(vec![target.clone()]);
         let mut current_screen = entry.clone();
         current_screen.id = "local-display-1".into();
         let active = ActiveTarget {
@@ -10689,7 +10840,7 @@ mod tests {
         let mut unguarded = active.clone();
         unguarded.x += dx;
         assert!(
-            update_active_remote_screen(&mut unguarded, dx, dy, &layout_state),
+            update_active_remote_screen(&mut unguarded, dx, dy, &layout_state, &targets),
             "without the initial warp guard, the anchor warp delta is mistaken for returning"
         );
 
@@ -10698,7 +10849,7 @@ mod tests {
             false
         } else {
             guarded.x += dx;
-            update_active_remote_screen(&mut guarded, dx, dy, &layout_state)
+            update_active_remote_screen(&mut guarded, dx, dy, &layout_state, &targets)
         };
 
         assert!(!returned);
@@ -11159,6 +11310,7 @@ mod tests {
                 edge,
                 modifier_map: None,
             };
+            let targets = Arc::new(vec![target.clone()]);
             let mut current_screen = entry.clone();
             current_screen.id = "local-display-1".into();
             let mut active = ActiveTarget {
@@ -11174,7 +11326,8 @@ mod tests {
                 &mut active,
                 dx,
                 dy,
-                &layout_state
+                &layout_state,
+                &targets
             ));
             assert_eq!(active.x, expected_x);
             assert_eq!(active.y, expected_y);
