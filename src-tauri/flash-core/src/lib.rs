@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 /// 光圈停留时长：与 3 拍脉冲动画（0.45s × 3 交替 ≈ 1.35s）对齐。
-pub(crate) const FLASH_DURATION: Duration = Duration::from_millis(1400);
+pub const FLASH_DURATION: Duration = Duration::from_millis(1400);
 
 /// CSS 里的 `rgba(56, 150, 255, 0.92)`——与前端画布选中描边同色系。
 /// 通道统一存 0-255，alpha 同乘 255；两端渲染前各自归一。
@@ -262,10 +262,10 @@ mod macos_imp {
             }
         }
         let alloc: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-        // macOS 27 实测：initWithContentRect: 的大结构体参数会被吞掉（窗口
-        // 被建成显示器顶部的 30px 窄条），而 setFrame: 的同布局参数工作正常
-        // （旧版 frame 回读一直是正确的全屏框）。所以先按小矩形建窗，随后
-        // 用 setFrame: 撑到目标框——init 的传参坑就此绕开。
+        // 先按小矩形建窗再用 setFrame: 撑到目标框。init 的大 rect 传参在
+        // macOS 27 上属高风险路径（本轮排查中窗口服务器里出现的 30px 窄条
+        // 最终证实是无关的启动辅助窗，但 init 传参与 setFrame 相比缺乏
+        // 独立验证），setFrame 路径已被多轮 frame 回读证实可靠。
         let seed = NsRect {
             x: 0.0,
             y: 0.0,

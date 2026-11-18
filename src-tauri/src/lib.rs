@@ -39,7 +39,7 @@ mod native_drag;
 mod performance;
 mod quic_transport;
 mod rich_clipboard;
-pub mod screen_flash;
+pub use mykvm_flash_core as screen_flash;
 pub mod shared_input;
 #[cfg(any(target_os = "windows", test))]
 mod shortcut_keys;
@@ -124,6 +124,8 @@ const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const AUTOSTART_ARG: &str = "--mykvm-autostart";
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
+#[cfg(target_os = "macos")]
+const FLASH_ARG: &str = "--flash";
 #[allow(dead_code)] // Windows 服务安装参数；mac 构建上无用
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
 #[allow(dead_code)] // Windows 服务安装参数；mac 构建上无用
@@ -1810,8 +1812,43 @@ fn flash_screen_indicator(
             screen.height as f64,
         )
     };
-    screen_flash::flash_logical_rect((x, y, width, height));
+    run_screen_flash((x, y, width, height));
     Ok(())
+}
+
+/// 闪光统一入口。macOS 走独立进程（BUG-005：Tauri 进程内创建的跨显示器
+/// NSWindow 无法进入窗口服务器的当前 Space，同代码独立进程实测可见），
+/// 以 `mykvm --flash x y w h` 复用主程序二进制；spawn 失败（极端环境）回退
+/// 进程内实现。Windows/Linux 保持进程内实现。
+fn run_screen_flash(rect: (f64, f64, f64, f64)) {
+    #[cfg(target_os = "macos")]
+    match spawn_flash_helper(rect) {
+        Ok(()) => return,
+        Err(error) => {
+            log::info!("screen flash helper spawn failed ({error}); falling back in-process");
+        }
+    }
+    screen_flash::flash_logical_rect(rect);
+}
+
+/// 以本二进制 + `--flash` 参数拉起独立闪光进程。返回 Err 表示起不来，
+/// 由调用方回退进程内实现。
+#[cfg(target_os = "macos")]
+fn spawn_flash_helper(rect: (f64, f64, f64, f64)) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| format!("current_exe: {error}"))?;
+    let (x, y, width, height) = rect;
+    let args = [
+        FLASH_ARG.to_string(),
+        x.to_string(),
+        y.to_string(),
+        width.to_string(),
+        height.to_string(),
+    ];
+    std::process::Command::new(&exe)
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("spawn: {error}"))
 }
 
 /// 布局画布点选远端（被控）磁贴：通过 QUIC 输入通道向对端发 FlashScreen
@@ -4435,10 +4472,51 @@ fn is_portable_mode() -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+/// 光圈独立进程模式：`mykvm --flash <x> <y> <w> <h>`。进程里只有
+/// NSApplication + 闪光窗，与独立探针完全等价（跨显示器窗口可正常进入
+/// 当前 Space 显示）；闪光窗 1.4s 自关，这里 2s 后 terminate 退出。
+#[cfg(target_os = "macos")]
+fn run_flash_mode(args: &[String]) {
+    let coords: Vec<f64> = args
+        .iter()
+        .skip_while(|arg| arg.as_str() != FLASH_ARG)
+        .skip(1)
+        .filter_map(|arg| arg.parse::<f64>().ok())
+        .take(4)
+        .collect();
+    if coords.len() < 4 {
+        eprintln!("usage: mykvm --flash <x> <y> <w> <h>");
+        return;
+    }
+    unsafe {
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send, sel};
+
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, setActivationPolicy: 1usize]; // accessory
+        screen_flash::flash_logical_rect((coords[0], coords[1], coords[2], coords[3]));
+        let _: () = msg_send![app,
+            performSelector: sel!(terminate:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: 2.0_f64
+        ];
+        let _: () = msg_send![app, run];
+    }
+}
+
 pub fn handle_process_control_args() -> bool {
     let args = env::args().collect::<Vec<_>>();
     if args.iter().any(|arg| arg == QUIT_EXISTING_ARG) {
         request_existing_instance_quit();
+        return true;
+    }
+
+    // 光圈独立进程模式（BUG-005）：Tauri 进程内创建的跨显示器 NSWindow
+    // 无法进入窗口服务器的当前 Space，独立进程用同一段代码实测可见。
+    // 该分支在单实例锁之前执行，进程闪光 2s 后自行退出。
+    #[cfg(target_os = "macos")]
+    if args.iter().any(|arg| arg == FLASH_ARG) {
+        run_flash_mode(&args);
         return true;
     }
 
@@ -4967,14 +5045,13 @@ pub fn run() {
         .setup(|app| {
             let _ = APP_VERSION.set(app.config().version.clone().unwrap_or_else(|| app.package_info().version.to_string()));
             spawn_lock_sync_watcher(app.handle().clone());
-            // 被控端收到 FlashScreen 事件后要在对应物理屏闪光圈：光圈窗口
-            // 是原生的（screen_flash 模块自建自毁），不需要 AppHandle，把
-            // 执行器交给 input.rs 的分发点即可。
+            // 被控端收到 FlashScreen 事件后要在对应物理屏闪光圈：闪光走
+            // 独立 helper 进程（macOS），把执行器交给 input.rs 的分发点。
             input::install_screen_flash_dispatcher(Box::new(|x, y, width, height| {
-                screen_flash::flash_logical_rect((x, y, width, height));
+                run_screen_flash((x, y, width, height));
             }));
-            // TODO(临时诊断): 启动 12s 后对本机每块屏自动闪一次光圈（窗口
-            // 会在 450ms 时自截取证），定位 BUG-005 外接屏不显示。验收后删除。
+            // TODO(临时诊断): 启动 12s 后对本机每块屏自动闪一次光圈，定位
+            // BUG-005 外接屏不显示（现在走 helper 进程路径）。验收后删除。
             #[cfg(target_os = "macos")]
             {
                 let app_for_flash_test = app.handle().clone();
@@ -5009,21 +5086,11 @@ pub fn run() {
                             .unwrap_or_default()
                     };
                     for (id, x, y, width, height) in rects {
-                        log::info!("flash selftest begin screen={id} rect=({x},{y}) {width}x{height}");
-                        // 诊断对照：走 tauri 主线程派发（tao 事件循环体内执行）。
-                        let _ = app_for_flash_test.run_on_main_thread(move || {
-                            screen_flash::create_variant((x, y, width, height), false);
-                        });
-                        // 外接屏（非首个屏）额外做一次"激活变体"：建窗前激活
-                        // 本 app 并 makeKeyAndOrderFront，验证 Space 归属能否
-                        // 被激活态纠正。
-                        if id != "local-display-1" {
-                            std::thread::sleep(Duration::from_millis(2200));
-                            let _ = app_for_flash_test.run_on_main_thread(move || {
-                                screen_flash::create_variant((x, y, width, height), true);
-                            });
-                        }
-                        std::thread::sleep(Duration::from_millis(2200));
+                        log::info!(
+                            "flash selftest begin screen={id} rect=({x},{y}) {width}x{height}"
+                        );
+                        run_screen_flash((x, y, width, height));
+                        std::thread::sleep(Duration::from_millis(2500));
                     }
                     log::info!("flash selftest done");
                 });
