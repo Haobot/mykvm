@@ -1,21 +1,22 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
-    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex, OnceLock,
+    },
     thread,
     time::{Duration, Instant},
 };
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::sync::mpsc;
-
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::shared_input::LEFT_BUTTON_MASK;
 use crate::{
     quic_transport,
-    shared_input::{button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton},
+    shared_input::{
+        button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton,
+        LEFT_BUTTON_MASK,
+    },
     Device, LayoutState, NativeStageStatus, Screen,
 };
 

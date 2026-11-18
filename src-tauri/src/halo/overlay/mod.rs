@@ -118,8 +118,6 @@ pub fn create_overlay(settings: &FocusHaloSettings) -> Box<dyn OverlayBackend> {
 
 #[cfg(test)]
 mod tests {
-    // Linux 无测试用例（浮层后端未接入），super::* 只为 mac/win 用例服务。
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use super::*;
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]

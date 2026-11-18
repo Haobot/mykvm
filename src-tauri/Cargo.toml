@@ -25,6 +25,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 members = ["input-helper"]
 resolver = "2"
 
+# Linux 不是运行平台：capture/注入子系统在该目标整体 cfg 掉，入口、常量与
+# 导入的跨平台死代码是预期状态，rustc 的两个死代码类 lint 集中放行
+# （真实问题交给 clippy 与代码评审）。
+[lints.rust]
+dead_code = "allow"
+unused_imports = "allow"
+
 # clippy stable 升级后新增的 style 级规则在存量代码（尤其 halo 原生浮层与
 # 输入 FFI 的 raw msg_send 风格）上批量触发，与正确性无关，集中降级；
 # 待后续重构逐条收敛后再移除。CI 以 `cargo clippy -- -D warnings` 执行。
