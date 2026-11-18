@@ -132,6 +132,15 @@ export async function isAutostartEnabled(): Promise<boolean> {
   return invoke<boolean>('is_autostart_enabled')
 }
 
+/** 在屏幕 id 对应的物理显示器上闪一圈光圈（仅本机屏；窗口自动关闭）。 */
+export async function flashScreenIndicator(screenId: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('flash_screen_indicator', { screenId })
+}
+
 export async function setAutostart(enabled: boolean): Promise<boolean> {
   if (!isTauri()) {
     return enabled

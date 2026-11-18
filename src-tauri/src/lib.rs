@@ -1776,6 +1776,109 @@ fn open_log_directory(app: AppHandle) -> Result<(), String> {
     open_external_path(&log_dir)
 }
 
+/// 连续点击时区分每次光圈窗口的标签，叠开的窗口各自独立倒计时关闭。
+static SCREEN_FLASH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 光圈提示窗口的停留时长：与页面里 3 拍脉冲动画（约 1.35s）对齐。
+const SCREEN_FLASH_DURATION: Duration = Duration::from_millis(1400);
+
+/// 布局画布点击磁贴后，在对应的物理显示器上闪一圈光圈，让用户知道
+/// "这块画布磁贴 = 这块真实屏幕"。窗口透明、置顶、点击穿透，到时自关。
+/// 仅本机屏可以点亮：远端屏属于对端机器，物理上够不着。
+#[tauri::command]
+fn flash_screen_indicator(
+    app: AppHandle,
+    state: tauri::State<'_, AppRuntime>,
+    screen_id: String,
+) -> Result<(), String> {
+    let (x, y, width, height) = {
+        let Ok(native) = state.native_layout.lock() else {
+            return Err("native layout lock poisoned".to_string());
+        };
+        let Some(local) = native.devices.iter().find(|device| device.role == "local") else {
+            return Err("local device missing from native layout".to_string());
+        };
+        let Some(screen) = local
+            .screens
+            .iter()
+            .find(|screen| screen.id == screen_id)
+            .filter(|screen| screen.width > 1 && screen.height > 1)
+        else {
+            return Err(format!("unknown local screen {screen_id}"));
+        };
+        (
+            screen.x as f64,
+            screen.y as f64,
+            screen.width as f64,
+            screen.height as f64,
+        )
+    };
+
+    let label = format!(
+        "screen-flash-{}",
+        SCREEN_FLASH_SEQ.fetch_add(1, Ordering::SeqCst)
+    );
+    let app_for_window = app.clone();
+    app.run_on_main_thread(move || {
+        let builder = WebviewWindowBuilder::new(
+            &app_for_window,
+            &label,
+            WebviewUrl::App("screen-indicator.html".into()),
+        )
+        .position(x, y)
+        .inner_size(width.max(80.0), height.max(60.0))
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .minimizable(false)
+        .maximizable(false)
+        .closable(true)
+        .focused(false);
+        let window = match builder.build() {
+            Ok(window) => window,
+            Err(error) => {
+                log::warn!("failed to open screen indicator window: {error}");
+                return;
+            }
+        };
+        let _ = window.set_ignore_cursor_events(true);
+        #[cfg(target_os = "macos")]
+        raise_window_above_system_chrome(window.ns_window().ok());
+        std::thread::spawn(move || {
+            std::thread::sleep(SCREEN_FLASH_DURATION);
+            if let Err(error) = window.close() {
+                log::debug!("screen indicator window already closed: {error}");
+            }
+        });
+    })
+    .map_err(|error| format!("failed to dispatch to main thread: {error}"))
+}
+
+/// tauri 的 always-on-top 是 floating 层（3），会被菜单栏（25）和程序坞
+/// （20）遮住光圈的上/下边缘；抬到 NSScreenSaverWindowLevel（1000）并
+/// 允许跨空间显示，保证屏幕四边都能看到。
+#[cfg(target_os = "macos")]
+fn raise_window_above_system_chrome(ns_window: Option<*mut std::ffi::c_void>) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let Some(ns_window) = ns_window else {
+        return;
+    };
+    unsafe {
+        let window = &*(ns_window as *const AnyObject);
+        let _: () = msg_send![window, setLevel: 1000_i64];
+        // NSWindowCollectionBehaviorCanJoinAllSpaces (1<<0)
+        // | NSWindowCollectionBehaviorFullScreenAuxiliary (1<<8)
+        let _: () = msg_send![window, setCollectionBehavior: 257_usize];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn raise_window_above_system_chrome(_ns_window: Option<*mut std::ffi::c_void>) {}
+
 #[tauri::command]
 fn save_layout(
     layout: LayoutState,
@@ -5210,6 +5313,7 @@ pub fn run() {
             read_runtime_status,
             read_diagnostic_info,
             open_log_directory,
+            flash_screen_indicator,
             save_layout,
             cancel_file_transfer,
             paste_remote_clipboard,
