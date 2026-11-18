@@ -1779,6 +1779,24 @@ fn open_log_directory(app: AppHandle) -> Result<(), String> {
 /// 连续点击时区分每次光圈窗口的标签，叠开的窗口各自独立倒计时关闭。
 static SCREEN_FLASH_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// 与 NSRect 同布局（原点在主屏左下、y 向上，点坐标）。
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NsRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+// objc2 要求 msg_send 的返回/参数类型实现 Encode；四个 f64 与 NSRect 的
+// ABI 完全一致。
+#[cfg(target_os = "macos")]
+unsafe impl objc2::encode::Encode for NsRect {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Array(4, &f64::ENCODING);
+}
+
 /// 光圈提示窗口的停留时长：与页面里 3 拍脉冲动画（约 1.35s）对齐。
 const SCREEN_FLASH_DURATION: Duration = Duration::from_millis(1400);
 
@@ -1845,7 +1863,7 @@ fn flash_screen_indicator(
         };
         let _ = window.set_ignore_cursor_events(true);
         #[cfg(target_os = "macos")]
-        raise_window_above_system_chrome(window.ns_window().ok());
+        style_screen_indicator_window(window.ns_window().ok(), (x, y, width, height));
         std::thread::spawn(move || {
             std::thread::sleep(SCREEN_FLASH_DURATION);
             if let Err(error) = window.close() {
@@ -1859,10 +1877,19 @@ fn flash_screen_indicator(
 /// tauri 的 always-on-top 是 floating 层（3），会被菜单栏（25）和程序坞
 /// （20）遮住光圈的上/下边缘；抬到 NSScreenSaverWindowLevel（1000）并
 /// 允许跨空间显示，保证屏幕四边都能看到。
+///
+/// 定位不走 tao 的 builder 坐标：tao 把逻辑 y 翻转成 Cocoa 坐标时用的是
+/// 主屏的**物理像素高**（`CGDisplay::main().pixels_high()`），而传入值是
+/// **点**——Retina 主屏（scale 2）下整屏坐标系统性偏移一个主屏高度，
+/// 只有恰好贴原点的屏看起来正常。改为在 NSScreen 列表里按点级几何匹配
+/// 目标屏，直接用它自己的 Cocoa frame 设窗口，完全绕开换算。
 #[cfg(target_os = "macos")]
-fn raise_window_above_system_chrome(ns_window: Option<*mut std::ffi::c_void>) {
-    use objc2::msg_send;
+fn style_screen_indicator_window(
+    ns_window: Option<*mut std::ffi::c_void>,
+    target: (f64, f64, f64, f64),
+) {
     use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
 
     let Some(ns_window) = ns_window else {
         return;
@@ -1873,11 +1900,49 @@ fn raise_window_above_system_chrome(ns_window: Option<*mut std::ffi::c_void>) {
         // NSWindowCollectionBehaviorCanJoinAllSpaces (1<<0)
         // | NSWindowCollectionBehaviorFullScreenAuxiliary (1<<8)
         let _: () = msg_send![window, setCollectionBehavior: 257_usize];
+
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        let count: usize = msg_send![screens, count];
+        if count == 0 {
+            return;
+        }
+        // NSScreen.screens[0] 是带菜单栏的主屏；frame 是点坐标（Cocoa 坐标
+        // 系，原点在主屏左下角），先把每块屏换算回"左上原点、y 向下"的
+        // 可视坐标再与 native_layout 的逻辑矩形匹配。
+        let first: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+        let main_frame: NsRect = msg_send![first, frame];
+        let main_height = main_frame.h;
+        let (tx, ty, tw, th) = target;
+        for index in 0..count {
+            let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
+            let frame: NsRect = msg_send![screen, frame];
+            let visual_y = main_height - (frame.y + frame.h);
+            let same_size = (frame.w - tw).abs() < 1.0 && (frame.h - th).abs() < 1.0;
+            let same_origin = (frame.x - tx).abs() < 1.0 && (visual_y - ty).abs() < 1.0;
+            if same_size && same_origin {
+                let _: () = msg_send![window, setFrame: frame, display: true];
+                log::info!(
+                    "screen indicator covering display at cocoa ({:.0},{:.0}) [{:.0}x{:.0}]",
+                    frame.x,
+                    frame.y,
+                    frame.w,
+                    frame.h
+                );
+                return;
+            }
+        }
+        log::warn!(
+            "screen indicator: no NSScreen matched logical rect ({tx:.0},{ty:.0}) [{tw:.0}x{th:.0}]; keeping tao-positioned window"
+        );
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn raise_window_above_system_chrome(_ns_window: Option<*mut std::ffi::c_void>) {}
+fn style_screen_indicator_window(
+    _ns_window: Option<*mut std::ffi::c_void>,
+    _target: (f64, f64, f64, f64),
+) {
+}
 
 #[tauri::command]
 fn save_layout(
