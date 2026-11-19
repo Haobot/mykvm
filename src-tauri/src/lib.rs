@@ -1803,6 +1803,39 @@ unsafe impl objc2::encode::Encode for NsRect {
 /// 光圈提示窗口的停留时长：与页面里 3 拍脉冲动画（约 1.35s）对齐。
 const SCREEN_FLASH_DURATION: Duration = Duration::from_millis(1400);
 
+/// 全屏应用会反复抢占 z-order / 所属 Space，光圈窗需要在存活期内周期性
+/// 重申置顶；4 次 × 300ms + 尾部 200ms = 停留时长 1400ms。
+const SCREEN_FLASH_REASSERT_INTERVAL: Duration = Duration::from_millis(300);
+
+/// 光圈窗口比目标屏幕四边各大 8px：WebView 透明窗口在窗口边缘会合成出
+/// 1~2px 的黑色线框（WebView2 / WKWebView 的透明窗边缘伪影），把窗口撑到
+/// 显示区之外，伪影就落在屏幕外看不见。页面里环的 inset 起点相应 +8px
+/// （screen-indicator.html），两边数字保持同步。
+const SCREEN_FLASH_EDGE_SLACK: f64 = 8.0;
+
+/// 矩形四边各外扩 `slack`。纯计算（无 Tauri/objc 类型）便于单测；
+/// 窗口矩形与 macOS 屏幕帧定位共用同一份外扩数学。
+fn outset_rect(x: f64, y: f64, width: f64, height: f64, slack: f64) -> (f64, f64, f64, f64) {
+    (
+        x - slack,
+        y - slack,
+        width + slack * 2.0,
+        height + slack * 2.0,
+    )
+}
+
+/// 屏幕矩形（逻辑坐标）→ 光圈窗口矩形：先钳最小可视尺寸，再四边外扩
+/// [`SCREEN_FLASH_EDGE_SLACK`]。纯计算（无 Tauri 类型）便于单测。
+fn screen_flash_window_rect(x: f64, y: f64, width: f64, height: f64) -> (f64, f64, f64, f64) {
+    outset_rect(
+        x,
+        y,
+        width.max(80.0),
+        height.max(60.0),
+        SCREEN_FLASH_EDGE_SLACK,
+    )
+}
+
 /// 布局画布点击磁贴后，在对应的物理显示器上闪一圈光圈，让用户知道
 /// "这块画布磁贴 = 这块真实屏幕"。窗口透明、置顶、点击穿透，到时自关。
 /// 仅本机屏可以点亮：远端屏属于对端机器，物理上够不着。
@@ -1850,6 +1883,7 @@ fn run_screen_flash_window(
         "screen-flash-{}",
         SCREEN_FLASH_SEQ.fetch_add(1, Ordering::SeqCst)
     );
+    let (fx, fy, fw, fh) = screen_flash_window_rect(x, y, width, height);
     let app_for_window = app.clone();
     app.run_on_main_thread(move || {
         let builder = WebviewWindowBuilder::new(
@@ -1857,10 +1891,13 @@ fn run_screen_flash_window(
             &label,
             WebviewUrl::App("screen-indicator.html".into()),
         )
-        .position(x, y)
-        .inner_size(width.max(80.0), height.max(60.0))
+        .position(fx, fy)
+        .inner_size(fw, fh)
         .decorations(false)
         .transparent(true)
+        // 窗口阴影会沿窗缘投出一圈暗框（尤其外接屏接缝侧），光圈窗一律
+        // 不要阴影。
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
@@ -1876,16 +1913,54 @@ fn run_screen_flash_window(
             }
         };
         let _ = window.set_ignore_cursor_events(true);
+        // macOS 侧的样式在置顶重申里也会生效；先做一次初始定级/定位。
         #[cfg(target_os = "macos")]
         style_screen_indicator_window(window.ns_window().ok(), (x, y, width, height));
         std::thread::spawn(move || {
-            std::thread::sleep(SCREEN_FLASH_DURATION);
+            // 存活期内周期性重申置顶：扩展屏上跑应用全屏时，全屏应用会把
+            // 光圈窗挤下层级（Windows）或挤出当前 Space 前排（macOS）。
+            let interval = SCREEN_FLASH_REASSERT_INTERVAL.as_millis() as u64;
+            let total = SCREEN_FLASH_DURATION.as_millis() as u64;
+            for _ in 0..(total / interval) {
+                std::thread::sleep(SCREEN_FLASH_REASSERT_INTERVAL);
+                reassert_screen_indicator_front(&window);
+            }
+            std::thread::sleep(Duration::from_millis(total % interval));
             if let Err(error) = window.close() {
                 log::debug!("screen indicator window already closed: {error}");
             }
         });
     })
     .map_err(|error| format!("failed to dispatch to main thread: {error}"))
+}
+
+/// 置顶重申：Windows 直接重申 HWND_TOPMOST；macOS 不能用
+/// `set_always_on_top`（它会把层级压回 floating(3)，盖掉光圈窗刻意抬到的
+/// NSScreenSaverWindowLevel），改为回主线程重设层级 + `orderFrontRegardless`。
+fn reassert_screen_indicator_front(window: &tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(error) = window.set_always_on_top(true) {
+            log::debug!("screen indicator topmost reassert failed: {error}");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(ns_window) = window.ns_window() else {
+            return;
+        };
+        // objc 指针不是 Send：以 usize 过线程，主线程回调里再换回指针
+        // （同 halo/macos.rs 的静态指针存法）。
+        let ns_window = ns_window as usize;
+        let app = window.app_handle().clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            bring_screen_indicator_front(ns_window as *mut std::ffi::c_void);
+        }) {
+            log::debug!("screen indicator front reassert dispatch failed: {error}");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = window;
 }
 
 /// 布局画布点选远端（被控）磁贴：通过 QUIC 输入通道向对端发 FlashScreen
@@ -1939,44 +2014,68 @@ fn style_screen_indicator_window(
 
         let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
         let count: usize = msg_send![screens, count];
-        if count == 0 {
-            return;
-        }
-        // NSScreen.screens[0] 是带菜单栏的主屏；frame 是点坐标（Cocoa 坐标
-        // 系，原点在主屏左下角），先把每块屏换算回"左上原点、y 向下"的
-        // 可视坐标再与 native_layout 的逻辑矩形匹配。
-        let first: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
-        let main_frame: NsRect = msg_send![first, frame];
-        let main_height = main_frame.h;
-        let (tx, ty, tw, th) = target;
-        for index in 0..count {
-            let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
-            let frame: NsRect = msg_send![screen, frame];
-            let visual_y = main_height - (frame.y + frame.h);
-            let same_size = (frame.w - tw).abs() < 1.0 && (frame.h - th).abs() < 1.0;
-            let same_origin = (frame.x - tx).abs() < 1.0 && (visual_y - ty).abs() < 1.0;
-            if same_size && same_origin {
-                let _: () = msg_send![window, setFrame: frame, display: true];
-                // 后台 app 建窗可能被 macOS 抑制显示：orderFrontRegardless
-                // 绕过激活检查强制上屏。
-                let _: () = msg_send![window, orderFrontRegardless];
-                let level: i64 = msg_send![window, level];
-                let frame_now: NsRect = msg_send![window, frame];
-                log::info!(
-                    "screen indicator covering display at cocoa ({:.0},{:.0}) [{:.0}x{:.0}] level={level} now=({:.0},{:.0})",
-                    frame.x,
-                    frame.y,
-                    frame.w,
-                    frame.h,
-                    frame_now.x,
-                    frame_now.y
-                );
-                return;
+        if count > 0 {
+            // NSScreen.screens[0] 是带菜单栏的主屏；frame 是点坐标（Cocoa 坐标
+            // 系，原点在主屏左下角），先把每块屏换算回"左上原点、y 向下"的
+            // 可视坐标再与 native_layout 的逻辑矩形匹配。
+            let first: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+            let main_frame: NsRect = msg_send![first, frame];
+            let main_height = main_frame.h;
+            let (tx, ty, tw, th) = target;
+            for index in 0..count {
+                let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
+                let frame: NsRect = msg_send![screen, frame];
+                let visual_y = main_height - (frame.y + frame.h);
+                let same_size = (frame.w - tw).abs() < 1.0 && (frame.h - th).abs() < 1.0;
+                let same_origin = (frame.x - tx).abs() < 1.0 && (visual_y - ty).abs() < 1.0;
+                if same_size && same_origin {
+                    // 屏幕帧四边外扩：WebView 透明窗的边缘伪影（黑色线框）
+                    // 被推出显示区。相对屏幕边缘的环位置由页面 inset 补偿。
+                    let (ox, oy, ow, oh) =
+                        outset_rect(frame.x, frame.y, frame.w, frame.h, SCREEN_FLASH_EDGE_SLACK);
+                    let window_frame = NsRect {
+                        x: ox,
+                        y: oy,
+                        w: ow,
+                        h: oh,
+                    };
+                    let _: () = msg_send![window, setFrame: window_frame, display: true];
+                    let level: i64 = msg_send![window, level];
+                    let frame_now: NsRect = msg_send![window, frame];
+                    log::info!(
+                        "screen indicator covering display at cocoa ({:.0},{:.0}) [{:.0}x{:.0}] level={level} now=({:.0},{:.0})",
+                        frame.x,
+                        frame.y,
+                        frame.w,
+                        frame.h,
+                        frame_now.x,
+                        frame_now.y
+                    );
+                    bring_screen_indicator_front(ns_window);
+                    return;
+                }
             }
+            log::warn!(
+                "screen indicator: no NSScreen matched logical rect ({tx:.0},{ty:.0}) [{tw:.0}x{th:.0}]; keeping tao-positioned window"
+            );
         }
-        log::warn!(
-            "screen indicator: no NSScreen matched logical rect ({tx:.0},{ty:.0}) [{tw:.0}x{th:.0}]; keeping tao-positioned window"
-        );
+        // 匹配失败也要强制上屏：否则窗口可能留在 tao 换算错的坐标上不可见。
+        bring_screen_indicator_front(ns_window);
+    }
+}
+
+/// 把光圈窗抬到 NSScreenSaverWindowLevel 并强制上屏。后台 app 建窗可能被
+/// macOS 抑制显示，`orderFrontRegardless` 绕过激活检查；扩展屏跑应用全屏
+/// 时（全屏 Space）也靠它把光圈从全屏应用手里夺回前排——存活期内的置顶
+/// 重申（`reassert_screen_indicator_front`）走的同一条路径。
+#[cfg(target_os = "macos")]
+fn bring_screen_indicator_front(ns_window: *mut std::ffi::c_void) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    unsafe {
+        let window = &*(ns_window as *const AnyObject);
+        let _: () = msg_send![window, setLevel: 1000_i64];
+        let _: () = msg_send![window, orderFrontRegardless];
     }
 }
 
@@ -16703,5 +16802,31 @@ mod tests {
             &mut grace_until,
         );
         assert!(!skipped, "正常间隔不应触发 guard 信号");
+    }
+
+    #[test]
+    fn screen_flash_window_rect_outsides_the_screen_to_hide_edge_artifacts() {
+        // 复盘：WebView 透明窗在窗口边缘合成出 1~2px 黑色线框；窗口四边
+        // 外扩 8px 后伪影落在显示区外，环的屏幕内位置由页面 inset 补偿。
+        let (x, y, w, h) = screen_flash_window_rect(100.0, 200.0, 1920.0, 1080.0);
+        assert_eq!((x, y), (100.0 - 8.0, 200.0 - 8.0));
+        assert_eq!((w, h), (1920.0 + 16.0, 1080.0 + 16.0));
+    }
+
+    #[test]
+    fn screen_flash_window_rect_clamps_before_outsizing() {
+        // 极小矩形先钳到最小可视尺寸（80×60），再外扩，避免钳制把
+        // 外扩量吃掉导致伪影回到屏幕内。
+        let (x, y, w, h) = screen_flash_window_rect(50.0, 60.0, 10.0, 10.0);
+        assert_eq!((x, y), (50.0 - 8.0, 60.0 - 8.0));
+        assert_eq!((w, h), (80.0 + 16.0, 60.0 + 16.0));
+    }
+
+    #[test]
+    fn outset_rect_grows_every_edge_by_the_slack() {
+        assert_eq!(
+            outset_rect(10.0, 20.0, 30.0, 40.0, 5.0),
+            (5.0, 15.0, 40.0, 50.0)
+        );
     }
 }

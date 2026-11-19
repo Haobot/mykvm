@@ -4,8 +4,14 @@
     <meta charset="utf-8" />
     <!--
       布局画布点击磁贴时，在对应物理显示器上全屏铺一层透明窗口，
-      只画一圈蓝色光圈提示"这块画布磁贴 = 这块真实屏幕"。
+      只画一圈蓝色光晕提示"这块画布磁贴 = 这块真实屏幕"。
       窗口由 Rust 侧创建并定时关闭；本页无任何脚本，纯视觉。
+
+      视觉 = 双层：外层 .glow 大半径模糊铺弥散光晕，内层 .ring 轻度
+      虚化的亮芯，合起来是柔化的"光晕"效果（不要硬描边）。
+      inset 从 16px 起算 = Rust 侧 SCREEN_FLASH_EDGE_SLACK(8px，窗口比
+      屏幕四边各大 8px 把 WebView 透明窗边缘伪影推出显示区) + 屏内留白
+      8px；两边数字保持同步，环相对屏幕边缘的位置与旧版一致。
     -->
     <style>
       html,
@@ -16,19 +22,32 @@
         background: transparent;
         overflow: hidden;
       }
+      /* 光晕层：粗描边 + 大半径模糊，向内外弥散出蓝色光晕。 */
+      .glow {
+        position: fixed;
+        inset: 12px;
+        border: 16px solid rgba(56, 150, 255, 0.35);
+        border-radius: 26px;
+        filter: blur(18px);
+      }
+      /* 亮芯层：细描边 + 小半径模糊，给光晕一个柔化的芯。 */
       .ring {
         position: fixed;
-        inset: 8px;
-        border: 10px solid rgba(56, 150, 255, 0.92);
-        border-radius: 18px;
+        inset: 16px;
+        border: 8px solid rgba(130, 195, 255, 0.85);
+        border-radius: 22px;
+        filter: blur(3px);
         box-shadow:
-          0 0 60px rgba(56, 150, 255, 0.5),
-          inset 0 0 60px rgba(56, 150, 255, 0.5);
+          0 0 28px rgba(56, 150, 255, 0.55),
+          inset 0 0 36px rgba(56, 150, 255, 0.45);
+      }
+      .glow,
+      .ring {
         animation: screen-flash-pulse 0.45s ease-in-out 3 alternate;
       }
       @keyframes screen-flash-pulse {
         from {
-          opacity: 0.4;
+          opacity: 0.35;
         }
         to {
           opacity: 1;
@@ -37,6 +56,7 @@
     </style>
   </head>
   <body>
+    <div class="glow"></div>
     <div class="ring"></div>
   </body>
 </html>
