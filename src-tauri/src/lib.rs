@@ -1861,13 +1861,39 @@ fn run_screen_flash_window(
         .inner_size(width.max(80.0), height.max(60.0))
         .decorations(false)
         .transparent(true)
+        // WebView2 paints its default WHITE background for the first frame(s)
+        // before the indicator page's CSS composites — the fullscreen white
+        // flash seen ahead of the blue ring. A fully transparent default
+        // background removes it (wry maps alpha=0 to WebView2 transparent on
+        // Windows; a no-op elsewhere).
+        .background_color(tauri::utils::config::Color(0, 0, 0, 0))
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
         .minimizable(false)
         .maximizable(false)
         .closable(true)
-        .focused(false);
+        .focused(false)
+        // Create hidden and show only after the indicator page finished
+        // loading: WebView2 still paints its default white for the window's
+        // first frames even with a transparent webview background, and that
+        // white flash reaches the screen before the CSS ring composites.
+        // An invisible window cannot flash; the page-load event (a bundled
+        // local asset) is what makes it appear.
+        .visible(false)
+        .on_page_load(move |indicator, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                // Finished only means the DOM is ready — WebView2's compositor
+                // may still owe the window its first presented frame, and
+                // showing before that hand-off exposes the opaque base. Give
+                // it two vsyncs, then reveal the fully composited ring.
+                let indicator = indicator.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    let _ = indicator.show();
+                });
+            }
+        });
         let window = match builder.build() {
             Ok(window) => window,
             Err(error) => {
@@ -1876,6 +1902,8 @@ fn run_screen_flash_window(
             }
         };
         let _ = window.set_ignore_cursor_events(true);
+        #[cfg(target_os = "windows")]
+        clear_screen_indicator_border(&window);
         #[cfg(target_os = "macos")]
         style_screen_indicator_window(window.ns_window().ok(), (x, y, width, height));
         std::thread::spawn(move || {
@@ -1908,6 +1936,47 @@ fn flash_peer_screen(state: tauri::State<'_, AppRuntime>, screen_id: String) -> 
         .map_err(|_| "native layout lock poisoned".to_string())?;
     let input_events = Arc::clone(&state.input_events);
     input::send_flash_screen_to_peer(&layout, &native, &screen_id, &transport, &input_events)
+}
+
+/// Win11 still draws a ~1px DWM border around undecorated windows — white on
+/// the light theme, hugging the fullscreen indicator window and reading as an
+/// enlarged white frame behind the blue ring (macOS draws no system chrome on
+/// borderless windows). DWMWA_COLOR_NONE removes it outright, matching the
+/// macOS look where only the CSS ring is visible.
+///
+/// The DWM show transition must go too: Win11 animates a newly shown window
+/// scaling up from small to full size, and until WebView2 presents its first
+/// frame that animated surface is the opaque window base — the white box
+/// "growing" over the screen ahead of the ring. macOS shows this window
+/// without any open animation, so disabling it is also visual parity.
+#[cfg(target_os = "windows")]
+fn clear_screen_indicator_border(window: &tauri::WebviewWindow) {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
+        DWMWA_TRANSITIONS_FORCEDISABLED,
+    };
+
+    if let Ok(hwnd) = window.hwnd() {
+        let hwnd = hwnd.0 as HWND;
+        let no_border = DWMWA_COLOR_NONE as u32;
+        let no_transition = 1u32;
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR as u32,
+                &no_border as *const u32 as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                &no_transition as *const u32 as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
+    }
 }
 
 /// tauri 的 always-on-top 是 floating 层（3），会被菜单栏（25）和程序坞
