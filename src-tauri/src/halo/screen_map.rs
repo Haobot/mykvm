@@ -1298,7 +1298,7 @@ mod tests {
         // Fully identical quads: every sample collides.
         let twin = rect_region("b", 0.0, 10.0);
         assert!(matches!(
-            validate_region(&twin, &vec![rect_region("a", 0.0, 10.0)]),
+            validate_region(&twin, &[rect_region("a", 0.0, 10.0)]),
             Err(RegionError::Overlap { other: 0, .. })
         ));
     }
@@ -1350,7 +1350,7 @@ mod tests {
     #[test]
     fn topology_rejects_count_and_geometry_changes() {
         let cal = calibrated("hdmi-1", board("hdmi-1", 0.0, 0.0, 1920.0, 1080.0));
-        let current = vec![board("hdmi-1", 0.0, 0.0, 1920.0, 1080.0)];
+        let current = [board("hdmi-1", 0.0, 0.0, 1920.0, 1080.0)];
         // Screen count changed.
         let two = vec![
             current[0].clone(),

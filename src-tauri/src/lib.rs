@@ -22,6 +22,8 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
+mod agent_channel;
+mod agent_file_access;
 mod clipboard;
 mod clipboard_exchange;
 #[cfg(any(target_os = "windows", test))]
@@ -356,6 +358,14 @@ struct LayoutState {
     /// when it takes the network back over at startup.
     #[serde(default)]
     headless_paused: bool,
+    /// 跨机 Agent 通道的用户意图配置（RFC §6.3，P1a）：同为前端所有，
+    /// 载入/保存路径各自钳制，不进 merge_runtime_owned_layout_fields。
+    #[serde(default = "default_agent_channel")]
+    agent_channel: agent_channel::AgentChannelConfig,
+}
+
+fn default_agent_channel() -> agent_channel::AgentChannelConfig {
+    agent_channel::default_agent_channel()
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -413,6 +423,11 @@ struct LanPeer {
     /// 落空 Vec（跨版本兼容见 RFC §6，已用字节层探测测试锁定）。
     #[serde(default)]
     pub ips: Vec<String>,
+    /// 对端的 Agent 通道能力宣告（RFC §6.3 P1c）。None = 旧版对端（无此
+    /// 字段）；Some(enabled:false) = 对端显式关闭。旧包解码落 None，
+    /// 兼容性已用跨版本双向测试锁定。
+    #[serde(default)]
+    agent_channel: Option<agent_channel::AgentChannelAnnounce>,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
     #[serde(default)]
@@ -989,6 +1004,22 @@ impl AppRuntime {
         let peers_for_pairing = Arc::clone(&self.peers);
         let layout_for_halo_focus = Arc::clone(&self.layout);
         let transport_packets_for_halo_focus = Arc::clone(&self.transport_packets);
+        // Agent 通道（RFC §6.3）的运行期依赖：on_stream 闭包先于 transport
+        // 创建，response 回发只能经由槽位；transport 就绪后填充（见下方 start
+        // 之后）。capability 分发同样经由 runtime 注入（P1a 起在独立线程执行）。
+        // P1b：文件能力线程没有 AppHandle，日志目录与默认可读根在此解析一次注入
+        // （log_dir 照 write_own_log_tail 的 app_log_dir 真相源；默认根 =
+        // [日志目录, 文件接收根（file_transfer_receive_root）]）。
+        let agent_transport_slot = Arc::new(Mutex::new(None::<quic_transport::TransportHandle>));
+        let mut agent_runtime_for_stream =
+            agent_channel::AgentChannelRuntime::production(Arc::clone(&agent_transport_slot));
+        let agent_log_dir = self.app_handle.path().app_log_dir().ok();
+        agent_runtime_for_stream.log_dir = agent_log_dir.clone();
+        agent_runtime_for_stream.file_roots =
+            Arc::new(agent_file_access::default_agent_file_roots(
+                agent_log_dir.as_deref(),
+                file_transfer_receive_root(&self.app_handle).ok().as_deref(),
+            ));
 
         // P4 cross-machine focus: install the receive hook once at transport
         // startup. The hook is the only place that turns an authorized halo
@@ -1050,6 +1081,20 @@ impl AppRuntime {
                 layout.clone()
             };
             let current_peer = local_peer_from_layout(&layout);
+
+            // Agent 通道（mykvm.agent.v1）：request/response/cancel/notify。
+            // decode 失败或鉴权不过返回 false，交回调度链——旧版对端收到
+            // agent 包在各分支 decode 失败最终同样落到 reject ack（RFC §4）。
+            if agent_channel::handle_agent_stream_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &agent_runtime_for_stream,
+                source,
+            ) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
 
             if handle_drag_control_packet(&payload, &layout, &current_peer.id) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
@@ -1116,6 +1161,11 @@ impl AppRuntime {
             .unwrap_or_else(|| PathBuf::from("."));
         let transport =
             quic_transport::start(preferred_port, identity_dir, on_datagram, on_stream)?;
+        // transport 就绪后填充 agent 通道的响应回发槽位。填充前到达的
+        // agent request 会记 warn 并放弃回发（发起方超时兜底）。
+        if let Ok(mut slot) = agent_transport_slot.lock() {
+            *slot = Some(transport.clone());
+        }
         let mut stored = self
             .quic_transport
             .lock()
@@ -1167,13 +1217,16 @@ impl AppRuntime {
                         break;
                     }
                     Err(error) => {
-                        if attempt + 1 < attempts {
+                        // get(attempt) 而非 [attempt]：最后一次尝试没有可睡的
+                        // 退避间隔，索引会越界，clippy needless_range_loop 也
+                        // 要求避开裸下标。
+                        if let Some(delay) = LEASE_TAKEOVER_RETRY_DELAYS.get(attempt) {
                             log::warn!(
                                 "network takeover attempt {}/{} failed: {error}; retrying",
                                 attempt + 1,
                                 attempts
                             );
-                            thread::sleep(LEASE_TAKEOVER_RETRY_DELAYS[attempt]);
+                            thread::sleep(*delay);
                         }
                         failure = Some(error);
                     }
@@ -2001,6 +2054,9 @@ fn save_layout(
         // (no merge from `current`); a hand-edited snapshot must still be
         // clamped back into range before it reaches disk or the overlay.
         saved_layout.focus_halo = saved_layout.focus_halo.sanitized();
+        // agent_channel 同为前端所有：保存路径钳制非法 level / 清洗白名单，
+        // 与载入路径（normalize_saved_layout）互为防线。
+        saved_layout.agent_channel = saved_layout.agent_channel.sanitized();
         if let Err(error) = validate_shared_hotkeys(&saved_layout) {
             log::warn!("save_layout: hotkey validation rejected the save: {error}");
             return Err(error);
@@ -2937,7 +2993,7 @@ fn screen_cal_plan_sources(layout: &LayoutState) -> Vec<ScreenCalPlanSource> {
 /// caller (layout-sourced or local-only) numbers the same way.
 fn screen_cal_plan_from_sources(sources: &[ScreenCalPlanSource]) -> Vec<HaloScreenCalPlanItem> {
     let mut sorted: Vec<&ScreenCalPlanSource> = sources.iter().collect();
-    sorted.sort_by(|a, b| (a.screen.x, a.screen.y).cmp(&(b.screen.x, b.screen.y)));
+    sorted.sort_by_key(|a| (a.screen.x, a.screen.y));
     sorted
         .iter()
         .enumerate()
@@ -3094,12 +3150,12 @@ fn halo_engine_settings(
     layout: &LayoutState,
 ) -> halo::FocusHaloSettings {
     let mut settings = focus_halo.clone().sanitized();
-    if screen_cal_topology_flag(focus_halo, layout) == Some(false) {
-        if settings.screen_calibration.take().is_some() {
-            log::info!(
-                "halo: display topology changed since the screen calibration; multi-screen switching suspended until recalibration"
-            );
-        }
+    if screen_cal_topology_flag(focus_halo, layout) == Some(false)
+        && settings.screen_calibration.take().is_some()
+    {
+        log::info!(
+            "halo: display topology changed since the screen calibration; multi-screen switching suspended until recalibration"
+        );
     }
     settings
 }
@@ -3864,7 +3920,7 @@ fn spawn_halo_debug_pump(app: &AppHandle) {
                     remote_switch_latch = drained
                         .iter()
                         .filter_map(|snapshot| snapshot.remote_switch.clone())
-                        .last();
+                        .next_back();
                     let mut newest = drained.into_iter().last();
                     if let Some(snapshot) = newest.as_mut() {
                         snapshot.screen_switched = screen_switched;
@@ -5702,6 +5758,78 @@ async fn request_client_update(app: tauri::AppHandle, device_id: String) -> Resu
     .map_err(|error| format!("请求客户端更新任务失败: {error}"))?
 }
 
+// ---- Agent 互联 P1c 集成面（RFC §6.3）：本机主动发起 agent 请求 + 审计/收件箱查看 ----
+
+/// P1c：向对端 agent 通道发一条请求并等待响应（两段式 RPC）。对端不在线 /
+/// 未配对 / 版本过旧各返回明确中文错误；超时默认 10s、钳上限 60s。
+/// 网络等待在线程池执行（照 fetch_client_log 先例）：send_agent_request
+/// 阻塞至超时，不允许占用 Tauri 命令线程。
+#[tauri::command]
+async fn agent_channel_request(
+    app: tauri::AppHandle,
+    device_id: String,
+    capability: String,
+    payload: serde_json::Value,
+    timeout_ms: Option<u64>,
+) -> Result<agent_channel::AgentChannelResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppRuntime>();
+        let state = state.inner();
+        state.start_discovery()?;
+        let layout = state.layout_snapshot();
+        let quic_transport = state
+            .quic_transport_handle()
+            .ok_or_else(|| "QUIC transport 尚未就绪，请先启动运行时。".to_string())?;
+        let peers = active_peer_snapshot(&state.peers);
+        let target = agent_channel::agent_channel_target_for_device(&layout, &peers, &device_id)?;
+        let local_peer = local_peer_from_layout(&layout);
+        let timeout = agent_channel::clamped_agent_request_timeout(timeout_ms);
+        // PeerEndpoint 构造照 send_peer_request 先例（实时地址 + 证书钉扎公钥）。
+        let peer = quic_transport.peer(
+            target.addr.clone(),
+            target.transport_public_key.clone(),
+            target.protocol_version,
+        );
+        let response = agent_channel::send_agent_request(
+            &quic_transport,
+            &peer,
+            &layout,
+            &local_peer.id,
+            quic_transport.public_key(),
+            &target.device_id,
+            &capability,
+            payload,
+            timeout,
+            &agent_channel::global_audit_log(),
+        )
+        .map_err(|error| format!("agent 请求失败: {error}"))?;
+        Ok(agent_channel::AgentChannelResponse {
+            status: response.status,
+            payload: response.payload,
+        })
+    })
+    .await
+    .map_err(|error| format!("agent 请求任务失败: {error}"))?
+}
+
+/// P1c：Agent 通道审计快照，最新在前；limit 缺省 100、钳制 2000。
+#[tauri::command]
+fn agent_channel_audit(limit: Option<usize>) -> Vec<agent_channel::AgentAuditEntry> {
+    agent_channel::recent_audit_snapshot(&agent_channel::global_audit_log(), limit)
+}
+
+/// P1c：Agent 通道收件箱快照（按时间升序）。
+#[tauri::command]
+fn agent_channel_inbox() -> Vec<agent_channel::AgentInboxMessage> {
+    agent_channel::global_agent_inbox().snapshot()
+}
+
+/// P1c：清空收件箱，返回清掉的条数。
+#[tauri::command]
+fn agent_channel_inbox_clear() -> usize {
+    agent_channel::drain_agent_inbox(&agent_channel::global_agent_inbox())
+}
+
 #[tauri::command]
 fn sync_window_chrome(window: tauri::WebviewWindow, theme: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -6807,6 +6935,9 @@ pub fn run() {
                     config_dir.display()
                 )
             })?;
+            // Agent 通道审计落盘到配置目录（RFC §5.3 对策二）：必须先于任何
+            // QUIC transport 启动（其 on_stream 闭包取用全局审计实例）。
+            agent_channel::init_global_audit_log(&config_dir);
 
             let detected_layout = detect_local_layout(app.handle());
             let runtime = AppRuntime::new(
@@ -7116,6 +7247,10 @@ pub fn run() {
             send_files_to_device,
             fetch_client_log,
             request_client_update,
+            agent_channel_request,
+            agent_channel_audit,
+            agent_channel_inbox,
+            agent_channel_inbox_clear,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -7656,6 +7791,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         focus_halo: halo::FocusHaloSettings::default(),
         headless_paused: false,
+        agent_channel: default_agent_channel(),
         devices: vec![Device {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
@@ -7707,6 +7843,7 @@ fn detect_fallback_layout() -> LayoutState {
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         focus_halo: halo::FocusHaloSettings::default(),
         headless_paused: false,
+        agent_channel: default_agent_channel(),
     }
 }
 
@@ -8074,6 +8211,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         // 无人值守暂停标记必须原样穿过归一化：clear_headless_pause 依据内存
         // 状态决定是否落盘清除，丢了标记磁盘上的 true 就永远无人解除。
         headless_paused: saved_layout.headless_paused,
+        agent_channel: saved_layout.agent_channel.sanitized(),
     }
 }
 
@@ -11061,7 +11199,8 @@ fn client_log_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Read at most the last `max_bytes` bytes of `path`.
-fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+/// Agent 通道 log.read（P1b）同样用它做尾部读取，见 agent_channel::capabilities 的 log.read 处理。
+pub(crate) fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -11073,16 +11212,11 @@ fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     Ok(tail)
 }
 
-/// Copy the tail of this machine's newest log file into a temp file named after
-/// this device, ready to stream back to whoever asked. Returns the temp path.
-fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, String> {
-    let log_dir = app
-        .path()
-        .app_log_dir()
-        .map_err(|error| format!("failed to resolve log dir: {error}"))?;
-    // The plugin keeps the live log plus rotated copies; the newest by mtime is
-    // the one currently being written.
-    let newest = fs::read_dir(&log_dir)
+/// The newest `.log` file under `log_dir` — the one the log plugin is currently
+/// writing. Agent 通道 log.read（P1b）复用同一真相源，见
+/// agent_channel::capabilities 的 log.read 处理。
+pub(crate) fn newest_log_file_in(log_dir: &Path) -> Result<PathBuf, String> {
+    fs::read_dir(log_dir)
         .map_err(|error| format!("failed to read log dir: {error}"))?
         .flatten()
         .filter(|entry| {
@@ -11099,7 +11233,19 @@ fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, Str
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
         })
         .map(|entry| entry.path())
-        .ok_or_else(|| "no log file found".to_string())?;
+        .ok_or_else(|| "no log file found".to_string())
+}
+
+/// Copy the tail of this machine's newest log file into a temp file named after
+/// this device, ready to stream back to whoever asked. Returns the temp path.
+fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log dir: {error}"))?;
+    // The plugin keeps the live log plus rotated copies; the newest by mtime is
+    // the one currently being written.
+    let newest = newest_log_file_in(&log_dir)?;
 
     let tail = tail_of_file(&newest, CLIENT_LOG_TAIL_BYTES)
         .map_err(|error| format!("failed to read log: {error}"))?;
@@ -12607,6 +12753,9 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         host,
         ip,
         ips: announcement_ips,
+        // P1c：enabled=false 也宣告（enabled:false），让对端区分「已关」与
+        //「旧版」；钳制内聚在 announce_from_config。
+        agent_channel: Some(agent_channel::announce_from_config(&layout.agent_channel)),
         transport_port: layout.transport_port,
         quic_port: normalize_quic_port(layout.transport_port, layout.quic_port),
         transport_public_key: local_device
@@ -14557,6 +14706,59 @@ mod tests {
         assert_eq!(restored.input_protection, InputProtection::default());
     }
 
+    #[test]
+    fn layout_roundtrip_clamps_agent_channel_config() {
+        // P1a：agent_channel 是前端所有的用户意图配置，手改 layout.json 或
+        // 旧版快照里的非法值必须在载入（normalize_saved_layout）与保存
+        // （save_layout，经同一 sanitized）两条路径被钳回安全默认。
+        let mut saved = test_layout();
+        saved.agent_channel = agent_channel::AgentChannelConfig {
+            enabled: true,
+            level: "root".into(),
+            file_roots: vec!["  ".into(), " /tmp/a ".into(), "/tmp/a".into()],
+            cmd_whitelist: vec!["".into(), " cargo test ".into()],
+            approval_ttl_secs: 300,
+        };
+        let restored = normalize_saved_layout(saved, test_layout());
+        assert_eq!(
+            restored.agent_channel.level, "readonly",
+            "非法 level 必须钳回 readonly"
+        );
+        assert_eq!(
+            restored.agent_channel.file_roots,
+            vec!["/tmp/a".to_string()],
+            "file_roots 必须清洗"
+        );
+        assert_eq!(
+            restored.agent_channel.cmd_whitelist,
+            vec!["cargo test".to_string()],
+            "cmd_whitelist 必须清洗"
+        );
+
+        // 合法值必须原样保留（用户明确选择的级别不被覆盖）。
+        let mut saved = test_layout();
+        saved.agent_channel.level = "files".into();
+        let restored = normalize_saved_layout(saved, test_layout());
+        assert_eq!(restored.agent_channel.level, "files");
+    }
+
+    #[test]
+    fn layout_json_without_agent_channel_defaults_to_enabled_readonly() {
+        // 旧版 layout.json 没有该字段：序列化后剥掉 agentChannel 再反序列化，
+        // 必须落回「启用 + readonly」默认（升级路径行为可预期）。
+        let saved = test_layout();
+        let mut json = serde_json::to_value(normalized_transient_clone(&saved)).expect("序列化");
+        json.as_object_mut()
+            .expect("layout 是对象")
+            .remove("agentChannel");
+        let restored: LayoutState = serde_json::from_value(json).expect("缺字段反序列化");
+        assert_eq!(
+            restored.agent_channel,
+            agent_channel::AgentChannelConfig::default(),
+            "缺失 agentChannel 必须落回默认（enabled=true, level=readonly, TTL=300）"
+        );
+    }
+
     fn test_layout() -> LayoutState {
         LayoutState {
             lock_sync: false,
@@ -14626,6 +14828,7 @@ mod tests {
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
             focus_halo: halo::FocusHaloSettings::default(),
             headless_paused: false,
+            agent_channel: default_agent_channel(),
         }
     }
 
@@ -14640,6 +14843,7 @@ mod tests {
             host: "client".into(),
             ip: "10.0.0.2".into(),
             ips: Vec::new(),
+            agent_channel: None,
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "peer-public-key".into(),
@@ -17053,6 +17257,7 @@ mod tests {
             host: "server.local".into(),
             ip: "10.0.0.1".into(),
             ips: Vec::new(),
+            agent_channel: None,
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "server-public-key".into(),
@@ -18183,8 +18388,9 @@ mod tests {
         assert_eq!(decoded.peer.ip, "10.0.0.2");
     }
 
-    /// 与旧版（无 ips 字段）LanPeer 逐字段一致的镜像结构：跨版本编解码
-    /// 双向测试的"另一端"。新增 ips 后此镜像就代表已部署的旧版客户端。
+    /// 与旧版（无 ips / agent_channel 字段）LanPeer 逐字段一致的镜像结构：
+    /// 跨版本编解码双向测试的"另一端"。新增字段后此镜像就代表已部署的
+    /// 旧版客户端——它不认识任何 serde(default) 的新键，但必须忽略它们。
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct LegacyLanPeerMirror {
@@ -18292,6 +18498,198 @@ mod tests {
         let legacy_decoded = decode_wire_packet::<LegacyDiscoveryPacketMirror>(&new_bytes)
             .expect("旧版镜像解码新包（含 ips）必须成功");
         assert_eq!(legacy_decoded.peer.ip, "10.0.0.2");
+    }
+
+    // ---- Agent 互联 P1c：LanPeer.agent_channel 能力宣告（先写失败测试） ----
+
+    #[test]
+    fn legacy_peer_without_agent_channel_field_decodes_to_none() {
+        // RFC §6.3 P1c：LanPeer 新增 agent_channel 宣告。旧版 announce 没有
+        // 该键——新版解码必须落 None（serde(default)），不得报错。
+        let old_packet = LegacyDiscoveryPacketMirror {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer: legacy_mirror_peer(&test_peer()),
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let old_bytes = rmp_serde::to_vec_named(&old_packet).expect("旧版 announce 编码成功");
+
+        let decoded = decode_discovery_packet(&old_bytes)
+            .expect("新版解码旧版 announce（无 agent_channel）必须成功");
+        assert!(
+            decoded.peer.agent_channel.is_none(),
+            "旧包解码后 agent_channel 必须是 None"
+        );
+    }
+
+    #[test]
+    fn announce_with_agent_channel_roundtrips_and_legacy_mirror_ignores_it() {
+        // 双向：① 新版带 agent_channel 的 announce 编码 → 新版解码逐字段一致；
+        // ② 同一份新字节流 → 旧版镜像解码：未知 agent_channel 键被忽略不报错
+        //（P1c 验收「跨版本混跑」：新版先升级的一端能宣告，旧端不受影响）。
+        let mut peer = test_peer();
+        peer.agent_channel = Some(agent_channel::AgentChannelAnnounce {
+            enabled: true,
+            level: "readonly".into(),
+        });
+        let new_packet = DiscoveryPacket {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: "announce".into(),
+            peer,
+            pairing_code: None,
+            pair_cluster_id: None,
+            pair_secret: None,
+            pairing_error: None,
+        };
+        let new_bytes = rmp_serde::to_vec_named(&new_packet).expect("新版 announce 编码成功");
+
+        let decoded =
+            decode_discovery_packet(&new_bytes).expect("新版解码自己带 agent_channel 的包必须成功");
+        let announce = decoded
+            .peer
+            .agent_channel
+            .expect("往返后 agent_channel 必须保留");
+        assert!(announce.enabled);
+        assert_eq!(announce.level, "readonly");
+
+        let legacy_decoded = decode_wire_packet::<LegacyDiscoveryPacketMirror>(&new_bytes)
+            .expect("旧版镜像解码新包（含 agent_channel）必须成功");
+        assert_eq!(legacy_decoded.peer.id, "peer-client-10-0-0-2");
+    }
+
+    #[test]
+    fn local_peer_from_layout_announces_agent_channel_even_when_disabled() {
+        // enabled=false 也要宣告（enabled:false, level 取 sanitized 值）：
+        // 让对端知道「此端 agent 通道已关」，而不是当成「旧版对端」。
+        let mut layout = test_layout();
+        layout.agent_channel = agent_channel::AgentChannelConfig {
+            enabled: false,
+            // 故意用非法 level：宣告必须取钳制后的有效值，不外泄脏值。
+            level: "bogus".into(),
+            file_roots: Vec::new(),
+            cmd_whitelist: Vec::new(),
+            approval_ttl_secs: 300,
+        };
+        let local_peer = local_peer_from_layout(&layout);
+        let announce = local_peer
+            .agent_channel
+            .expect("通道关闭也必须宣告（enabled:false）");
+        assert!(!announce.enabled);
+        assert_eq!(
+            announce.level, "readonly",
+            "非法 level 必须钳回 readonly（与 gate 判定一致）"
+        );
+
+        layout.agent_channel.enabled = true;
+        layout.agent_channel.level = "files".into();
+        let announce = local_peer_from_layout(&layout)
+            .agent_channel
+            .expect("通道开启时必须宣告");
+        assert!(announce.enabled);
+        assert_eq!(announce.level, "files");
+    }
+
+    #[test]
+    fn merge_peer_entry_replaces_agent_channel_announcement_with_latest() {
+        // discovery 的 peers 表合并是整体替换：对端先宣告关闭、再宣告开启，
+        // 合并后必须跟随最新 announce，不残留旧值。
+        let mut peers: Vec<LanPeer> = Vec::new();
+        let mut peer = test_peer();
+        peer.agent_channel = Some(agent_channel::AgentChannelAnnounce {
+            enabled: false,
+            level: "readonly".into(),
+        });
+        merge_peer_entry(&mut peers, peer.clone());
+
+        peer.agent_channel = Some(agent_channel::AgentChannelAnnounce {
+            enabled: true,
+            level: "files".into(),
+        });
+        merge_peer_entry(&mut peers, peer);
+
+        assert_eq!(peers.len(), 1);
+        let announce = peers[0]
+            .agent_channel
+            .as_ref()
+            .expect("合并后 agent_channel 必须保留");
+        assert!(announce.enabled, "必须跟随最新 announce（开启）");
+        assert_eq!(announce.level, "files");
+    }
+
+    #[test]
+    fn agent_channel_target_requires_pairing_and_online_peer() {
+        // P1c 命令 agent_channel_request 的目标解析（模式照抄
+        // file_transfer_target_for_device，Agent 语境的错误文案）。
+        let layout = test_layout();
+        let mut peer = test_peer();
+        peer.agent_channel = Some(agent_channel::AgentChannelAnnounce {
+            enabled: true,
+            level: "readonly".into(),
+        });
+        let peers = vec![peer];
+
+        // 未配对（cluster/secret 任一为空）直接报错。
+        let mut unpaired = test_layout();
+        unpaired.pair_secret = String::new();
+        let error = agent_channel::agent_channel_target_for_device(
+            &unpaired,
+            &peers,
+            "peer-client-10-0-0-2",
+        )
+        .expect_err("未配对必须报错");
+        assert!(error.contains("配对"), "未配对错误要指明配对: {error}");
+
+        // 对端真正离线的语义 = 实时 peers 表没有它（announce 已过期）且
+        // device 表也标记 offline：必须报「不在线」，不盲发请求。
+        let mut offline_layout = test_layout();
+        offline_layout.devices[1].online = false;
+        let error = agent_channel::agent_channel_target_for_device(
+            &offline_layout,
+            &[],
+            "peer-client-10-0-0-2",
+        )
+        .expect_err("对端离线必须报「不在线」");
+        assert!(error.contains("不在线"), "离线错误文案: {error}");
+
+        // peers 表命中即在线（announce 新鲜），device.online 滞后不影响：
+        // presence 同步可能落后于 discovery（两表不一致时信 peers 表，
+        // 避免「显示离线但实际可达」误伤）。
+        let mut stale_presence_layout = test_layout();
+        stale_presence_layout.devices[1].online = false;
+        let target = agent_channel::agent_channel_target_for_device(
+            &stale_presence_layout,
+            &peers,
+            "peer-client-10-0-0-2",
+        )
+        .expect("peers 表命中时即使 presence 滞后也必须命中");
+        assert_eq!(target.device_id, "peer-client-10-0-0-2");
+
+        // 在线命中：地址取 peers 表实时值（id 内嵌 IP 会漂移，见 AGENTS.md 坑 6）。
+        let target =
+            agent_channel::agent_channel_target_for_device(&layout, &peers, "peer-client-10-0-0-2")
+                .expect("在线对端必须命中");
+        assert_eq!(target.device_id, "peer-client-10-0-0-2");
+        assert_eq!(target.addr, "10.0.0.2:52001");
+        assert_eq!(target.transport_public_key, "peer-public-key");
+
+        // 版本过旧（protocol_version 不一致）明确报错，不发请求。
+        let mut stale_peers = peers.clone();
+        stale_peers[0].protocol_version = quic_transport::PROTOCOL_VERSION - 1;
+        let error = agent_channel::agent_channel_target_for_device(
+            &layout,
+            &stale_peers,
+            "peer-client-10-0-0-2",
+        )
+        .expect_err("版本过旧必须报错");
+        assert!(error.contains("升级"), "版本错误文案: {error}");
+
+        // 查无此设备。
+        let error = agent_channel::agent_channel_target_for_device(&layout, &peers, "peer-unknown")
+            .expect_err("未知设备必须报错");
+        assert!(!error.is_empty());
     }
 
     #[test]
@@ -18669,18 +19067,20 @@ mod tests {
         corner: halo::BadgeCorner,
         point: halo::screen_map::PosePoint,
     ) -> ScreenCalWizardState {
-        let mut wizard = ScreenCalWizardState::default();
-        wizard.plan = vec![HaloScreenCalPlanItem {
-            screen_index: 0,
-            screen_id: "screen-0".into(),
-            label: 1,
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            remote: false,
-            device_name: String::new(),
-        }];
+        let mut wizard = ScreenCalWizardState {
+            plan: vec![HaloScreenCalPlanItem {
+                screen_index: 0,
+                screen_id: "screen-0".into(),
+                label: 1,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                remote: false,
+                device_name: String::new(),
+            }],
+            ..Default::default()
+        };
         wizard.corners.push(ScreenCalCornerSample {
             screen_index,
             corner,
@@ -18722,8 +19122,7 @@ mod tests {
     fn screen_cal_flip_matches_camera_position_xor_invert_toggle() {
         // The capture flow applies (camera_position == Bottom) XOR invert_pitch;
         // pin the exact same convention here.
-        let flip =
-            (halo::params::CameraPosition::Bottom != halo::params::CameraPosition::Top) != false;
+        let flip = halo::params::CameraPosition::Bottom != halo::params::CameraPosition::Top;
         assert!(flip, "bottom camera flips");
         assert_eq!(screen_cal_flip_pitch(7.0, true), -7.0);
         assert_eq!(screen_cal_flip_pitch(-3.0, true), 3.0);
@@ -18745,18 +19144,20 @@ mod tests {
             halo::BadgeCorner::Bl,
         ];
         // Replay the wizard flow corner by corner; every step must pass.
-        let mut wizard = ScreenCalWizardState::default();
-        wizard.plan = vec![HaloScreenCalPlanItem {
-            screen_index: 0,
-            screen_id: "screen-0".into(),
-            label: 1,
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            remote: false,
-            device_name: String::new(),
-        }];
+        let mut wizard = ScreenCalWizardState {
+            plan: vec![HaloScreenCalPlanItem {
+                screen_index: 0,
+                screen_id: "screen-0".into(),
+                label: 1,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                remote: false,
+                device_name: String::new(),
+            }],
+            ..Default::default()
+        };
         for (corner, point) in corners.iter().zip(plan_quad.iter()) {
             screen_cal_check_corner(*corner, point, &wizard, 0)
                 .unwrap_or_else(|error| panic!("{corner:?} step rejected: {error}"));
@@ -18804,18 +19205,20 @@ mod tests {
     #[test]
     fn screen_cal_last_corner_checks_both_remaining_sides() {
         // tl, tr, bl captured; br fails the right side (tr pitch vs br pitch).
-        let mut wizard = ScreenCalWizardState::default();
-        wizard.plan = vec![HaloScreenCalPlanItem {
-            screen_index: 0,
-            screen_id: "screen-0".into(),
-            label: 1,
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            remote: false,
-            device_name: String::new(),
-        }];
+        let mut wizard = ScreenCalWizardState {
+            plan: vec![HaloScreenCalPlanItem {
+                screen_index: 0,
+                screen_id: "screen-0".into(),
+                label: 1,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                remote: false,
+                device_name: String::new(),
+            }],
+            ..Default::default()
+        };
         for (corner, point) in [
             (halo::BadgeCorner::Tl, pose(-12.0, 8.0)),
             (halo::BadgeCorner::Tr, pose(12.0, 7.0)),
@@ -18919,8 +19322,10 @@ mod tests {
         // Incomplete corners cannot assemble.
         assert!(screen_cal_region_from_samples(&plan[0], &samples[..3]).is_none());
 
-        let mut wizard = ScreenCalWizardState::default();
-        wizard.plan = plan;
+        let wizard = ScreenCalWizardState {
+            plan,
+            ..Default::default()
+        };
         let progress = screen_cal_progress(&wizard);
         assert_eq!(
             progress,
@@ -19103,10 +19508,12 @@ mod tests {
 
     #[test]
     fn screen_cal_topology_flag_skips_offline_peer_regions() {
-        let mut settings = halo::FocusHaloSettings::default();
         // Region 0 at x=-1920 (peer-s), region 1 at x=0 (local-1): matching
         // the rig's live rects.
-        settings.screen_calibration = Some(topology_calibration(&["peer-s", "local-1"], -1920));
+        let settings = halo::FocusHaloSettings {
+            screen_calibration: Some(topology_calibration(&["peer-s", "local-1"], -1920)),
+            ..Default::default()
+        };
 
         // Peer online and its rect unchanged: matches.
         let layout = local_plus_peer_layout(true, true);
@@ -19135,8 +19542,10 @@ mod tests {
         // EVERY region belongs to the offline peer (local-only calibration
         // is impossible in this setup, so simulate by calibrating only the
         // peer screen): the check passes vacuously.
-        let mut settings = halo::FocusHaloSettings::default();
-        settings.screen_calibration = Some(topology_calibration(&["peer-s"], -1920));
+        let settings = halo::FocusHaloSettings {
+            screen_calibration: Some(topology_calibration(&["peer-s"], -1920)),
+            ..Default::default()
+        };
         let layout = local_plus_peer_layout(true, false);
         assert_eq!(
             screen_cal_topology_flag(&settings, &layout),
@@ -19257,8 +19666,10 @@ mod tests {
 
     #[test]
     fn apply_lean_alphas_writes_the_stored_calibration_or_fails() {
-        let mut settings = halo::FocusHaloSettings::default();
-        settings.screen_calibration = Some(topology_calibration(&["screen-0"], 0));
+        let mut settings = halo::FocusHaloSettings {
+            screen_calibration: Some(topology_calibration(&["screen-0"], 0)),
+            ..Default::default()
+        };
         apply_lean_alphas(&mut settings, 88.0, 72.0).expect("persist succeeds");
         let cal = settings.screen_calibration.expect("still present");
         assert_eq!(cal.trans_alpha_yaw, 88.0);

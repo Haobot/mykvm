@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::sync::mpsc;
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
@@ -8,20 +10,16 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    quic_transport,
-    shared_input::{
-        button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton,
-    },
-    Device, LayoutState, NativeStageStatus, Screen,
-};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::shared_input::LEFT_BUTTON_MASK;
+use crate::{
+    quic_transport,
+    shared_input::{button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton},
+    Device, LayoutState, NativeStageStatus, Screen,
+};
 
 const INPUT_PROTOCOL: &str = "mykvm.input.v1";
 const INPUT_CONTROL_PROTOCOL: &str = "mykvm.input-control.v1";
@@ -3219,7 +3217,11 @@ fn warn_unauthorized_control_packet(layout: &LayoutState, packet: &InputControlP
     );
 }
 
-fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer_id: &str) -> bool {
+pub(crate) fn packet_targets_local(
+    layout: &LayoutState,
+    target_device_id: &str,
+    local_peer_id: &str,
+) -> bool {
     if target_device_id.trim().is_empty() {
         return true;
     }
@@ -10871,6 +10873,7 @@ mod tests {
             screen_switch_hotkeys: crate::ScreenSwitchHotkeys::default(),
             focus_halo: crate::halo::FocusHaloSettings::default(),
             headless_paused: false,
+            agent_channel: crate::agent_channel::AgentChannelConfig::default(),
         }
     }
 

@@ -245,7 +245,8 @@ mod macos_imp {
         let _: () = msg_send![window_ref, setFrame: frame, display: true];
         if !view.is_null() {
             let view_ref = &*view;
-            let _: () = msg_send![view_ref, setFrame: NsRect { x: 0.0, y: 0.0, w: frame.w, h: frame.h }];
+            let _: () =
+                msg_send![view_ref, setFrame: NsRect { x: 0.0, y: 0.0, w: frame.w, h: frame.h }];
         }
         let frame_now: NsRect = msg_send![window_ref, frame];
         log::info!(
@@ -490,7 +491,7 @@ mod windows_imp {
         drop(Box::from_raw(list));
         monitors
             .into_iter()
-            .map(|(handle, rc, scale)| {
+            .map(|(_, rc, scale)| {
                 let error = (f64::from(rc.left) / scale - tx).abs()
                     + (f64::from(rc.top) / scale - ty).abs()
                     + (f64::from(rc.right - rc.left) / scale - tw).abs()
@@ -576,6 +577,7 @@ mod windows_imp {
     /// 把空心圆角描边带画进 `pixels`（width × height，premultiplied BGRA，
     /// top-down）。带骑在离边 `pad` 像素的圆角轮廓上，带宽 `band`，内部
     /// 全透明。`alpha` 缩放描边（调用方喂脉冲值）。
+    #[allow(clippy::too_many_arguments)]
     fn paint_border(
         pixels: &mut [u32],
         width: i32,

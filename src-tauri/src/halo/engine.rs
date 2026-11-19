@@ -217,6 +217,7 @@ pub struct EngineConfig {
 
 /// Commands the engine thread accepts while running.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // SetSettings 携带完整快照；通道低频、装箱反而增加分配
 pub enum EngineCommand {
     /// Stop the thread (overlay hidden on exit).
     Shutdown,
@@ -2033,8 +2034,10 @@ mod tests {
     fn set_settings_flips_ring_visibility_only_on_change() {
         let mut s = test_state();
         // Flip to hidden: one immediate overlay call.
-        let mut settings = FocusHaloSettings::default();
-        settings.show_halo = false;
+        let settings = FocusHaloSettings {
+            show_halo: false,
+            ..Default::default()
+        };
         assert_eq!(
             drive_recording(&mut s, EngineCommand::SetSettings(settings.clone()), 100),
             vec![false]
@@ -2042,9 +2045,11 @@ mod tests {
         // Same value again: no call (dedup).
         assert!(drive_recording(&mut s, EngineCommand::SetSettings(settings), 200).is_empty());
         // Unrelated settings churn with the same visibility: still silent.
-        let mut churn = FocusHaloSettings::default();
-        churn.show_halo = false;
-        churn.halo_opacity = 0.8;
+        let churn = FocusHaloSettings {
+            show_halo: false,
+            halo_opacity: 0.8,
+            ..Default::default()
+        };
         assert!(drive_recording(&mut s, EngineCommand::SetSettings(churn), 300).is_empty());
         // Flip back to shown: one call.
         assert_eq!(
@@ -2125,10 +2130,12 @@ mod tests {
         let (activator, _) = fake_activator();
         let recorder = WarpRecorder::new(warp_succeeds);
         let handle = recorder.clone();
-        let mut settings = FocusHaloSettings::default();
-        settings.screen_warp_enabled = true;
-        settings.region_settle_ms = 300;
-        settings.cooldown_ms = 500;
+        let settings = FocusHaloSettings {
+            screen_warp_enabled: true,
+            region_settle_ms: 300,
+            cooldown_ms: 500,
+            ..Default::default()
+        };
         let state = EngineState::new(EngineConfig {
             settings,
             calibration: CalibrationProfile::default(),
@@ -2476,10 +2483,12 @@ mod tests {
         let (activator, _) = fake_activator();
         let recorder = WarpRecorder::new(warp_succeeds);
         let handle = recorder.clone();
-        let mut settings = FocusHaloSettings::default();
-        settings.screen_warp_enabled = true;
-        settings.region_settle_ms = 300;
-        settings.cooldown_ms = 500;
+        let settings = FocusHaloSettings {
+            screen_warp_enabled: true,
+            region_settle_ms: 300,
+            cooldown_ms: 500,
+            ..Default::default()
+        };
         let state = EngineState::new(EngineConfig {
             settings,
             calibration: CalibrationProfile::default(),

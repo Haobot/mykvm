@@ -106,8 +106,18 @@ extern "C" {
         transform: *const CGAffineTransform,
     ) -> *mut c_void;
     pub(crate) fn CGPathCreateMutable() -> *mut c_void;
-    pub(crate) fn CGPathMoveToPoint(path: *mut c_void, transform: *const CGAffineTransform, x: f64, y: f64);
-    pub(crate) fn CGPathAddLineToPoint(path: *mut c_void, transform: *const CGAffineTransform, x: f64, y: f64);
+    pub(crate) fn CGPathMoveToPoint(
+        path: *mut c_void,
+        transform: *const CGAffineTransform,
+        x: f64,
+        y: f64,
+    );
+    pub(crate) fn CGPathAddLineToPoint(
+        path: *mut c_void,
+        transform: *const CGAffineTransform,
+        x: f64,
+        y: f64,
+    );
     pub(crate) fn CGPathRelease(path: *mut c_void);
     fn CGPathCloseSubpath(path: *mut c_void);
     fn CGPathAddRoundedRect(

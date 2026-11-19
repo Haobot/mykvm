@@ -1,4 +1,4 @@
-import type { LayoutState } from './types'
+import type { AgentChannelAnnounce, LayoutState } from './types'
 
 export interface NativeStageStatus {
   state: 'stubbed' | 'idle' | 'ready' | 'paused' | 'error'
@@ -14,6 +14,8 @@ export interface LanPeer {
   pairingRequired: boolean
   host: string
   ip: string
+  /** 对端的 Agent 通道能力宣告（P1c）；缺省 = 旧版对端（未带字段）。 */
+  agentChannel?: AgentChannelAnnounce | null
   transportPort: number
   quicPort: number
   transportPublicKey: string
