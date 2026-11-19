@@ -367,6 +367,35 @@ export async function relaunchApp(): Promise<void> {
   await relaunch()
 }
 
+/** Quit-dialog "exit anyway": the unattended control service stays in charge. */
+export async function quitApp(): Promise<void> {
+  if (!isTauri()) {
+    window.close()
+    return
+  }
+
+  await invoke('quit_app')
+}
+
+/** Quit-dialog "exit and pause": persist the headless pause, then exit. */
+export async function quitWithHeadlessPause(): Promise<void> {
+  if (!isTauri()) {
+    window.close()
+    return
+  }
+
+  await invoke('quit_with_headless_pause')
+}
+
+/** Clear the poll-delivered quit confirmation request (dialog dismissed). */
+export async function dismissQuitConfirmation(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('dismiss_quit_confirmation')
+}
+
 export async function syncWindowChrome(theme: 'dark' | 'light'): Promise<void> {
   if (!isTauri()) {
     return

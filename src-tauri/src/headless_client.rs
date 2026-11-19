@@ -213,12 +213,13 @@ fn helper_ready() -> bool {
     input::windows_input_pipe_available()
 }
 
-fn headless_receive_enabled(layout: &LayoutState) -> bool {
+pub(crate) fn headless_receive_enabled(layout: &LayoutState) -> bool {
     layout.machine_role == "client"
         && layout.input_mode == "receive"
         && !layout.cluster_id.trim().is_empty()
         && !layout.pair_secret.trim().is_empty()
         && !layout.paired_controllers.is_empty()
+        && !layout.headless_paused
 }
 
 #[cfg(test)]
@@ -258,6 +259,13 @@ mod tests {
 
         layout = eligible_layout();
         layout.machine_role = "server".into();
+        assert!(!headless_receive_enabled(&layout));
+    }
+
+    #[test]
+    fn headless_receiver_skips_when_paused_for_exit() {
+        let mut layout = eligible_layout();
+        layout.headless_paused = true;
         assert!(!headless_receive_enabled(&layout));
     }
 }

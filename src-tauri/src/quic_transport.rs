@@ -427,7 +427,18 @@ async fn run_transport(
     }
 
     endpoint.close(0_u32.into(), b"shutdown");
-    endpoint.wait_idle().await;
+    // Draining waits for peers to acknowledge CONNECTION_CLOSE; an active or
+    // wedged peer (e.g. the controller streaming input while the GUI takes
+    // the ports back) can hold wait_idle past any sane ack budget — the
+    // unbounded wait is what tripped the input service's shutdown timeout.
+    // Bound it: the endpoint is dropped (releasing the UDP port) either way
+    // before the ack; only the closeness of the shutdown handshake is capped.
+    if tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle())
+        .await
+        .is_err()
+    {
+        log::warn!("QUIC endpoint drain timed out; releasing the socket anyway");
+    }
     shutdown_ack
 }
 

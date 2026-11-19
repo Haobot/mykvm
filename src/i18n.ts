@@ -360,6 +360,14 @@ export const TEXT = {
       installUpdate: "下载安装更新失败。",
       updateSignatureMismatch:
         "更新包签名密钥与当前应用内置公钥不匹配，自动更新无法验证这个版本。请从 Releases 手动安装一次，或由发布者用正确的 TAURI_SIGNING_PRIVATE_KEY 重新签名发布。",
+      quitPause: "暂停无人值守被控失败。",
+    },
+    quitDialog: {
+      eyebrow: "Windows LocalSystem",
+      title: "退出后仍可被远端控制",
+      copy: "无人值守控制服务正在运行：退出主程序后，已配对设备仍能控制这台电脑（含锁屏和开机登录界面）。可选择暂停被控，或保持无人值守直接退出。",
+      pauseAndExit: "退出并暂停被控",
+      directExit: "保持被控，直接退出",
     },
   },
   en: {
@@ -725,6 +733,14 @@ export const TEXT = {
       installUpdate: "Failed to download and install the update.",
       updateSignatureMismatch:
         "The update package was signed with a different key than this app trusts. Install once from Releases manually, or re-sign the release with the matching TAURI_SIGNING_PRIVATE_KEY.",
+      quitPause: "Failed to pause unattended control.",
+    },
+    quitDialog: {
+      eyebrow: "Windows LocalSystem",
+      title: "This PC stays controllable after quitting",
+      copy: "The unattended control service is running: after you quit, paired devices can still control this PC (including the lock and sign-in screens). Pause remote control for now, or keep it on and quit directly.",
+      pauseAndExit: "Quit and pause control",
+      directExit: "Keep control, just quit",
     },
   },
 } as const;

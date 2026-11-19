@@ -454,3 +454,253 @@ pub fn send_secure_attention() -> Result<(), String> {
     }
     Ok(())
 }
+
+// ---- 无人值守顶班时的屏幕光圈 ----
+//
+// GUI 在时 FlashScreen 在 dispatch_input_command 就被分流到 Tauri 的
+// screen-indicator 窗口；GUI 退出（"保持被控"）后 FlashScreen 经输入管道
+// 到达会话 worker，这里用纯 Win32 分层窗口把同一圈蓝色光圈画到用户桌面
+// 上。视觉参数对齐 public/screen-indicator.html：RGB(56,150,255)、10px
+// 边框、8px 内缩、0.45s 脉冲、共 1.4s。
+
+const FLASH_RING_R: u32 = 56;
+const FLASH_RING_G: u32 = 150;
+const FLASH_RING_B: u32 = 255;
+const FLASH_DURATION_MS: u64 = 1_400;
+const FLASH_PULSE_PERIOD_MS: u64 = 450;
+const FLASH_TIMER_ID: usize = 1;
+const FLASH_TIMER_MS: u32 = 45;
+
+struct PhysicalFlashRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    scale: f64,
+}
+
+/// 把逻辑坐标的光圈矩形（detect_local_screens 空间）换算成目标显示器上
+/// 的物理像素矩形：逐显示器用有效 DPI 还原 winit 的 logical = physical *
+/// 96/dpi 映射，找中心点所在的显示器。
+fn physical_flash_rect(x: f64, y: f64, width: f64, height: f64) -> Option<PhysicalFlashRect> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HMONITOR, MONITORINFO,
+    };
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    unsafe extern "system" fn collect_monitor(
+        monitor: HMONITOR,
+        _hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+        _rect: *mut RECT,
+        data: isize,
+    ) -> windows_sys::core::BOOL {
+        let monitors = &mut *(data as *mut Vec<(HMONITOR, MONITORINFO)>);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            monitors.push((monitor, info));
+        }
+        1
+    }
+
+    let mut monitors: Vec<(HMONITOR, MONITORINFO)> = Vec::new();
+    unsafe {
+        if EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect_monitor),
+            &mut monitors as *mut Vec<(HMONITOR, MONITORINFO)> as isize,
+        ) == 0
+        {
+            return None;
+        }
+    }
+
+    let center_x = x + width / 2.0;
+    let center_y = y + height / 2.0;
+    let mut chosen: Option<f64> = None;
+    for (monitor, info) in &monitors {
+        let rc = info.rcMonitor;
+        if rc.right <= rc.left || rc.bottom <= rc.top {
+            continue;
+        }
+        let mut dpi_x = 0_u32;
+        let mut dpi_y = 0_u32;
+        let dpi_ok =
+            unsafe { GetDpiForMonitor(*monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) == 0 };
+        let scale = if dpi_ok && dpi_x > 0 {
+            f64::from(dpi_x) / 96.0
+        } else {
+            1.0
+        };
+        // winit 逻辑空间：logical = physical * 96 / dpi。
+        let (left, top) = (f64::from(rc.left) / scale, f64::from(rc.top) / scale);
+        let (right, bottom) = (f64::from(rc.right) / scale, f64::from(rc.bottom) / scale);
+        if center_x >= left && center_x < right && center_y >= top && center_y < bottom {
+            chosen = Some(scale);
+            break;
+        }
+        // 兜底：中心点不落在任何显示器的逻辑矩形里时用第一个有效显示器。
+        chosen = chosen.or(Some(scale));
+    }
+
+    let scale = chosen?;
+    Some(PhysicalFlashRect {
+        x: (x * scale).round() as i32,
+        y: (y * scale).round() as i32,
+        width: ((width * scale).round() as i32).max(1),
+        height: ((height * scale).round() as i32).max(1),
+        scale,
+    })
+}
+
+/// 在会话 worker（SYSTEM）里画光圈：专用线程绑定输入桌面后开四条
+/// TOPMOST|TRANSPARENT 分层窗口条拼成边框，按 GUI 同款节奏做透明度脉冲。
+pub fn flash_screen_overlay(x: f64, y: f64, width: f64, height: f64) {
+    let Some(rect) = physical_flash_rect(x, y, width, height) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("mykvm-flash-overlay".into())
+        .spawn(move || unsafe { run_flash_overlay(rect) });
+}
+
+unsafe fn run_flash_overlay(rect: PhysicalFlashRect) {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Gdi::CreateSolidBrush;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_CREATEWINDOW,
+        DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+        PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes, SetTimer, ShowWindow,
+        TranslateMessage, LWA_ALPHA, MSG, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT, WS_POPUP,
+    };
+
+    // 绑定到当前输入桌面（正常桌面；锁屏/UAC 期间 OpenInputDesktop 指向
+    // 安全桌面，光圈画了也看不见，直接放弃——与 GUI 行为一致）。
+    let desktop = OpenInputDesktop(
+        0,
+        0,
+        DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_CREATEWINDOW,
+    );
+    if desktop.is_null() || SetThreadDesktop(desktop) == 0 {
+        if !desktop.is_null() {
+            let _ = CloseDesktop(desktop);
+        }
+        return;
+    }
+
+    static CLASS_ATOM: OnceLock<u16> = OnceLock::new();
+    let atom = *CLASS_ATOM.get_or_init(|| {
+        let class_name = crate::wide_null("MyKVMFlashBar");
+        let brush = CreateSolidBrush(FLASH_RING_R | (FLASH_RING_G << 8) | (FLASH_RING_B << 16));
+        let module = GetModuleHandleW(std::ptr::null());
+        let mut class: WNDCLASSEXW = std::mem::zeroed();
+        class.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
+        class.lpfnWndProc = Some(DefWindowProcW);
+        class.hInstance = module;
+        class.hbrBackground = brush; // 与类同生命周期，进程存活期间持有
+        class.lpszClassName = class_name.as_ptr();
+        RegisterClassExW(&class)
+    });
+    if atom == 0 {
+        let _ = CloseDesktop(desktop);
+        return;
+    }
+
+    let margin = (((8.0_f64) * rect.scale).round() as i32).max(4);
+    let thickness = (((10.0_f64) * rect.scale).round() as i32).clamp(6, 40);
+    let inner_x = rect.x + margin;
+    let inner_y = rect.y + margin;
+    let inner_w = (rect.width - 2 * margin).max(2 * thickness);
+    let inner_h = (rect.height - 2 * margin).max(2 * thickness);
+    let bars = [
+        (inner_x, inner_y, inner_w, thickness),
+        (inner_x, inner_y + inner_h - thickness, inner_w, thickness),
+        (
+            inner_x,
+            inner_y + thickness,
+            thickness,
+            inner_h - 2 * thickness,
+        ),
+        (
+            inner_x + inner_w - thickness,
+            inner_y + thickness,
+            thickness,
+            inner_h - 2 * thickness,
+        ),
+    ];
+
+    let class_name = crate::wide_null("MyKVMFlashBar");
+    let module = GetModuleHandleW(std::ptr::null());
+    let ex_style: WINDOW_EX_STYLE =
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    let style: WINDOW_STYLE = WS_POPUP;
+
+    let mut windows: Vec<HWND> = Vec::with_capacity(bars.len());
+    for (bar_x, bar_y, bar_w, bar_h) in bars {
+        let hwnd = CreateWindowExW(
+            ex_style,
+            class_name.as_ptr(),
+            std::ptr::null(),
+            style,
+            bar_x,
+            bar_y,
+            bar_w.max(1),
+            bar_h.max(1),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            module,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            continue;
+        }
+        // 0.92 透明度基准（与 CSS 的 alpha 0.92 对齐），脉冲由定时器驱动。
+        SetLayeredWindowAttributes(hwnd, 0, 235, LWA_ALPHA);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        windows.push(hwnd);
+    }
+
+    if windows.is_empty() {
+        let _ = CloseDesktop(desktop);
+        return;
+    }
+    // 定时器挂在第一条窗口上：消息循环统一驱动脉冲与收尾。
+    SetTimer(windows[0], FLASH_TIMER_ID, FLASH_TIMER_MS, None);
+
+    let started = Instant::now();
+    let mut message: MSG = std::mem::zeroed();
+    while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+        if message.message == WM_TIMER && message.hwnd == windows[0] {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if elapsed_ms >= FLASH_DURATION_MS {
+                for hwnd in &windows {
+                    let _ = DestroyWindow(*hwnd);
+                }
+                let _ = CloseDesktop(desktop);
+                PostQuitMessage(0);
+            } else {
+                let phase = f64::from((elapsed_ms % FLASH_PULSE_PERIOD_MS) as u32)
+                    / FLASH_PULSE_PERIOD_MS as f64;
+                let triangle = if phase < 0.5 {
+                    phase * 2.0
+                } else {
+                    2.0 - phase * 2.0
+                };
+                let alpha = ((0.4 + 0.6 * triangle) * 235.0).round() as u8;
+                for hwnd in &windows {
+                    SetLayeredWindowAttributes(*hwnd, 0, alpha, LWA_ALPHA);
+                }
+            }
+        }
+        let _ = TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}

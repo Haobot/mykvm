@@ -130,6 +130,10 @@ const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
 #[allow(dead_code)] // Windows 服务安装参数；mac 构建上无用
 const HELPER_PATH_ARG: &str = "--helper-path";
 const RUNTIME_STATE_EVENT: &str = "runtime-state-changed";
+// Tray "quit" fires this when quitting would leave the unattended control
+// service serving paired peers; the frontend answers with a confirmation
+// dialog whose actions invoke quit_app / quit_with_headless_pause.
+const QUIT_CONFIRMATION_EVENT: &str = "quit-confirmation-requested";
 const FILE_TRANSFER_PROGRESS_EVENT: &str = "file-transfer-progress";
 // FocusHalo P1 debug stream: one engine DebugSnapshot per emit, produced by
 // the 5 Hz pump thread spawned by halo_set_enabled.
@@ -342,6 +346,13 @@ struct LayoutState {
     /// pairing fields merged by merge_runtime_owned_layout_fields.
     #[serde(default)]
     focus_halo: halo::FocusHaloSettings,
+    /// Backend-owned: set by the tray-quit flow when the user chooses
+    /// "exit and pause remote control". While true, the headless receiver in
+    /// the lock-screen input service stays off, so quitting the app really
+    /// stops paired peers from controlling this machine. Cleared by the GUI
+    /// when it takes the network back over at startup.
+    #[serde(default)]
+    headless_paused: bool,
 }
 
 /// Cross-platform modifier remapping. Each field names the *logical* modifier
@@ -465,6 +476,12 @@ struct RuntimeStatus {
     privilege: PrivilegeStatus,
     input_service: InputServiceStatus,
     input_protection: input_guard::GuardStatus,
+    /// Tray quit needs the confirmation dialog, but emitting into a hidden
+    /// (suspended) WebView2 drops the event. This flag carries the request
+    /// through the 2 s status poll instead; the frontend clears it via
+    /// dismiss_quit_confirmation when the dialog is closed.
+    #[serde(default)]
+    quit_confirmation_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -686,6 +703,13 @@ struct AppRuntime {
     file_transfers: Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// Why the last start_discovery attempt failed; surfaced while the
+    /// runtime is "started" but discovery is down so the 2 s status poll
+    /// cannot mask a dead network stack behind a plain "idle" state.
+    last_discovery_error: Mutex<Option<String>>,
+    /// Tray quit asked for confirmation; read (and delivered) by the status
+    /// poll because emits into a hidden WebView2 are dropped on Windows.
+    quit_confirmation_pending: AtomicBool,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
     clipboard_stop: Mutex<Option<Arc<AtomicBool>>>,
     clipboard_seen_text: Arc<Mutex<Option<String>>>,
@@ -749,6 +773,8 @@ impl AppRuntime {
             file_transfers: Arc::new(Mutex::new(HashMap::new())),
             quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
+            last_discovery_error: Mutex::new(None),
+            quit_confirmation_pending: AtomicBool::new(false),
             input_stop: Mutex::new(None),
             clipboard_stop: Mutex::new(None),
             clipboard_seen_text: Arc::new(Mutex::new(None)),
@@ -828,6 +854,17 @@ impl AppRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         runtime.discovery = self.discovery_status_for_layout(layout);
+        let last_discovery_error = self
+            .last_discovery_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        runtime.discovery = surfaced_discovery_status(
+            runtime.discovery,
+            runtime.started,
+            last_discovery_error.as_deref(),
+        );
+        runtime.quit_confirmation_pending = self.quit_confirmation_pending.load(Ordering::Relaxed);
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
         runtime.privilege = current_privilege_status();
@@ -1075,15 +1112,74 @@ impl AppRuntime {
         Ok(transport)
     }
 
+    /// GUI 接管点：打开主程序即恢复被控——上一次「退出并暂停被控」留下的
+    /// headless 暂停在这里（并在落盘后）解除，输入服务此后不会再观察到它。
+    fn clear_headless_pause(&self) {
+        let Ok(mut layout) = self.layout.lock() else {
+            return;
+        };
+        if !layout.headless_paused {
+            return;
+        }
+        layout.headless_paused = false;
+        match write_layout_to_disk(&self.config_path, &layout) {
+            Ok(()) => log::info!("headless control resumed (pause cleared)"),
+            Err(error) => log::warn!("failed to clear headless pause: {error}"),
+        }
+    }
+
     fn start_discovery(&self) -> Result<(), String> {
+        // 幂等检查先行：运行中的发现链路不能被一次瞬时的网络租约抖动
+        // （Windows 单实例阻塞管道繁忙等）判成失败并中断健康会话。
+        if self
+            .discovery_stop
+            .lock()
+            .map_err(|_| "discovery state lock poisoned".to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        // 从锁屏输入服务接管 UDP/QUIC 端口时，会与上一个 GUI 实例的退出
+        // 竞态（换装新版本的同一秒，单实例阻塞管道还挂在旧客户端上）。
+        // 亚秒级重叠不该打死整个会话的发现/QUIC，按退避重试；超出预算的
+        // 故障由 mykvm-discovery-retry 看门狗继续兜底。
         #[cfg(target_os = "windows")]
-        let _ = self.acquire_input_service_network_lease()?;
+        {
+            let attempts = 1 + LEASE_TAKEOVER_RETRY_DELAYS.len();
+            let mut failure = None;
+            for attempt in 0..attempts {
+                match self.acquire_input_service_network_lease() {
+                    Ok(_) => {
+                        failure = None;
+                        break;
+                    }
+                    Err(error) => {
+                        if attempt + 1 < attempts {
+                            log::warn!(
+                                "network takeover attempt {}/{} failed: {error}; retrying",
+                                attempt + 1,
+                                attempts
+                            );
+                            thread::sleep(LEASE_TAKEOVER_RETRY_DELAYS[attempt]);
+                        }
+                        failure = Some(error);
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                log::error!("discovery failed to take over the network ports: {error}");
+                return Err(error);
+            }
+        }
 
         let mut discovery_stop = self
             .discovery_stop
             .lock()
             .map_err(|_| "discovery state lock poisoned".to_string())?;
 
+        // 持长锁后复查：重试期间用户命令或恢复看门狗可能已经把发现拉起，
+        // 此时直接成功返回，避免两个调用方各自绑到相邻端口。
         if discovery_stop.is_some() {
             return Ok(());
         }
@@ -1465,6 +1561,9 @@ impl AppRuntime {
         });
 
         *discovery_stop = Some(stop);
+        if let Ok(mut error_slot) = self.last_discovery_error.lock() {
+            *error_slot = None;
+        }
         Ok(())
     }
 
@@ -2864,6 +2963,9 @@ fn merge_runtime_owned_layout_fields(
     // clear them and force the client to be paired again.
     incoming.cluster_id = current.cluster_id.clone();
     incoming.pair_secret = current.pair_secret.clone();
+    // Same for the headless pause: only quit_with_headless_pause sets it and
+    // only the GUI startup clears it, so a whole-layout save must not flip it.
+    incoming.headless_paused = current.headless_paused;
 
     if current.machine_role == "client"
         && incoming.machine_role == "client"
@@ -3032,7 +3134,18 @@ fn restart_runtime_if_running(state: &AppRuntime) -> Result<(), String> {
 
 fn start_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
     state.refresh_layout_from_disk();
+    // GUI taking over always ends a headless pause from a previous session.
+    state.clear_headless_pause();
     let discovery_error = state.start_discovery().err();
+    if let Some(error) = &discovery_error {
+        // Without this line a discovery startup failure left zero trace in the
+        // log: the error only lived in the in-memory status until the first
+        // 2 s poll overwrote it with a plain "idle".
+        log::error!("discovery failed to start: {error}");
+        if let Ok(mut error_slot) = state.last_discovery_error.lock() {
+            *error_slot = Some(error.clone());
+        }
+    }
     let layout = state.layout_snapshot();
     let mut discovery = state.discovery_status();
     if let Some(error) = discovery_error {
@@ -3058,6 +3171,7 @@ fn start_runtime_inner(state: &AppRuntime) -> Result<RuntimeStatus, String> {
         privilege: current_privilege_status(),
         input_service: current_input_service_status(),
         input_protection: Default::default(),
+        quit_confirmation_pending: state.quit_confirmation_pending.load(Ordering::Relaxed),
     };
 
     Ok(runtime.clone())
@@ -3080,6 +3194,26 @@ fn ready_transport_status(discovery: &DiscoveryStatus) -> NativeStageStatus {
             "UDP discovery is ready on {}; QUIC is ready on {} for input datagrams and clipboard streams.",
             discovery.port, discovery.local_peer.quic_port
         ),
+    }
+}
+
+/// 已启动的 runtime 若发现循环并未运行，不能读成普通的 "idle"：2s 状态轮询
+/// 会把启动失败掩盖成"闲置"（正是光圈消失那次故障里 GUI 瘫痪却无感知的
+/// 形态）。这里把记住的启动失败重新浮出来；真正停掉的 runtime 保持 idle。
+fn surfaced_discovery_status(
+    discovery: DiscoveryStatus,
+    runtime_started: bool,
+    last_error: Option<&str>,
+) -> DiscoveryStatus {
+    if !runtime_started || discovery.state != "idle" {
+        return discovery;
+    }
+    DiscoveryStatus {
+        state: "error".into(),
+        detail: last_error
+            .unwrap_or("Discovery is not running; retrying to take over the network ports.")
+            .into(),
+        ..discovery
     }
 }
 
@@ -4057,6 +4191,58 @@ fn spawn_lock_sync_watcher(app: AppHandle) {
         });
 }
 
+/// 自愈看门狗：runtime 已启动但发现循环没起来（典型：启动瞬间向输入服务
+/// 接管端口失败，GUI 整会话瘫痪而无人值守服务顶班掩盖故障）。每 5s 重试
+/// start_discovery 把网络栈拉回来；更新安装窗口（upgrading 置位）内不抢
+/// 端口。失败日志限频，长期故障不刷屏。
+fn spawn_discovery_recovery_watcher(app: AppHandle) {
+    const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+    const LOG_INTERVAL: Duration = Duration::from_secs(60);
+    let _ = thread::Builder::new()
+        .name("mykvm-discovery-retry".into())
+        .spawn(move || {
+            let mut last_failure_log: Option<Instant> = None;
+            loop {
+                thread::sleep(RETRY_INTERVAL);
+                let Some(state) = app.try_state::<AppRuntime>() else {
+                    continue;
+                };
+                if state.upgrading.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let started = state
+                    .runtime
+                    .lock()
+                    .map(|runtime| runtime.started)
+                    .unwrap_or(false);
+                // 拿不到锁时按"发现循环在跑"处理，宁可少一次重试也不抢端口。
+                let discovery_running = state
+                    .discovery_stop
+                    .lock()
+                    .map(|stop| stop.is_some())
+                    .unwrap_or(true);
+                if !started || discovery_running {
+                    continue;
+                }
+                match state.start_discovery() {
+                    Ok(()) => {
+                        log::info!("discovery recovered after startup failure");
+                        last_failure_log = None;
+                    }
+                    Err(error) => {
+                        let should_log = last_failure_log
+                            .map(|at| at.elapsed() >= LOG_INTERVAL)
+                            .unwrap_or(true);
+                        if should_log {
+                            log::warn!("discovery recovery retry failed: {error}");
+                            last_failure_log = Some(Instant::now());
+                        }
+                    }
+                }
+            }
+        });
+}
+
 fn lock_online_clients(state: &AppRuntime) {
     let layout = state.layout_snapshot();
     if layout.machine_role != "server" || !layout.lock_sync {
@@ -4284,6 +4470,44 @@ fn minimize_main_window(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn hide_main_window(app: AppHandle) -> Result<(), String> {
     hide_main_window_handle(&app)
+}
+
+/// Frontend action for the quit dialog's "exit anyway" button.
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    request_app_quit(&app);
+}
+
+/// Clears the poll-delivered quit confirmation request once the dialog is
+/// closed, so the flag does not re-open it on the next status poll.
+#[tauri::command]
+fn dismiss_quit_confirmation(state: tauri::State<'_, AppRuntime>) {
+    state
+        .quit_confirmation_pending
+        .store(false, Ordering::Relaxed);
+}
+
+/// Frontend action for the quit dialog's "exit and pause remote control"
+/// button: persist the headless pause *before* the process exits so the
+/// service's LeaseReleased handler reads it from disk and stays off.
+#[tauri::command]
+fn quit_with_headless_pause(
+    app: AppHandle,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    {
+        let mut layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        if !layout.headless_paused {
+            layout.headless_paused = true;
+            write_layout_to_disk(&state.config_path, &layout)?;
+            log::info!("headless control paused for exit");
+        }
+    }
+    request_app_quit(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -4912,6 +5136,50 @@ fn request_app_quit(app: &AppHandle) {
     app.exit(0);
 }
 
+/// Pure predicate for the tray-quit flow: would the unattended control
+/// service keep serving paired peers after the GUI process exits?
+#[cfg(target_os = "windows")]
+fn headless_takeover_would_continue(layout: &LayoutState, service_running: bool) -> bool {
+    service_running && headless_client::headless_receive_enabled(layout)
+}
+
+/// The unattended control service only exists on Windows; quitting elsewhere
+/// never leaves a headless receiver behind.
+#[cfg(not(target_os = "windows"))]
+fn headless_takeover_would_continue(_layout: &LayoutState, _service_running: bool) -> bool {
+    false
+}
+
+/// Tray "quit": quitting while the unattended service would keep the machine
+/// controllable deserves an explicit choice, so surface the confirmation
+/// dialog instead of exiting silently. Every other exit path (single-instance
+/// takeover during updates, admin restart) keeps quitting directly.
+fn handle_tray_quit(app: &AppHandle) {
+    let should_confirm = app.try_state::<AppRuntime>().is_some_and(|state| {
+        let layout = state.layout_snapshot();
+        headless_takeover_would_continue(&layout, current_input_service_status().running)
+    });
+    if !should_confirm {
+        request_app_quit(app);
+        return;
+    }
+    // Emit into the webview as the fast path, but also set the pending flag:
+    // while the main window sits hidden in the tray, WebView2 is suspended
+    // and the injected event script is dropped, so the 2 s status poll is
+    // the delivery mechanism that actually reaches the dialog.
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        state
+            .quit_confirmation_pending
+            .store(true, Ordering::Relaxed);
+    }
+    if let Err(error) = show_main_window_handle(app) {
+        log::warn!("failed to show main window for quit confirmation: {error}");
+    }
+    if let Err(error) = app.emit(QUIT_CONFIRMATION_EVENT, ()) {
+        log::warn!("failed to emit quit confirmation event: {error}");
+    }
+}
+
 fn mark_explicit_quit(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppRuntime>() {
         state.allow_explicit_quit.store(true, Ordering::Relaxed);
@@ -5180,6 +5448,7 @@ pub fn run() {
         .setup(|app| {
             let _ = APP_VERSION.set(app.config().version.clone().unwrap_or_else(|| app.package_info().version.to_string()));
             spawn_lock_sync_watcher(app.handle().clone());
+            spawn_discovery_recovery_watcher(app.handle().clone());
             // 被控端收到 FlashScreen 事件后需要开 Tauri 窗口，而输入数据链
             // 没有 AppHandle：与 halo focus 的 receive hook 同一模式，把执行
             // 器（捕获本 handle）交给 input.rs 的分发点。
@@ -5268,8 +5537,16 @@ pub fn run() {
             {
                 let state = app.state::<AppRuntime>();
                 let runtime_ref = state.inner();
+                // GUI taking over always ends a headless pause from a
+                // previous "exit and pause" session.
+                runtime_ref.clear_headless_pause();
                 let layout = runtime_ref.layout_snapshot();
-                let _ = runtime_ref.start_discovery();
+                if let Err(error) = runtime_ref.start_discovery() {
+                    log::error!("startup discovery failed: {error}");
+                    if let Ok(mut error_slot) = runtime_ref.last_discovery_error.lock() {
+                        *error_slot = Some(error);
+                    }
+                }
                 let (capture, inject) = runtime_ref.start_input(layout.clone());
                 let clipboard = runtime_ref.start_clipboard(layout.clone());
                 let discovery = runtime_ref.discovery_status_for_layout(&layout);
@@ -5289,6 +5566,7 @@ pub fn run() {
                         privilege,
                         input_service,
                         input_protection: Default::default(),
+                        quit_confirmation_pending: false,
                     };
                 }
             }
@@ -5499,6 +5777,9 @@ pub fn run() {
             open_log_directory,
             flash_screen_indicator,
             flash_peer_screen,
+            quit_app,
+            quit_with_headless_pause,
+            dismiss_quit_confirmation,
             save_layout,
             cancel_file_transfer,
             paste_remote_clipboard,
@@ -5610,7 +5891,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             "hide" => {
                 let _ = hide_main_window_handle(app);
             }
-            "quit" => request_app_quit(app),
+            "quit" => handle_tray_quit(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -5831,6 +6112,7 @@ fn default_runtime(layout: &LayoutState) -> RuntimeStatus {
         privilege: current_privilege_status(),
         input_service: current_input_service_status(),
         input_protection: Default::default(),
+        quit_confirmation_pending: false,
         discovery: DiscoveryStatus {
             state: "idle".into(),
             detail: "LAN discovery is stopped. Start runtime or scan the LAN to find peers.".into(),
@@ -6054,6 +6336,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         focus_halo: halo::FocusHaloSettings::default(),
+        headless_paused: false,
         devices: vec![Device {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
@@ -6104,6 +6387,7 @@ fn detect_fallback_layout() -> LayoutState {
         edge_switch_hotkey: default_edge_switch_hotkey(),
         screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
         focus_halo: halo::FocusHaloSettings::default(),
+        headless_paused: false,
     }
 }
 
@@ -6452,6 +6736,9 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         edge_switch_hotkey: normalize_edge_switch_hotkey(&saved_layout.edge_switch_hotkey),
         screen_switch_hotkeys: saved_layout.screen_switch_hotkeys.clone(),
         focus_halo: saved_layout.focus_halo.clone(),
+        // 无人值守暂停标记必须原样穿过归一化：clear_headless_pause 依据内存
+        // 状态决定是否落盘清除，丢了标记磁盘上的 true 就永远无人解除。
+        headless_paused: saved_layout.headless_paused,
     }
 }
 
@@ -9687,7 +9974,9 @@ fn run_requested_update(app: AppHandle) {
         if let Err(error) = update.install(bytes) {
             log::warn!("requested update: install failed: {error}");
             state.upgrading.store(false, Ordering::Relaxed);
-            let _ = start_runtime_inner(state.inner());
+            if let Err(error) = start_runtime_inner(state.inner()) {
+                log::error!("runtime restart after failed update install: {error}");
+            }
             return;
         }
         app.restart();
@@ -11104,6 +11393,12 @@ fn sanitize_peer_id_part(value: &str) -> String {
 /// 发现链路 UDP socket 的写超时（毫秒），与 start_discovery 主 socket 同参；
 /// headless_client.rs 的主 discovery socket 复用同一参数。
 pub(crate) const DISCOVERY_WRITE_TIMEOUT_MS: u64 = 500;
+
+/// start_discovery 内向输入服务接管端口的退避重试间隔（首次尝试之后）。
+/// 单实例阻塞管道在换装新版本的瞬间仍可能挂在旧实例上，亚秒级竞态不该
+/// 把整个会话的发现/QUIC 打死；更长的故障由 mykvm-discovery-retry 看门狗兜底。
+#[cfg(target_os = "windows")]
+const LEASE_TAKEOVER_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
 
 /// 看门狗检查发现循环心跳的间隔（毫秒）。
 const DISCOVERY_STALL_CHECK_INTERVAL_MS: u64 = 10_000;
@@ -12955,6 +13250,7 @@ mod tests {
             edge_switch_hotkey: default_edge_switch_hotkey(),
             screen_switch_hotkeys: ScreenSwitchHotkeys::default(),
             focus_halo: halo::FocusHaloSettings::default(),
+            headless_paused: false,
         }
     }
 
@@ -12999,6 +13295,89 @@ mod tests {
             Some(tauri::RESTART_EXIT_CODE),
             false
         ));
+    }
+
+    fn idle_discovery_status() -> DiscoveryStatus {
+        DiscoveryStatus {
+            state: "idle".into(),
+            detail: "discovery is idle".into(),
+            port: 47833,
+            local_peer: test_peer(),
+            peers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn surfaced_discovery_status_marks_started_runtime_as_error() {
+        let surfaced = surfaced_discovery_status(
+            idle_discovery_status(),
+            true,
+            Some("network takeover pipe unavailable"),
+        );
+        assert_eq!(surfaced.state, "error");
+        assert_eq!(surfaced.detail, "network takeover pipe unavailable");
+    }
+
+    #[test]
+    fn surfaced_discovery_status_keeps_stopped_runtime_idle() {
+        let surfaced = surfaced_discovery_status(idle_discovery_status(), false, Some("boom"));
+        assert_eq!(surfaced.state, "idle");
+        assert_eq!(surfaced.detail, "discovery is idle");
+    }
+
+    #[test]
+    fn surfaced_discovery_status_falls_back_to_a_retry_hint_without_a_stored_error() {
+        let surfaced = surfaced_discovery_status(idle_discovery_status(), true, None);
+        assert_eq!(surfaced.state, "error");
+        assert!(surfaced.detail.contains("retrying"));
+    }
+
+    #[test]
+    fn surfaced_discovery_status_keeps_a_running_discovery_ready() {
+        let mut discovery = idle_discovery_status();
+        discovery.state = "ready".into();
+        let surfaced = surfaced_discovery_status(discovery, true, Some("stale error"));
+        assert_eq!(surfaced.state, "ready");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn headless_eligible_client_layout() -> LayoutState {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.input_mode = "receive".into();
+        layout.paired_controllers = vec![PairedController {
+            id: "controller".into(),
+            name: "Controller".into(),
+            host: "controller.local".into(),
+            ip: "10.0.0.9".into(),
+            transport_public_key: "controller-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: 1,
+        }];
+        layout
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn headless_takeover_would_continue_for_a_paired_receiving_client() {
+        assert!(headless_takeover_would_continue(
+            &headless_eligible_client_layout(),
+            true
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn headless_takeover_does_not_continue_when_service_or_pause_stops_it() {
+        let layout = headless_eligible_client_layout();
+        // 服务没在跑：没有顶班者，退出即停止被控。
+        assert!(!headless_takeover_would_continue(&layout, false));
+
+        // 「退出并暂停被控」写入的标记同样让顶班条件不成立。
+        let mut paused = layout.clone();
+        paused.headless_paused = true;
+        assert!(!headless_takeover_would_continue(&paused, true));
     }
 
     #[test]

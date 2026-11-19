@@ -65,6 +65,9 @@ export interface RuntimeStatus {
   privilege: PrivilegeStatus
   inputService: InputServiceStatus
   inputProtection?: InputProtectionStatus
+  /** Tray quit asked for confirmation; delivered via the status poll because
+   *  emits into a hidden (suspended) WebView2 window are dropped. */
+  quitConfirmationPending?: boolean
 }
 
 export interface InputProtectionStatus {

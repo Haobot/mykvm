@@ -55,6 +55,9 @@ import {
   openRepositoryUrl,
   openUpdateReleasePage,
   probeLanPeer,
+  quitApp,
+  quitWithHeadlessPause,
+  dismissQuitConfirmation,
   readDiagnosticInfo,
   readInputServiceStatus,
   readPerformanceSample,
@@ -322,6 +325,9 @@ function App() {
   const [isInputServicePending, setIsInputServicePending] = useState(false);
   const [inputServiceAction, setInputServiceAction] =
     useState<InputServiceAction | null>(null);
+  const [quitConfirmVisible, setQuitConfirmVisible] = useState(false);
+  const [isQuitPausePending, setIsQuitPausePending] = useState(false);
+  const quitDismissedAtRef = useRef(0);
   const [inputServiceOfferDismissed, setInputServiceOfferDismissed] = useState(
     () => {
       try {
@@ -617,6 +623,57 @@ function App() {
       unlistenRuntime?.();
     };
   }, []);
+
+  // 托盘「退出」在无人值守服务会顶班的场景下先发 quit-confirmation-requested，
+  // 由这里弹出确认：直接退出 / 退出并暂停被控 / 取消。
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let active = true;
+    let unlistenQuit: (() => void) | null = null;
+
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen("quit-confirmation-requested", () => {
+          if (active) {
+            setQuitConfirmVisible(true);
+          }
+        }),
+      )
+      .then((unlisten) => {
+        if (active) {
+          unlistenQuit = unlisten;
+          return;
+        }
+
+        unlisten();
+      })
+      .catch(() => {
+        // 收不到事件时退化为直接退出路径，不影响既有行为。
+      });
+
+    return () => {
+      active = false;
+      unlistenQuit?.();
+    };
+  }, []);
+
+  // 兜底投递通道：托盘 Quit 设置的 pending 标记随 2s 状态轮询到达。
+  // 隐藏（挂起）的 WebView2 会丢弃注入的事件脚本，emit 快速路径在窗口
+  // 常驻托盘的场景下恰恰不可用；轮询在窗口显示恢复后立即补投。
+  // dismiss 后的短暂窗口期内不重开，避免 dismiss 命令与下一轮轮询的竞态。
+  const quitConfirmationPending = snapshot?.runtime?.quitConfirmationPending;
+  useEffect(() => {
+    if (
+      quitConfirmationPending === true &&
+      !quitConfirmVisible &&
+      Date.now() - quitDismissedAtRef.current > 4000
+    ) {
+      setQuitConfirmVisible(true);
+    }
+  }, [quitConfirmationPending, quitConfirmVisible]);
 
   useEffect(() => {
     let active = true;
@@ -1020,9 +1077,36 @@ function App() {
     setInputServiceAction(null);
   }
 
+  function closeQuitConfirmation() {
+    quitDismissedAtRef.current = Date.now();
+    setQuitConfirmVisible(false);
+    // 清掉轮询携带的 pending 标记，避免下一轮 2s 状态刷新把弹窗重新打开。
+    void dismissQuitConfirmation().catch(() => {});
+  }
+
+  async function handleQuitPauseAndExit() {
+    if (isQuitPausePending) {
+      return;
+    }
+    setIsQuitPausePending(true);
+    try {
+      await quitWithHeadlessPause();
+      // Success exits the process; only a failure reaches this point.
+      setIsQuitPausePending(false);
+    } catch (error) {
+      setIsQuitPausePending(false);
+      setErrorMessage(
+        `${ui.errors.quitPause}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   const hasBlockingOverlay =
     Boolean(shownInputServiceAction) ||
     Boolean(errorMessage) ||
+    quitConfirmVisible ||
     isScanningLan ||
     Boolean(serverPairing) ||
     runtime?.pairing.state === "requested";
@@ -2665,6 +2749,61 @@ function App() {
     );
   }
 
+  function renderQuitConfirmation() {
+    return (
+      <div className="pairing-modal-backdrop" role="presentation">
+        <section
+          className="pairing-modal pairing-modal-client"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="quit-confirmation-title"
+        >
+          <button
+            type="button"
+            className="pairing-close-button"
+            onClick={closeQuitConfirmation}
+            disabled={isQuitPausePending}
+            title={ui.common.cancel}
+            aria-label={ui.common.cancel}
+          >
+            <WindowCloseIcon />
+          </button>
+          <div>
+            <p className="eyebrow">{ui.quitDialog.eyebrow}</p>
+            <h2 id="quit-confirmation-title">{ui.quitDialog.title}</h2>
+            <p>{ui.quitDialog.copy}</p>
+          </div>
+          <div className="pairing-actions">
+            <button
+              type="button"
+              className="secondary-button compact-button danger-button"
+              onClick={() => void handleQuitPauseAndExit()}
+              disabled={isQuitPausePending}
+            >
+              {isQuitPausePending ? ui.common.pending : ui.quitDialog.pauseAndExit}
+            </button>
+            <button
+              type="button"
+              className="primary-button compact-button"
+              onClick={() => void quitApp()}
+              disabled={isQuitPausePending}
+            >
+              {ui.quitDialog.directExit}
+            </button>
+            <button
+              type="button"
+              className="secondary-button compact-button"
+              onClick={closeQuitConfirmation}
+              disabled={isQuitPausePending}
+            >
+              {ui.common.cancel}
+            </button>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   if (!snapshot || !layout || !runtime || !displayLayout) {
     return (
       <main className={shellClassName}>
@@ -2982,6 +3121,7 @@ function App() {
       {shownInputServiceAction
         ? renderInputServicePrompt(shownInputServiceAction)
         : null}
+      {quitConfirmVisible ? renderQuitConfirmation() : null}
 
       {machineRole === "server" && currentTab === "layout" ? (
         <section className="workspace-shell">

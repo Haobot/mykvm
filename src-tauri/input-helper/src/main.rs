@@ -269,7 +269,6 @@ mod windows_helper {
             .as_ref()
             .and_then(|path| start_receiver(path));
         let mut network_leased = false;
-        let mut network_shutdown_failed = false;
         if let Some(owner_sid) = service_args.owner_sid.clone() {
             let control_tx = event_tx.clone();
             if let Err(error) = thread::Builder::new()
@@ -284,19 +283,23 @@ mod windows_helper {
             match event_rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(ServiceEvent::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(ServiceEvent::Takeover(ack)) => {
-                    if network_shutdown_failed {
-                        let _ = ack.send(false);
-                        continue;
+                    // A stop that timed out leaves the handle's stop flag set;
+                    // the retry on the next takeover returns Ok immediately
+                    // (idempotent stop). Latching the failure permanently —
+                    // as this used to do until the service was restarted —
+                    // turned one transient drain timeout into a lockout that
+                    // refused every future GUI takeover.
+                    match stop_receiver(&mut receiver) {
+                        Ok(()) => {
+                            network_leased = true;
+                            let _ = ack.send(true);
+                        }
+                        Err(error) => {
+                            log_service_error("stop headless receiver for GUI takeover", &error);
+                            network_leased = true;
+                            let _ = ack.send(false);
+                        }
                     }
-                    if let Err(error) = stop_receiver(&mut receiver) {
-                        log_service_error("stop headless receiver for GUI takeover", &error);
-                        network_shutdown_failed = true;
-                        network_leased = true;
-                        let _ = ack.send(false);
-                        continue;
-                    }
-                    network_leased = true;
-                    let _ = ack.send(true);
                 }
                 Ok(ServiceEvent::LeaseReleased) => {
                     if let Err(error) = stop_receiver(&mut receiver) {
@@ -710,6 +713,26 @@ mod windows_helper {
         pressed_keys: &mut Vec<u16>,
         button_mask: &mut u64,
     ) {
+        // 光圈不进注入管线：GUI 在时它在 dispatch_input_command 就被分流到
+        // Tauri 的 screen-indicator 窗口；GUI 退出（"保持被控"）后 FlashScreen
+        // 经输入管道到达 worker，由这里用 Win32 分层窗口直接绘制。不需要
+        // desktop attach（画提示不吃 JOURNALPLAYBACK 门控），也不阻塞管道
+        // 线程——overlay 自带线程与消息循环。
+        if let InputCommand::FlashScreen {
+            x,
+            y,
+            width,
+            height,
+        } = command
+        {
+            windows_input::flash_screen_overlay(
+                f64::from(*x),
+                f64::from(*y),
+                f64::from(*width),
+                f64::from(*height),
+            );
+            return;
+        }
         // Every command is injected on the worker's main thread against the
         // cached DesktopAttachment. attach_current_input_desktop() caches by
         // desktop name, so on a stable desktop this is cheap.
