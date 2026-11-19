@@ -6,6 +6,26 @@ import { spawnSync } from 'node:child_process'
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 
 function run(command, args) {
+  // Under `npm run tauri`, npm prepends its own bin dir (which ships another
+  // npm.cmd) to PATH; `cmd /c npm` resolves that inner shim, whose prefix
+  // probe re-appends node_modules\npm\bin\npm-cli.js onto itself and dies with
+  // MODULE_NOT_FOUND. Run the npm-cli.js that launched this chain directly
+  // (npm_execpath is always set under `npm run`); the cmd.exe shim below stays
+  // as the fallback for running `tauri build` outside npm.
+  if (command === 'npm' && process.env.npm_execpath) {
+    const npmResult = spawnSync(process.execPath, [process.env.npm_execpath, ...args], {
+      cwd: root,
+      stdio: 'inherit',
+    })
+    if (npmResult.error) {
+      console.error(npmResult.error.message)
+      process.exit(1)
+    }
+    if (npmResult.status !== 0) {
+      process.exit(npmResult.status ?? 1)
+    }
+    return
+  }
   const resolvedCommand =
     process.platform === 'win32' && command === 'npm'
       ? 'cmd.exe'
