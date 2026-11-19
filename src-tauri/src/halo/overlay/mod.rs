@@ -5,10 +5,13 @@
 
 pub use crate::halo::params::FocusHaloSettings;
 
+pub mod badge;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod win32;
+
+pub use badge::{BadgeCorner, BadgeLayer, BadgeScreen};
 
 /// What the halo ring should currently look like.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,7 +48,10 @@ pub struct BorderFrame {
 
 /// Screen geometry in the engine's layout-board space plus the platform's
 /// global native origin, so the backend never needs layout knowledge.
-#[derive(Debug, Clone, Copy)]
+/// `PartialEq` (exact float equality) drives the engine's overlay re-host
+/// deduplication: two calls with identical geometry are considered the same
+/// screen, so only real topology changes re-host the window.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverlayScreenGeometry {
     /// Logical origin of this screen in layout-board space.
     pub x: f64,
@@ -73,6 +79,10 @@ pub trait OverlayBackend: Send {
     /// around that board-space rectangle, `None` hides it. Default no-op so
     /// minimal backends (NoopBackend) stay unchanged.
     fn set_border(&mut self, _border: Option<BorderFrame>) {}
+    /// Show/hide the halo RING only (user preference; tracking and switching
+    /// keep running). Border/highlight visuals are unaffected. Default no-op
+    /// for minimal backends.
+    fn set_ring_visible(&mut self, _visible: bool) {}
     /// Whether a border is currently wanted by the backend (test hook).
     fn border_visible(&self) -> bool {
         false
@@ -116,11 +126,10 @@ pub fn create_overlay(settings: &FocusHaloSettings) -> Box<dyn OverlayBackend> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
 mod tests {
     use super::*;
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn supported_platforms_report_support() {
         assert!(overlay_supported());

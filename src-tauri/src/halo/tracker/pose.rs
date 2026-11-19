@@ -49,6 +49,28 @@ pub(crate) struct Face {
     score: f32,
 }
 
+impl Face {
+    /// Face-box center as normalized (u, v) in 0..1, image origin top-left
+    /// (v grows downward). This is the seat-translation probe the screen
+    /// calibration consumes (see `screen_map::PosePoint`).
+    pub(crate) fn center_uv(&self, img_width: u32, img_height: u32) -> (f64, f64) {
+        let cx = self.x + self.w / 2.0;
+        let cy = self.y + self.h / 2.0;
+        (
+            if img_width > 0 {
+                f64::from(cx) / f64::from(img_width)
+            } else {
+                0.0
+            },
+            if img_height > 0 {
+                f64::from(cy) / f64::from(img_height)
+            } else {
+                0.0
+            },
+        )
+    }
+}
+
 /// RGB8 image -> 1x3xHxW BGR float32 NCHW, raw 0..255 values (YuNet expects no
 /// normalization).
 pub(crate) fn bgr_nchw(img: &RgbImage) -> Array4<f32> {

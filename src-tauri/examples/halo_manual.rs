@@ -10,6 +10,8 @@
 //!   cargo run --example halo_manual -- windows
 //!   cargo run --example halo_manual -- activate <window_id>
 //!   cargo run --example halo_manual -- focus-receive <kind> <screen_id> <x> <y>
+//!   cargo run --example halo_manual -- badges [clear_after_ms]
+//!   cargo run --example halo_manual -- warp <board_x> <board_y>
 //!
 //! Examples:
 //!   halo_manual 756 491 idle 160            # static ring at screen center
@@ -25,15 +27,26 @@
 //!                                           # event through the real
 //!                                           # receive path (no second
 //!                                           # machine needed)
+//!   halo_manual badges 3000 [tl|tr|br|bl]   # S2: number badges on every
+//!                                           # display (no camera needed),
+//!                                           # auto-cleared after 3 s; the
+//!                                           # optional corner highlights
+//!                                           # screen 1's bracket set
+//!   halo_manual warp 756 491                # S3: move the OS cursor to the
+//!                                           # board point through the real
+//!                                           # warper (no overlay involved);
+//!                                           # prints before/expected/after
 //!
 //! The process just pumps the main run loop; Ctrl-C exits.
 
 // 手动调试脚本：演示代码风格从简，不受 clippy 全量规则约束。
 #![allow(clippy::iter_nth, clippy::field_reassign_with_default)]
 
+use mykvm_lib::halo::warp::board_to_native;
 use mykvm_lib::halo::{
-    apply_focus_event, create_activator, create_window_service, BorderFrame, FocusHaloSettings,
-    FocusScreen, HaloFocusEvent, HaloRuntime, HaloVisual, OverlayScreenGeometry,
+    apply_focus_event, create_activator, create_cursor_warper, create_window_service, BadgeCorner,
+    BadgeLayer, BadgeScreen, BorderFrame, FocusHaloSettings, FocusScreen, HaloFocusEvent,
+    HaloRuntime, HaloVisual, OverlayScreenGeometry,
 };
 
 #[cfg(target_os = "macos")]
@@ -92,6 +105,14 @@ fn main() {
         }
         Some("focus-receive") => {
             run_focus_receive_subcommand(&args);
+            return;
+        }
+        Some("badges") => {
+            run_badges_subcommand(&args);
+            return;
+        }
+        Some("warp") => {
+            run_warp_subcommand(&args);
             return;
         }
         _ => {}
@@ -388,10 +409,14 @@ fn run_windows_subcommand() {
 /// runs it through the exact same processing function the app's receive hook
 /// uses (apply_focus_event): screen selection, window hit-test, passive
 /// border highlight (auto-cleared by the runtime's 5 s watcher) and, for
-/// `activate`, window activation. Coordinates are board/global logical
-/// points; screen ids here are the synthesized `screen-<index>` of the
-/// locally attached displays, and a point inside a display also resolves by
-/// containment, so any on-screen coordinate works.
+/// `activate`, window activation. `land` (S4) additionally warps this
+/// machine's cursor onto the landing point before activating — its printed
+/// outcome carries the warp target and acceptance. Coordinates are
+/// screen-local logical points (origin = the target screen's top-left);
+/// screen ids here are the synthesized `screen-<index>` of the locally
+/// attached displays — an id that matches no local screen falls back to the
+/// first screen with a warning, so single-display rigs accept any on-screen
+/// coordinate.
 fn run_focus_receive_subcommand(args: &[String]) {
     let kind = args.get(2).map(String::as_str).unwrap_or("");
     let screen_id = args
@@ -421,9 +446,14 @@ fn run_focus_receive_subcommand(args: &[String]) {
             x,
             y,
         },
+        "land" => HaloFocusEvent::Land {
+            screen_id: screen_id.clone(),
+            x,
+            y,
+        },
         "clear" => HaloFocusEvent::Clear,
         _ => {
-            eprintln!("usage: halo_manual focus-receive <edge|candidate|activate|clear> <screen_id> <x> <y>");
+            eprintln!("usage: halo_manual focus-receive <edge|candidate|activate|land|clear> <screen_id> <x> <y>");
             std::process::exit(2);
         }
     };
@@ -453,12 +483,14 @@ fn run_focus_receive_subcommand(args: &[String]) {
     let mut runtime = HaloRuntime::new();
     let mut windows = create_window_service(&geometries);
     let mut activator = create_activator();
+    let mut warper = create_cursor_warper();
     let outcome = apply_focus_event(
         &event,
         &mut runtime,
         &screens,
         &mut *windows,
         &mut *activator,
+        &mut *warper,
     );
     println!(
         "outcome: kind={} window={:?} highlighted={} activated={} {}",
@@ -471,6 +503,90 @@ fn run_focus_receive_subcommand(args: &[String]) {
     }
     // Keep pumping so the overlay's async blocks execute and the runtime's
     // watcher thread can clear the highlight on schedule.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        run_main_loop();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// `halo_manual badges [clear_after_ms]` (appended): S2 badge-layer
+/// verification rig. Shows the numbered badge (center label + four corner
+/// brackets) on every attached display — exactly what the multi-screen
+/// region wizard draws — without needing a camera, then optionally clears
+/// after `clear_after_ms`. Run with two or more displays to check each
+/// screen gets its own window and number.
+fn run_badges_subcommand(args: &[String]) {
+    let clear_after_ms: Option<u64> = args.get(2).and_then(|value| value.parse().ok());
+    // Optional third arg: highlight this corner of screen 1 after showing
+    // (exercises the set_active path: active corner brightens, others dim).
+    let active_corner = args.get(3).and_then(|value| match value.as_str() {
+        "tl" => Some(BadgeCorner::Tl),
+        "tr" => Some(BadgeCorner::Tr),
+        "br" => Some(BadgeCorner::Br),
+        "bl" => Some(BadgeCorner::Bl),
+        _ => None,
+    });
+    #[cfg(target_os = "macos")]
+    unsafe {
+        init_nsapp();
+    }
+    let geometries = subcommand_screen_geometries();
+    if geometries.is_empty() {
+        eprintln!("no screens detected; cannot show badges");
+        std::process::exit(2);
+    }
+    let screens: Vec<BadgeScreen> = geometries
+        .iter()
+        .enumerate()
+        .map(|(index, geometry)| BadgeScreen {
+            geometry: *geometry,
+            label: (index + 1).to_string(),
+        })
+        .collect();
+    println!(
+        "halo_manual badges: {} screen(s) clear_after={:?} active={:?}",
+        screens.len(),
+        clear_after_ms,
+        active_corner
+    );
+    for screen in &screens {
+        println!(
+            "  badge {}: board=({}, {}) {}x{}",
+            screen.label,
+            screen.geometry.x,
+            screen.geometry.y,
+            screen.geometry.width,
+            screen.geometry.height
+        );
+    }
+    let mut badge = BadgeLayer::new();
+    badge.show(&screens);
+    if let Some(corner) = active_corner {
+        // Small delay so the highlight lands after the reveal pass.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let mut badge = BadgeLayer::new();
+            badge.set_active(0, corner);
+            std::mem::forget(badge);
+        });
+    }
+    if let Some(delay_ms) = clear_after_ms {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let mut badge = BadgeLayer::new();
+            badge.hide();
+            std::mem::forget(badge);
+            println!("halo_manual badges: cleared after {delay_ms} ms");
+        });
+    }
+    // Keep pumping so the dispatch_async_f blocks execute and the badges
+    // stay visible until Ctrl-C (or until the optional clear fires).
     #[cfg(target_os = "macos")]
     unsafe {
         run_main_loop();
@@ -505,6 +621,105 @@ fn run_activate_subcommand(args: &[String]) {
     if !outcome.activated {
         std::process::exit(1);
     }
+}
+
+/// `halo_manual warp <board_x> <board_y>` (appended): S3 cursor-warp
+/// verification rig. Builds the local screen list with the same enumeration
+/// the app uses (CG global points on macOS), converts the given board point
+/// through `board_to_native`, and fires the REAL platform warper — the exact
+/// backend the engine calls on a region commit.
+///
+/// No overlay window is involved (cursor warping is not affected by the
+/// macOS CLI overlay compositing limitation), so no run loop is needed: the
+/// process reads the pointer position, warps, settles briefly for the
+/// system to apply the move, reads again, prints, and exits. The before /
+/// expected / after lines are meant to be cross-checked against
+/// `swift -e 'import AppKit; print(NSEvent.mouseLocation)'`, which reports
+/// the same point in a bottom-left-origin frame: expected_nsevent =
+/// (x, main_height - y).
+fn run_warp_subcommand(args: &[String]) {
+    let parse = |index: usize| -> f64 {
+        args.get(index)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| {
+                eprintln!("usage: halo_manual warp <board_x> <board_y>");
+                std::process::exit(2);
+            })
+    };
+    let board_x = parse(2);
+    let board_y = parse(3);
+    let screens: Vec<(String, OverlayScreenGeometry)> = subcommand_screen_geometries()
+        .into_iter()
+        .enumerate()
+        .map(|(index, geometry)| (format!("screen-{index}"), geometry))
+        .collect();
+    if screens.is_empty() {
+        eprintln!("no screens detected; cannot warp");
+        std::process::exit(2);
+    }
+    let Some((native_x, native_y)) = board_to_native(&screens, board_x, board_y) else {
+        eprintln!("no usable screen for the warp target");
+        std::process::exit(2);
+    };
+    let before = current_cursor_location();
+    let mut warper = create_cursor_warper();
+    let ok = warper.warp(native_x, native_y);
+    println!(
+        "halo_manual warp: board=({board_x},{board_y}) -> native=({native_x},{native_y}) accepted={ok} screens={}",
+        screens.len()
+    );
+    println!("before: {before:?}");
+    // Give the window server a beat to apply and settle the warp before the
+    // verification read (CGWarpMouseCursorPosition is synchronous-ish, but
+    // the pointer location can land a frame later).
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let after = current_cursor_location();
+    println!("after: {after:?}");
+    let reached = after
+        .map(|(ax, ay)| ((ax - native_x).powi(2) + (ay - native_y).powi(2)).sqrt() < 1.5)
+        .unwrap_or(false);
+    println!(
+        "verification: pointer {} the requested native point (delta check {reached}); cross-check with: swift -e 'import AppKit; print(NSEvent.mouseLocation)' (bottom-left origin: expected ({native_x}, {}))",
+        if reached { "reached" } else { "did NOT reach" },
+        main_display_height() - native_y
+    );
+    if !ok {
+        std::process::exit(1);
+    }
+    // Exit instead of pumping the main loop: warp needs no window and no
+    // dispatch queue, so a lingering process would only hold the terminal.
+}
+
+/// Current pointer position in CG global (top-left origin) coordinates;
+/// `None` when the platform cannot report it (or no readback API exists).
+#[cfg(target_os = "macos")]
+fn current_cursor_location() -> Option<(f64, f64)> {
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    let event = CGEvent::new(source).ok()?;
+    let point = event.location();
+    Some((point.x, point.y))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_cursor_location() -> Option<(f64, f64)> {
+    None
+}
+
+/// Main display height for the NSEvent cross-check note (bottom-left
+/// origin); 0 when unavailable.
+#[cfg(target_os = "macos")]
+fn main_display_height() -> f64 {
+    core_graphics::display::CGDisplay::main()
+        .bounds()
+        .size
+        .height
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main_display_height() -> f64 {
+    0.0
 }
 
 /// All attached macOS displays in CG global points — the identity mapping

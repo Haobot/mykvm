@@ -113,6 +113,13 @@ export async function saveLayout(layout: LayoutState): Promise<AppStateSnapshot>
   return invoke<AppStateSnapshot>('save_layout', { layout })
 }
 
+export async function haloDebugLog(message: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+  await invoke('halo_debug_log', { message })
+}
+
 export async function resetPairing(): Promise<AppStateSnapshot> {
   if (!isTauri()) {
     return {
@@ -462,44 +469,6 @@ export async function isPortableMode(): Promise<boolean> {
   return invoke<boolean>('is_portable_mode')
 }
 
-export type HaloVisual = 'idle' | 'candidate' | 'pulse' | 'suspended'
-
-export interface HaloTestOverlayOptions {
-  screenId: string
-  /** Screen-local logical point (halo center). */
-  x: number
-  y: number
-  visual: HaloVisual
-  /** 0..1 progress arc, only used when visual === 'candidate'. */
-  progress?: number
-  /** Debug-only halo diameter override (logical px); exercises the hot-resize path. */
-  diameter?: number
-}
-
-// FocusHalo P0 debug entry: draw/hide one halo frame on a local screen.
-export async function haloTestOverlay(options: HaloTestOverlayOptions): Promise<void> {
-  if (!isTauri()) {
-    return
-  }
-
-  await invoke('halo_test_overlay_show', {
-    screenId: options.screenId,
-    x: options.x,
-    y: options.y,
-    visual: options.visual,
-    progress: options.progress ?? null,
-    diameter: options.diameter ?? null,
-  })
-}
-
-export async function haloHideOverlay(): Promise<void> {
-  if (!isTauri()) {
-    return
-  }
-
-  await invoke('halo_test_overlay_hide')
-}
-
 // FocusHalo P1: tracking pipeline control + calibration flow.
 
 /** Calibration capture steps, in the order the backend expects. */
@@ -559,6 +528,126 @@ export async function haloEmergencyStop(): Promise<void> {
   }
 
   await invoke('halo_emergency_stop')
+}
+
+// FocusHalo S2: multi-screen region calibration wizard (转头切屏).
+
+/** Mirrors the Rust `HaloScreenCalPlanItem` (serde camelCase). */
+export interface HaloScreenCalPlanItem {
+  screenIndex: number
+  screenId: string
+  label: number
+  x: number
+  y: number
+  width: number
+  height: number
+  /** S4: the screen lives on an online peer device (no local badge). */
+  remote: boolean
+  /** S4: owning device's display name ("Mac mini"), empty for local. */
+  deviceName: string
+}
+
+/** Mirrors the Rust `HaloScreenCalProgress` (serde camelCase). */
+export interface HaloScreenCalProgress {
+  acceptedScreens: number
+  totalScreens: number
+  cornersDone: number
+}
+
+/** Mirrors the Rust `HaloScreenCalExtent` (serde camelCase). */
+export interface HaloScreenCalExtent {
+  screenIndex: number
+  screenId: string
+  label: number
+  widthDeg: number
+  heightDeg: number
+}
+
+/** Mirrors the Rust `HaloScreenCalSummary` (serde camelCase). */
+export interface HaloScreenCalSummary {
+  totalScreens: number
+  capturedAtMs: number
+  refU: number
+  refV: number
+  transAlphaYaw: number
+  transAlphaPitch: number
+  extents: HaloScreenCalExtent[]
+}
+
+export type HaloScreenCalCorner = 'tl' | 'tr' | 'br' | 'bl'
+
+/**
+ * Start the wizard: builds the plan (board x then y, numbered 1..N), shows
+ * the native badge layer, and returns the plan. Rejects when FocusHalo is
+ * not running (user-facing Chinese reason).
+ */
+export async function haloScreenCalBegin(): Promise<HaloScreenCalPlanItem[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return invoke<HaloScreenCalPlanItem[]>('halo_screen_cal_begin')
+}
+
+/** Highlight `corner` of the screen at `screenIndex` on the badge layer. */
+export async function haloScreenCalSetStep(
+  screenIndex: number,
+  corner: HaloScreenCalCorner,
+): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_screen_cal_set_step', { screenIndex, corner })
+}
+
+/** Capture the currently highlighted corner; validates on the backend. */
+export async function haloScreenCalCapture(
+  screenIndex: number,
+  corner: HaloScreenCalCorner,
+): Promise<HaloScreenCalProgress> {
+  if (!isTauri()) {
+    return { acceptedScreens: 0, totalScreens: 0, cornersDone: 0 }
+  }
+
+  return invoke<HaloScreenCalProgress>('halo_screen_cal_capture', { screenIndex, corner })
+}
+
+/** Persist the finished calibration into focus_halo and tear the wizard down. */
+export async function haloScreenCalFinish(): Promise<HaloScreenCalSummary> {
+  if (!isTauri()) {
+    throw new Error('Available only in the Tauri desktop runtime.')
+  }
+
+  return invoke<HaloScreenCalSummary>('halo_screen_cal_finish')
+}
+
+/** Cancel the wizard: hide the badges, drop plan/corners. */
+export async function haloScreenCalCancel(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('halo_screen_cal_cancel')
+}
+
+/** Mirrors the Rust `HaloLeanStatus` (serde camelCase, internally tagged). */
+export type HaloLeanStatus =
+  | { stage: 'reference'; refU: number; refV: number }
+  | { stage: 'fitted'; transAlphaYaw: number; transAlphaPitch: number }
+
+/**
+ * S4 lean capture (two-step protocol): the first call records the reference
+ * pose, the second call (after the user physically shifts seat) fits the
+ * translation-compensation coefficients, persists them and pushes them to a
+ * running engine.
+ */
+export async function haloScreenCalLean(): Promise<HaloLeanStatus> {
+  if (!isTauri()) {
+    throw new Error('Available only in the Tauri desktop runtime.')
+  }
+
+  return invoke<HaloLeanStatus>('halo_screen_cal_lean')
 }
 
 /**

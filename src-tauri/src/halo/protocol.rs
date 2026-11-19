@@ -24,16 +24,19 @@ pub const RESEND_SUPPRESS: Duration = Duration::from_millis(150);
 /// slower heartbeat: the receiver auto-clears its highlight after 5 s, so an
 /// unchanged state (a long dwell) must be refreshed to stay visible.
 pub const UNCHANGED_REFRESH: Duration = Duration::from_secs(1);
-/// Coordinate quantum (layout-board logical pixels) for the "same event"
-/// comparison: a halo parked on a window jitters by a few pixels, and those
-/// micro-moves must not count as state changes.
+/// Coordinate quantum (logical pixels) for the "same event" comparison: a
+/// halo parked on a window jitters by a few pixels, and those micro-moves
+/// must not count as state changes.
 pub const COORD_QUANTUM: f64 = 5.0;
 
 /// One focus event directed at a peer screen. `screen_id` is the target
-/// screen's id from the shared layout board; `x`/`y` are the landing point in
-/// layout-board logical coordinates (the shared coordinate space every
-/// machine's screens are announced into), so the receiver can hit-test the
-/// point against its own windows directly.
+/// screen's id from the sender's layout board (the receiver suffix-normalizes
+/// it against its own screen ids); `x`/`y` are the landing point in the
+/// TARGET screen's own logical coordinates (origin = that screen's top-left
+/// corner, unit = logical pixels). Layout boards are localized per machine
+/// and not synchronized across peers, so board coordinates would be
+/// meaningless to the receiver; screen-local points convert through the
+/// selected screen's geometry on both ends.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum HaloFocusEvent {
@@ -49,6 +52,17 @@ pub enum HaloFocusEvent {
     /// it.
     #[serde(rename_all = "camelCase")]
     Activate { screen_id: String, x: f64, y: f64 },
+    /// S4 cross-machine takeover landing: the sender's head-turn engine
+    /// committed a region whose screen belongs to the receiver. The receiver
+    /// warps its own cursor to (x, y) (screen-local logical coordinates,
+    /// converted to native through the selected screen's geometry) and
+    /// activates the window under the point — an `Activate` plus a pointer
+    /// warp, marking the moment control intent moved to this machine. Input
+    /// still flows through the normal controller path afterwards (see the
+    /// pump-side dispatch notes in lib.rs); Land only places the peer's
+    /// cursor and focus where the user's head already is.
+    #[serde(rename_all = "camelCase")]
+    Land { screen_id: String, x: f64, y: f64 },
     /// The halo left the edge (or the sender's pipeline stopped): the peer
     /// clears its highlight.
     Clear,
@@ -68,6 +82,7 @@ impl HaloFocusEvent {
             HaloFocusEvent::Edge { x, y, .. } => ("edge", point(*x, *y)),
             HaloFocusEvent::Candidate { x, y, .. } => ("candidate", point(*x, *y)),
             HaloFocusEvent::Activate { x, y, .. } => ("activate", point(*x, *y)),
+            HaloFocusEvent::Land { x, y, .. } => ("land", point(*x, *y)),
             HaloFocusEvent::Clear => ("clear", None),
         }
     }
@@ -224,6 +239,44 @@ mod tests {
             HaloFocusPacket::new("a".into(), "c".into(), "s".into(), HaloFocusEvent::Clear, 1);
         let decoded = decode_halo_focus_packet(&packet.encode().expect("encode")).expect("decode");
         assert_eq!(decoded.event, HaloFocusEvent::Clear);
+    }
+
+    #[test]
+    fn land_variant_roundtrips_and_keeps_its_own_dedupe_space() {
+        let land = HaloFocusEvent::Land {
+            screen_id: "peer-s".into(),
+            x: 120.0,
+            y: 340.5,
+        };
+        let decoded = decode_halo_focus_packet(
+            &HaloFocusPacket::new("a".into(), "c".into(), "s".into(), land.clone(), 3)
+                .encode()
+                .expect("encode"),
+        )
+        .expect("land roundtrips");
+        assert_eq!(decoded.event, land);
+        let wire = decoded.encode().expect("re-encode");
+        let text = String::from_utf8_lossy(&wire);
+        assert!(text.contains("land"), "kind tag in wire format: {text}");
+        // Same point as an Activate: a different variant tag is a state
+        // change, so a takeover landing right after a dwell activation is
+        // never collapsed by the throttle.
+        let activate = HaloFocusEvent::Activate {
+            screen_id: "peer-s".into(),
+            x: 120.0,
+            y: 340.5,
+        };
+        assert_ne!(land.dedupe_key(), activate.dedupe_key());
+        assert_eq!(
+            land.dedupe_key(),
+            HaloFocusEvent::Land {
+                screen_id: "other".into(),
+                x: 120.0,
+                y: 340.5
+            }
+            .dedupe_key(),
+            "coordinates dominate the key; screen_id rides in the payload"
+        );
     }
 
     #[test]

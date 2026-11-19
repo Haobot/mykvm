@@ -130,57 +130,72 @@ unsafe fn init_nsapp() {
     );
 }
 
-/// pid of the frontmost application (0 when unavailable or when our own
-/// process is frontmost — the pure filter drops our own windows anyway).
-/// Note: the caller's context is expected to have a shared NSApplication
-/// (the Tauri app always does); otherwise the pid reads 0 and no window is
-/// marked foreground.
-unsafe fn nsworkspace_frontmost_pid() -> u32 {
-    let pool = objc_autoreleasePoolPush();
-    let workspace = object(
-        objc_getClass(b"NSWorkspace\0".as_ptr().cast()),
-        b"sharedWorkspace\0",
-    );
-    let application = object(workspace, b"frontmostApplication\0");
-    let pid = int(application, b"processIdentifier\0");
-    objc_autoreleasePoolPop(pool);
-    pid.max(0) as u32
+// ---------------------------------------------------------------------------
+// Process names via libproc (thread-safe replacement for NSWorkspace)
+//
+// NSWorkspace / NSRunningApplication are NOT safe off the main thread:
+// `localizedName` (and even `processIdentifier` when it lazily fetches
+// dynamic properties) resolves through LaunchServices, and that XPC can
+// block indefinitely when driven from a background thread. Observed live on
+// 2026-11-05: the halo engine thread (which calls enumerate at ~3 Hz via
+// the 300 ms cache) wedged inside
+// `-[NSRunningApplication _fetchDynamicProperties] ->
+//  _LSCopyApplicationInformation`, freezing the whole tracking pipeline and
+// the halo ring. libproc's sysctl-backed calls have no such hazard, so the
+// enumerate path resolves pid -> app name through proc_pidpath instead.
+// ---------------------------------------------------------------------------
+
+#[link(name = "proc")]
+extern "C" {
+    fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
+    fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
 }
 
-/// pid to preferred app name (`localizedName`, falling back to
-/// `bundleIdentifier`) for the running applications NSWorkspace knows about.
-unsafe fn ns_app_names_by_pid() -> HashMap<u32, String> {
-    let pool = objc_autoreleasePoolPush();
-    let mut names = HashMap::new();
-    let workspace = object(
-        objc_getClass(b"NSWorkspace\0".as_ptr().cast()),
-        b"sharedWorkspace\0",
+/// pid -> friendly app name for every running process: the `.app` bundle
+/// component of the executable path when there is one, else the binary
+/// name. Replaces the old NSWorkspace map (used for blacklist matching and
+/// telemetry); CGWindowList's `kCGWindowOwnerName` stays the fallback for
+/// pids the list misses.
+unsafe fn proc_app_names_by_pid() -> HashMap<u32, String> {
+    let mut pids = [0i32; 2048];
+    let count = proc_listallpids(
+        pids.as_mut_ptr(),
+        (pids.len() * std::mem::size_of::<i32>()) as i32,
     );
-    let applications = object(workspace, b"runningApplications\0");
-    let count = uint(applications, b"count\0");
-    let send_indexed: unsafe extern "C" fn(*mut c_void, *mut c_void, u64) -> *mut c_void =
-        std::mem::transmute(objc_msgSend as *const ());
-    for index in 0..count.min(1024) {
-        let application = send_indexed(
-            applications,
-            sel_registerName(b"objectAtIndexedSubscript:\0".as_ptr().cast()),
-            index,
-        );
-        if application.is_null() {
-            continue;
-        }
-        let pid = int(application, b"processIdentifier\0");
+    if count <= 0 {
+        return HashMap::new();
+    }
+    let mut names = HashMap::new();
+    for &pid in &pids[..count as usize] {
         if pid <= 0 {
             continue;
         }
-        let name = string(object(application, b"localizedName\0"))
-            .or_else(|| string(object(application, b"bundleIdentifier\0")));
-        if let Some(name) = name {
+        let mut buffer = [0u8; 4096];
+        let len = proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32);
+        if len <= 0 {
+            continue;
+        }
+        let path =
+            std::str::from_utf8(&buffer[..(len as usize).min(buffer.len())]).unwrap_or_default();
+        let name = app_name_from_path(path);
+        if !name.is_empty() {
             names.insert(pid as u32, name);
         }
     }
-    objc_autoreleasePoolPop(pool);
     names
+}
+
+/// `"/Applications/Foo.app/Contents/MacOS/Foo"` -> `"Foo"` (the bundle name
+/// matches what NSWorkspace's `localizedName` reported for bundle apps);
+/// any other path -> its last component.
+fn app_name_from_path(path: &str) -> String {
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    if components.len() >= 4 {
+        if let Some(stripped) = components[components.len() - 4].strip_suffix(".app") {
+            return stripped.to_string();
+        }
+    }
+    components.last().copied().unwrap_or_default().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -410,8 +425,15 @@ impl RawEnumerator for MacOSWindowService {
             .ok_or_else(|| "CGWindowListCopyWindowInfo returned no array".to_string())?;
         unsafe {
             let pool = objc_autoreleasePoolPush();
-            let frontmost_pid = nsworkspace_frontmost_pid();
-            let app_names = ns_app_names_by_pid();
+            // Thread-safe replacements for the NSWorkspace calls this used to
+            // make (see the libproc section above): app names come from
+            // proc_pidpath, and the frontmost pid is derived from the very
+            // list being iterated — CGWindowList returns z-order front to
+            // back, so the first layer-0 window that is not our own process
+            // belongs to the frontmost application.
+            let app_names = proc_app_names_by_pid();
+            let own_pid = std::process::id();
+            let mut frontmost_pid: u32 = 0;
             let array_ref = array.as_concrete_TypeRef();
 
             let mut raw = Vec::new();
@@ -436,6 +458,9 @@ impl RawEnumerator for MacOSWindowService {
                 let Some(frame) = cf_bounds(&dict) else {
                     continue;
                 };
+                if frontmost_pid == 0 && pid > 0 && pid as u32 != own_pid {
+                    frontmost_pid = pid as u32;
+                }
                 let owner_name = cf_string(&dict, kCGWindowOwnerName).unwrap_or_default();
                 let process = app_names
                     .get(&(pid as u32))
@@ -463,7 +488,6 @@ impl RawEnumerator for MacOSWindowService {
             // each app once for its AX windows, matching frames to fill titles
             // in. Skipped when a screen-recording permission already provided
             // kCGWindowName values.
-            let own_pid = std::process::id();
             let mut pending: HashMap<u32, Vec<usize>> = HashMap::new();
             for (index, window) in raw.iter().enumerate() {
                 if window.title.is_empty() && window.pid != 0 && window.pid != own_pid {
@@ -534,6 +558,35 @@ mod tests {
     use super::*;
     use crate::halo::windows_layer::WindowService;
 
+    #[test]
+    fn app_name_from_path_extracts_the_bundle() {
+        // Bundle apps: the ".app" component three levels above the binary.
+        assert_eq!(
+            app_name_from_path("/Applications/Safari.app/Contents/MacOS/Safari"),
+            "Safari"
+        );
+        assert_eq!(
+            app_name_from_path("/Users/x/Applications/My Tool.app/Contents/MacOS/My Tool"),
+            "My Tool"
+        );
+        // Helpers and bare binaries: last component.
+        assert_eq!(app_name_from_path("/usr/libexec/spotlight"), "spotlight");
+        assert_eq!(app_name_from_path("/bin/zsh"), "zsh");
+        // Degenerate inputs: empty, not a path.
+        assert_eq!(app_name_from_path(""), "");
+        assert_eq!(app_name_from_path("/"), "");
+    }
+
+    /// libproc resolution must produce a non-empty map on any live session
+    /// (this test binary itself is running) and must never block - a hang
+    /// here would reproduce the LaunchServices wedge it replaced.
+    #[test]
+    fn proc_app_names_resolves_live_pids() {
+        let names = unsafe { proc_app_names_by_pid() };
+        assert!(!names.is_empty(), "at least this process should resolve");
+        assert!(names.contains_key(&std::process::id()));
+    }
+
     /// Live-desktop integration test: real window server, real AX, real
     /// NSWorkspace. Not part of the default run.
     #[test]
@@ -547,8 +600,11 @@ mod tests {
         // Raw pass first: no candidate may belong to our own process.
         let own_pid = std::process::id();
         unsafe {
-            let frontmost = nsworkspace_frontmost_pid();
-            println!("diagnostics: own pid={own_pid}, NSWorkspace frontmost pid={frontmost}");
+            let names = proc_app_names_by_pid();
+            println!(
+                "diagnostics: own pid={own_pid}, libproc knows {} app names",
+                names.len()
+            );
         }
         let mut backend = MacOSWindowService;
         let (raw, _) = backend.enumerate_raw(&screens).expect("raw enumerate");

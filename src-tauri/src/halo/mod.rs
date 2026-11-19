@@ -21,13 +21,18 @@ pub mod mapping;
 pub mod overlay;
 pub mod params;
 pub mod protocol;
+pub mod screen_map;
 pub mod smoothing;
 pub mod state_machine;
 pub mod tracker;
+pub mod warp;
 pub mod windows_layer;
 
 pub use activator::{create_activator, ActivationOutcome, WindowActivator};
-pub use engine::{spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase};
+pub use engine::{
+    spawn as spawn_engine, DebugSnapshot, EngineCommand, EngineConfig, EnginePhase, RemoteSwitch,
+    ScreenEntry,
+};
 pub use filter::OneEuroFilter;
 pub use focus_router::{
     apply_focus_event, install_receive_hook, BoardScreen, FocusDisplayOutcome, FocusEmission,
@@ -35,7 +40,10 @@ pub use focus_router::{
 };
 pub use input_probe::{InputActivityProbe, NullProbe, SystemInputProbe};
 pub use mapping::{map_pose, CalibrationProfile};
-pub use overlay::{BorderFrame, HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry};
+pub use overlay::{
+    badge::{BadgeCorner, BadgeLayer, BadgeScreen},
+    BorderFrame, HaloFrame, HaloVisual, OverlayBackend, OverlayScreenGeometry,
+};
 pub use params::FocusHaloSettings;
 pub use protocol::{
     decode_halo_focus_packet, FocusSender, HaloFocusEvent, HaloFocusPacket, HALO_FOCUS_PROTOCOL,
@@ -44,6 +52,7 @@ pub use state_machine::{
     advance as advance_dwell, DwellConfig, DwellPhase, DwellState, SwitchEvent,
 };
 pub use tracker::{default_models_dir, Frame, HeadSample, PoseEngine};
+pub use warp::{create_cursor_warper, CursorWarper, WarpRecorder};
 pub use windows_layer::{create_window_service, WindowInfo, WindowService};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -52,6 +61,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::halo::screen_map::ScreenCalibration;
 use tracker::camera::CameraControl;
 
 /// How long a remote-focus highlight stays on screen without a refresh
@@ -145,6 +155,11 @@ pub struct HaloRuntime {
     /// the window so its pixel size follows the setting.
     built_diameter: f64,
     geometry: Option<OverlayScreenGeometry>,
+    /// S3: every local screen in board space, handed to the engine so a
+    /// region commit can switch screens and warp the pointer. Kept on the
+    /// runtime so the next enable picks up the current topology without the
+    /// caller having to re-push it.
+    screens: Vec<ScreenEntry>,
     /// Live while running: signals the tracker thread to stop (its loop owns
     /// the camera object, so all camera calls stay on one thread).
     tracker_stop: Option<Arc<AtomicBool>>,
@@ -152,9 +167,12 @@ pub struct HaloRuntime {
     engine_handle: Option<JoinHandle<()>>,
     engine_cmd_tx: Option<std::sync::mpsc::Sender<EngineCommand>>,
     engine_debug_rx: Option<Receiver<DebugSnapshot>>,
-    /// Latest raw (yaw, pitch) from the tracker, for the calibration capture
-    /// flow. `None` whenever the last inference found no face.
-    latest_raw_pose: Arc<Mutex<Option<(f64, f64)>>>,
+    /// Latest raw (yaw, pitch, u, v) from the tracker, for the calibration
+    /// capture flows. `u`/`v` are the normalized face-center position (see
+    /// `tracker::HeadSample`) and are consumed by the multi-screen region
+    /// calibration's seat compensation. `None` whenever the last inference
+    /// found no face.
+    latest_raw_pose: Arc<Mutex<Option<(f64, f64, f64, f64)>>>,
     /// Camera health as of the last successful/failed enable, surfaced by
     /// `halo_get_status`.
     camera_ok: bool,
@@ -179,6 +197,7 @@ impl HaloRuntime {
             overlay: None,
             built_diameter: 0.0,
             geometry: None,
+            screens: Vec::new(),
             tracker_stop: None,
             tracker_handle: None,
             engine_handle: None,
@@ -242,6 +261,7 @@ impl HaloRuntime {
             self.settings = settings;
             self.calibration = calibration;
             self.geometry = Some(screen);
+            self.forward(EngineCommand::SetScreens(self.screens.clone()));
             self.forward(EngineCommand::SetSettings(self.settings.clone()));
             self.forward(EngineCommand::SetCalibration(calibration));
             self.forward(EngineCommand::SetScreen(screen));
@@ -325,6 +345,13 @@ impl HaloRuntime {
             // switches through this backend.
             activator: activator::create_activator(),
             screen,
+            // S3 region switching: the caller pushes the live screen list via
+            // `set_screens` (kept on the runtime), the calibration travels
+            // inside the settings snapshot, and the warper is the platform
+            // cursor warp backend.
+            screens: self.screens.clone(),
+            screen_calibration: settings.screen_calibration.clone(),
+            warper: warp::create_cursor_warper(),
         };
         let (engine_handle, engine_cmd_tx, engine_debug_rx) = engine::spawn(
             config,
@@ -465,9 +492,29 @@ impl HaloRuntime {
         }
     }
 
-    /// Latest raw head pose for the calibration capture flow: `None` while
-    /// disabled or whenever the last inference found no face.
-    pub(crate) fn latest_pose(&self) -> Option<(f64, f64)> {
+    /// S3: replace the whole local-screen list (display topology changed).
+    /// Stored for the next enable and forwarded to a running engine as
+    /// [`EngineCommand::SetScreens`]; the engine's region path uses the list
+    /// to re-host the overlay and to convert warp targets to native coords.
+    pub fn set_screens(&mut self, screens: Vec<ScreenEntry>) {
+        self.screens = screens;
+        if self.is_running() {
+            self.forward(EngineCommand::SetScreens(self.screens.clone()));
+        }
+    }
+
+    /// S3: replace the multi-screen calibration; forwarded to a running
+    /// engine (used by the recenter flow, which shifts every region's quad).
+    pub(crate) fn set_screen_calibration(&mut self, calibration: Option<ScreenCalibration>) {
+        if self.is_running() {
+            self.forward(EngineCommand::SetScreenCalibration(calibration));
+        }
+    }
+
+    /// Latest raw head pose plus face-center position for the calibration
+    /// capture flows: `None` while disabled or whenever the last inference
+    /// found no face.
+    pub(crate) fn latest_pose(&self) -> Option<(f64, f64, f64, f64)> {
         self.latest_raw_pose.lock().ok().and_then(|latest| *latest)
     }
 
@@ -688,7 +735,7 @@ fn run_tracker(
     frame_rx: Receiver<Frame>,
     sample_tx: SyncSender<HeadSample>,
     gate: Arc<Mutex<FrameGate>>,
-    latest_raw_pose: Arc<Mutex<Option<(f64, f64)>>>,
+    latest_raw_pose: Arc<Mutex<Option<(f64, f64, f64, f64)>>>,
     stop: Arc<AtomicBool>,
 ) {
     loop {
@@ -708,7 +755,7 @@ fn run_tracker(
         let sample = pose_engine.infer(&frame);
         if let Ok(mut latest) = latest_raw_pose.lock() {
             *latest = if sample.face_detected {
-                Some((sample.yaw_deg, sample.pitch_deg))
+                Some((sample.yaw_deg, sample.pitch_deg, sample.u, sample.v))
             } else {
                 None
             };

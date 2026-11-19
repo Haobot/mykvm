@@ -33,6 +33,44 @@ export interface HaloCalibration {
   downPitch: number
 }
 
+/** Mirrors the Rust `halo::screen_map::PosePoint` (serde camelCase). */
+export interface HaloPosePoint {
+  yaw: number
+  pitch: number
+  u: number
+  v: number
+}
+
+/** Mirrors the Rust `halo::screen_map::BoardRect` (serde camelCase). */
+export interface HaloBoardRect {
+  screenId: string
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** Mirrors the Rust `halo::screen_map::ScreenRegion` (serde camelCase). */
+export interface HaloScreenRegion {
+  screenId: string
+  board: HaloBoardRect
+  tl: HaloPosePoint
+  tr: HaloPosePoint
+  br: HaloPosePoint
+  bl: HaloPosePoint
+}
+
+/** Mirrors the Rust `halo::screen_map::ScreenCalibration` (serde camelCase). */
+export interface HaloScreenCalibration {
+  version: number
+  capturedAtMs: number
+  regions: HaloScreenRegion[]
+  refU: number
+  refV: number
+  transAlphaYaw: number
+  transAlphaPitch: number
+}
+
 /** Mirrors the Rust `halo::FocusHaloSettings` (serde camelCase). */
 export interface FocusHaloSettings {
   enabled: boolean
@@ -60,6 +98,18 @@ export interface FocusHaloSettings {
   recenterHotkey: string
   /** Captured calibration; absent until the first successful capture. */
   calibration?: HaloCalibration | null
+  /** 转头切屏 master switch (S1 schema stability; consumed in S2+). */
+  screenWarpEnabled?: boolean
+  showHalo?: boolean
+  /** New-region hysteresis window in ms. */
+  regionSettleMs?: number
+  /** Dilatation factor around a region centroid (1.0 = no tolerance). */
+  regionMargin?: number
+  /** Seat-translation compensation, deg per normalized unit. */
+  transAlphaYaw?: number
+  transAlphaPitch?: number
+  /** Per-screen pose quads; absent until the first multi-screen calibration. */
+  screenCalibration?: HaloScreenCalibration | null
 }
 
 /** Mirrors the Rust `HaloStatus` (serde camelCase). */
@@ -67,6 +117,8 @@ export interface HaloStatus {
   running: boolean
   cameraOk: boolean
   reason: string | null
+  /** Multi-screen calibration vs live topology: null before any calibration. */
+  screenTopologyOk?: boolean | null
 }
 
 /** Mirrors the Rust `halo::DebugSnapshot` (serde camelCase, phase snake_case). */
@@ -81,6 +133,16 @@ export interface HaloDebugSnapshot {
   normY: number
   speedNorm: number
   phase: 'idle' | 'suspended_face' | 'suspended_input'
+  /** 转头切屏：当前生效区域对应的屏幕 id（单屏模式为 null）。 */
+  activeScreenId?: string | null
+  /** 转头切屏：本快照窗口内发生了区域切换（引擎仅在提交 tick 置位）。 */
+  screenSwitched?: boolean
+  /** S4 跨机切屏：本快照 tick 锁存的远程落点（仅提交 tick 出现）。 */
+  remoteSwitch?: {
+    screenId: string
+    boardX: number
+    boardY: number
+  } | null
 }
 
 export interface PairedController {

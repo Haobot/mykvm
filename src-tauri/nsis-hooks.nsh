@@ -21,7 +21,21 @@ Var MyKvmExecResult
     ${If} $MyKvmWaitTries >= 40
       nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM mykvm.exe'
       Pop $MyKvmExecResult
-      ${Break}
+      Sleep 500
+      ; taskkill can be refused (permissions, security software, sandboxed
+      ; tokens). A still-running mykvm.exe would lock the file and surface
+      ; later as a cryptic "Error opening file for writing" retry loop, so
+      ; verify the kill worked and hand the decision to the user instead.
+      nsExec::Exec '"$SYSDIR\cmd.exe" /c tasklist /FI "IMAGENAME eq mykvm.exe" /NH | findstr /I "mykvm.exe"'
+      Pop $MyKvmExecResult
+      ${If} $MyKvmExecResult == 0
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "MyKVM is still running and could not be closed automatically.$\r$\n$\r$\nPlease quit it yourself (tray icon menu, or Task Manager) and click Retry.$\r$\nCancel stops the installation." IDRETRY mykvm_still_running_retry
+        Abort "MyKVM is still running; installation cancelled."
+        mykvm_still_running_retry:
+          StrCpy $MyKvmWaitTries 0
+      ${Else}
+        ${Break}
+      ${EndIf}
     ${EndIf}
     Sleep 200
   ${Loop}
