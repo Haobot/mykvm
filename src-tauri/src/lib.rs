@@ -39,6 +39,7 @@ mod native_drag;
 mod performance;
 mod quic_transport;
 mod rich_clipboard;
+pub use mykvm_flash_core as screen_flash;
 pub mod shared_input;
 #[cfg(any(target_os = "windows", test))]
 mod shortcut_keys;
@@ -123,6 +124,8 @@ const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const AUTOSTART_ARG: &str = "--mykvm-autostart";
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
+#[cfg(target_os = "macos")]
+const FLASH_ARG: &str = "--flash";
 #[allow(dead_code)] // Windows 服务安装参数；mac 构建上无用
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
 #[allow(dead_code)] // Windows 服务安装参数；mac 构建上无用
@@ -1878,36 +1881,11 @@ fn open_log_directory(app: AppHandle) -> Result<(), String> {
     open_external_path(&log_dir)
 }
 
-/// 连续点击时区分每次光圈窗口的标签，叠开的窗口各自独立倒计时关闭。
-static SCREEN_FLASH_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// 与 NSRect 同布局（原点在主屏左下、y 向上，点坐标）。
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NsRect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-}
-
-// objc2 要求 msg_send 的返回/参数类型实现 Encode；四个 f64 与 NSRect 的
-// ABI 完全一致。
-#[cfg(target_os = "macos")]
-unsafe impl objc2::encode::Encode for NsRect {
-    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Array(4, &f64::ENCODING);
-}
-
-/// 光圈提示窗口的停留时长：与页面里 3 拍脉冲动画（约 1.35s）对齐。
-const SCREEN_FLASH_DURATION: Duration = Duration::from_millis(1400);
-
 /// 布局画布点击磁贴后，在对应的物理显示器上闪一圈光圈，让用户知道
-/// "这块画布磁贴 = 这块真实屏幕"。窗口透明、置顶、点击穿透，到时自关。
+/// "这块画布磁贴 = 这块真实屏幕"。原生窗口透明、置顶、点击穿透，到时自关。
 /// 仅本机屏可以点亮：远端屏属于对端机器，物理上够不着。
 #[tauri::command]
 fn flash_screen_indicator(
-    app: AppHandle,
     state: tauri::State<'_, AppRuntime>,
     screen_id: String,
 ) -> Result<(), String> {
@@ -1933,86 +1911,43 @@ fn flash_screen_indicator(
             screen.height as f64,
         )
     };
-    run_screen_flash_window(&app, x, y, width, height)
+    run_screen_flash((x, y, width, height));
+    Ok(())
 }
 
-/// 在逻辑矩形对应的物理显示器上闪光圈窗口。本机画布点击与被控端收到
-/// FlashScreen 事件共用这一条路径。
-fn run_screen_flash_window(
-    app: &AppHandle,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    let label = format!(
-        "screen-flash-{}",
-        SCREEN_FLASH_SEQ.fetch_add(1, Ordering::SeqCst)
-    );
-    let app_for_window = app.clone();
-    app.run_on_main_thread(move || {
-        let builder = WebviewWindowBuilder::new(
-            &app_for_window,
-            &label,
-            WebviewUrl::App("screen-indicator.html".into()),
-        )
-        .position(x, y)
-        .inner_size(width.max(80.0), height.max(60.0))
-        .decorations(false)
-        .transparent(true)
-        // WebView2 paints its default WHITE background for the first frame(s)
-        // before the indicator page's CSS composites — the fullscreen white
-        // flash seen ahead of the blue ring. A fully transparent default
-        // background removes it (wry maps alpha=0 to WebView2 transparent on
-        // Windows; a no-op elsewhere).
-        .background_color(tauri::utils::config::Color(0, 0, 0, 0))
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .minimizable(false)
-        .maximizable(false)
-        .closable(true)
-        .focused(false)
-        // Create hidden and show only after the indicator page finished
-        // loading: WebView2 still paints its default white for the window's
-        // first frames even with a transparent webview background, and that
-        // white flash reaches the screen before the CSS ring composites.
-        // An invisible window cannot flash; the page-load event (a bundled
-        // local asset) is what makes it appear.
-        .visible(false)
-        .on_page_load(move |indicator, payload| {
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
-                // Finished only means the DOM is ready — WebView2's compositor
-                // may still owe the window its first presented frame, and
-                // showing before that hand-off exposes the opaque base. Give
-                // it two vsyncs, then reveal the fully composited ring.
-                let indicator = indicator.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(60));
-                    let _ = indicator.show();
-                });
-            }
-        });
-        let window = match builder.build() {
-            Ok(window) => window,
-            Err(error) => {
-                log::warn!("failed to open screen indicator window: {error}");
-                return;
-            }
-        };
-        let _ = window.set_ignore_cursor_events(true);
-        #[cfg(target_os = "windows")]
-        clear_screen_indicator_border(&window);
-        #[cfg(target_os = "macos")]
-        style_screen_indicator_window(window.ns_window().ok(), (x, y, width, height));
-        std::thread::spawn(move || {
-            std::thread::sleep(SCREEN_FLASH_DURATION);
-            if let Err(error) = window.close() {
-                log::debug!("screen indicator window already closed: {error}");
-            }
-        });
-    })
-    .map_err(|error| format!("failed to dispatch to main thread: {error}"))
+/// 闪光统一入口。macOS 走独立进程（BUG-005：Tauri 进程内创建的跨显示器
+/// NSWindow 无法进入窗口服务器的当前 Space，同代码独立进程实测可见），
+/// 以 `mykvm --flash x y w h` 复用主程序二进制；spawn 失败（极端环境）回退
+/// 进程内实现。Windows/Linux 保持进程内实现。
+fn run_screen_flash(rect: (f64, f64, f64, f64)) {
+    #[cfg(target_os = "macos")]
+    match spawn_flash_helper(rect) {
+        Ok(()) => return,
+        Err(error) => {
+            log::info!("screen flash helper spawn failed ({error}); falling back in-process");
+        }
+    }
+    screen_flash::flash_logical_rect(rect);
+}
+
+/// 以本二进制 + `--flash` 参数拉起独立闪光进程。返回 Err 表示起不来，
+/// 由调用方回退进程内实现。
+#[cfg(target_os = "macos")]
+fn spawn_flash_helper(rect: (f64, f64, f64, f64)) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| format!("current_exe: {error}"))?;
+    let (x, y, width, height) = rect;
+    let args = [
+        FLASH_ARG.to_string(),
+        x.to_string(),
+        y.to_string(),
+        width.to_string(),
+        height.to_string(),
+    ];
+    std::process::Command::new(&exe)
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("spawn: {error}"))
 }
 
 /// 布局画布点选远端（被控）磁贴：通过 QUIC 输入通道向对端发 FlashScreen
@@ -2035,117 +1970,6 @@ fn flash_peer_screen(state: tauri::State<'_, AppRuntime>, screen_id: String) -> 
         .map_err(|_| "native layout lock poisoned".to_string())?;
     let input_events = Arc::clone(&state.input_events);
     input::send_flash_screen_to_peer(&layout, &native, &screen_id, &transport, &input_events)
-}
-
-/// Win11 still draws a ~1px DWM border around undecorated windows — white on
-/// the light theme, hugging the fullscreen indicator window and reading as an
-/// enlarged white frame behind the blue ring (macOS draws no system chrome on
-/// borderless windows). DWMWA_COLOR_NONE removes it outright, matching the
-/// macOS look where only the CSS ring is visible.
-///
-/// The DWM show transition must go too: Win11 animates a newly shown window
-/// scaling up from small to full size, and until WebView2 presents its first
-/// frame that animated surface is the opaque window base — the white box
-/// "growing" over the screen ahead of the ring. macOS shows this window
-/// without any open animation, so disabling it is also visual parity.
-#[cfg(target_os = "windows")]
-fn clear_screen_indicator_border(window: &tauri::WebviewWindow) {
-    use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
-        DWMWA_TRANSITIONS_FORCEDISABLED,
-    };
-
-    if let Ok(hwnd) = window.hwnd() {
-        let hwnd = hwnd.0 as HWND;
-        let no_border = DWMWA_COLOR_NONE as u32;
-        let no_transition = 1u32;
-        unsafe {
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_BORDER_COLOR as u32,
-                &no_border as *const u32 as *const c_void,
-                std::mem::size_of::<u32>() as u32,
-            );
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                &no_transition as *const u32 as *const c_void,
-                std::mem::size_of::<u32>() as u32,
-            );
-        }
-    }
-}
-
-/// tauri 的 always-on-top 是 floating 层（3），会被菜单栏（25）和程序坞
-/// （20）遮住光圈的上/下边缘；抬到 NSScreenSaverWindowLevel（1000）并
-/// 允许跨空间显示，保证屏幕四边都能看到。
-///
-/// 定位不走 tao 的 builder 坐标：tao 把逻辑 y 翻转成 Cocoa 坐标时用的是
-/// 主屏的**物理像素高**（`CGDisplay::main().pixels_high()`），而传入值是
-/// **点**——Retina 主屏（scale 2）下整屏坐标系统性偏移一个主屏高度，
-/// 只有恰好贴原点的屏看起来正常。改为在 NSScreen 列表里按点级几何匹配
-/// 目标屏，直接用它自己的 Cocoa frame 设窗口，完全绕开换算。
-#[cfg(target_os = "macos")]
-fn style_screen_indicator_window(
-    ns_window: Option<*mut std::ffi::c_void>,
-    target: (f64, f64, f64, f64),
-) {
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
-
-    let Some(ns_window) = ns_window else {
-        return;
-    };
-    unsafe {
-        let window = &*(ns_window as *const AnyObject);
-        let _: () = msg_send![window, setLevel: 1000_i64];
-        // NSWindowCollectionBehaviorCanJoinAllSpaces (1<<0)
-        // | NSWindowCollectionBehaviorFullScreenAuxiliary (1<<8)
-        let _: () = msg_send![window, setCollectionBehavior: 257_usize];
-
-        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-        let count: usize = msg_send![screens, count];
-        if count == 0 {
-            return;
-        }
-        // NSScreen.screens[0] 是带菜单栏的主屏；frame 是点坐标（Cocoa 坐标
-        // 系，原点在主屏左下角），先把每块屏换算回"左上原点、y 向下"的
-        // 可视坐标再与 native_layout 的逻辑矩形匹配。
-        let first: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
-        let main_frame: NsRect = msg_send![first, frame];
-        let main_height = main_frame.h;
-        let (tx, ty, tw, th) = target;
-        for index in 0..count {
-            let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
-            let frame: NsRect = msg_send![screen, frame];
-            let visual_y = main_height - (frame.y + frame.h);
-            let same_size = (frame.w - tw).abs() < 1.0 && (frame.h - th).abs() < 1.0;
-            let same_origin = (frame.x - tx).abs() < 1.0 && (visual_y - ty).abs() < 1.0;
-            if same_size && same_origin {
-                let _: () = msg_send![window, setFrame: frame, display: true];
-                // 后台 app 建窗可能被 macOS 抑制显示：orderFrontRegardless
-                // 绕过激活检查强制上屏。
-                let _: () = msg_send![window, orderFrontRegardless];
-                let level: i64 = msg_send![window, level];
-                let frame_now: NsRect = msg_send![window, frame];
-                log::info!(
-                    "screen indicator covering display at cocoa ({:.0},{:.0}) [{:.0}x{:.0}] level={level} now=({:.0},{:.0})",
-                    frame.x,
-                    frame.y,
-                    frame.w,
-                    frame.h,
-                    frame_now.x,
-                    frame_now.y
-                );
-                return;
-            }
-        }
-        log::warn!(
-            "screen indicator: no NSScreen matched logical rect ({tx:.0},{ty:.0}) [{tw:.0}x{th:.0}]; keeping tao-positioned window"
-        );
-    }
 }
 
 #[tauri::command]
@@ -4872,10 +4696,51 @@ fn is_portable_mode() -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+/// 光圈独立进程模式：`mykvm --flash <x> <y> <w> <h>`。进程里只有
+/// NSApplication + 闪光窗，与独立探针完全等价（跨显示器窗口可正常进入
+/// 当前 Space 显示）；闪光窗 1.4s 自关，这里 2s 后 terminate 退出。
+#[cfg(target_os = "macos")]
+fn run_flash_mode(args: &[String]) {
+    let coords: Vec<f64> = args
+        .iter()
+        .skip_while(|arg| arg.as_str() != FLASH_ARG)
+        .skip(1)
+        .filter_map(|arg| arg.parse::<f64>().ok())
+        .take(4)
+        .collect();
+    if coords.len() < 4 {
+        eprintln!("usage: mykvm --flash <x> <y> <w> <h>");
+        return;
+    }
+    unsafe {
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send, sel};
+
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, setActivationPolicy: 1usize]; // accessory
+        screen_flash::flash_logical_rect((coords[0], coords[1], coords[2], coords[3]));
+        let _: () = msg_send![app,
+            performSelector: sel!(terminate:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: 2.0_f64
+        ];
+        let _: () = msg_send![app, run];
+    }
+}
+
 pub fn handle_process_control_args() -> bool {
     let args = env::args().collect::<Vec<_>>();
     if args.iter().any(|arg| arg == QUIT_EXISTING_ARG) {
         request_existing_instance_quit();
+        return true;
+    }
+
+    // 光圈独立进程模式（BUG-005）：Tauri 进程内创建的跨显示器 NSWindow
+    // 无法进入窗口服务器的当前 Space，独立进程用同一段代码实测可见。
+    // 该分支在单实例锁之前执行，进程闪光 2s 后自行退出。
+    #[cfg(target_os = "macos")]
+    if args.iter().any(|arg| arg == FLASH_ARG) {
+        run_flash_mode(&args);
         return true;
     }
 
@@ -5449,19 +5314,11 @@ pub fn run() {
             let _ = APP_VERSION.set(app.config().version.clone().unwrap_or_else(|| app.package_info().version.to_string()));
             spawn_lock_sync_watcher(app.handle().clone());
             spawn_discovery_recovery_watcher(app.handle().clone());
-            // 被控端收到 FlashScreen 事件后需要开 Tauri 窗口，而输入数据链
-            // 没有 AppHandle：与 halo focus 的 receive hook 同一模式，把执行
-            // 器（捕获本 handle）交给 input.rs 的分发点。
-            {
-                let app_handle_for_flash = app.handle().clone();
-                input::install_screen_flash_dispatcher(Box::new(move |x, y, width, height| {
-                    if let Err(error) =
-                        run_screen_flash_window(&app_handle_for_flash, x, y, width, height)
-                    {
-                        log::warn!("screen flash failed: {error}");
-                    }
-                }));
-            }
+            // 被控端收到 FlashScreen 事件后要在对应物理屏闪光圈：闪光走
+            // 独立 helper 进程（macOS），把执行器交给 input.rs 的分发点。
+            input::install_screen_flash_dispatcher(Box::new(|x, y, width, height| {
+                run_screen_flash((x, y, width, height));
+            }));
             let silent_launch = launched_from_autostart();
             #[cfg(target_os = "macos")]
             {

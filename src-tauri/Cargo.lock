@@ -2401,6 +2401,7 @@ dependencies = [
  "if-addrs",
  "image",
  "log",
+ "mykvm-flash-core",
  "ndarray",
  "objc2",
  "objc2-av-foundation",
@@ -2429,6 +2430,17 @@ dependencies = [
  "windows",
  "windows-core 0.61.2",
  "windows-service",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mykvm-flash-core"
+version = "0.1.0"
+dependencies = [
+ "core-graphics",
+ "log",
+ "objc2",
+ "objc2-foundation",
  "windows-sys 0.61.2",
 ]
 

@@ -4,6 +4,11 @@
 > 被控端应在对应物理显示器上闪一圈蓝色光圈，帮助确认"这块磁贴 = 那块真实屏幕"。
 > 服务端（Mac）与被控端（Windows）共用本仓库同一份代码；**被控端需要升级到包含
 > `fa5f6fc`（FlashScreen 事件）及之后提交的构建**才能响应光圈请求。
+> **推荐直接装最新分支构建（原生光圈）**：Mac 真机验证发现透明 WebView 光圈窗跨显示器
+> 移动后 WKWebView 不重绘（外接屏上完全不可见），已换原生窗口实现；macOS 27 上
+> Tauri 进程内创建的跨显示器 NSWindow 无法进入当前 Space，Mac 端闪光现由
+> `mykvm --flash` 独立子进程执行（`flash-core` crate），已真机验收。Windows 被控端
+> 仍为进程内分层窗实现（halo win32 同构，实测可见），不受影响。
 
 ## 1. 已实现内容（已合入 `main`，无需重复开发）
 
@@ -17,19 +22,22 @@
   `input_event_to_command` 把 wire screen_id 换算成自己 `native_layout` 的逻辑屏矩形 →
   `InputCommand::FlashScreen` → `dispatch_input_command` 顶部分流给
   `dispatch_screen_flash` → lib.rs 在 `.setup` 里用 `install_screen_flash_dispatcher`
-  安装的执行器（捕获 AppHandle）→ `run_screen_flash_window` 在对应显示器上创建
-  透明置顶点击穿透窗口（加载 `public/screen-indicator.html` 纯 CSS 光圈），约 1.4s 自关。
+  安装的执行器 → `screen_flash::flash_logical_rect`（`src-tauri/src/screen_flash.rs`）：
+  `WS_EX_LAYERED` 分层窗 + GDI DIB 像素光圈（halo win32 同构路径），按
+  `GetDpiForMonitor` 匹配逻辑矩形选屏，蓝色圆角描边 0.45s×3 脉冲，约 1.4s 自毁。
 - Windows 特有注意：
   - FlashScreen **不下发**给锁屏助手服务（`dispatch_input_command` 在 helper 路由之前
     分流）；助手侧 `inject_command_without_tracking` / `worker_can_inject` 已补穷尽匹配。
-  - Windows 无 tao 的 Cocoa 翻转问题，`builder.position`（逻辑坐标）直接可用。
+  - 光圈窗自带消息循环线程，不占输入数据链线程；窗口类 `MyKVMScreenFlash` 复用注册；
+    `windows-sys` 已补 `Win32_UI_HiDpi` feature。
 
 ## 2. Windows 端构建（二选一）
 
 ### 方式 A：GitHub dev-build 工作流（推荐，GT37 上无需装开发环境）
 
-> 功能已合入 `main`（原开发分支 `fix/layout-crossing-overlap` 已合并删除、
-> 不再存在），直接从 `main` 构建即可，无需推送任何分支。
+> 功能已合入 `main`（原开发分支 `fix/layout-crossing-overlap`、
+> `fix/native-screen-flash` 均已合并删除、不再存在），直接从 `main` 构建即可，
+> 无需推送任何分支。
 
 1. 触发：`gh workflow run dev-build --ref main`（或网页 Actions → Dev Build →
    Run workflow 选 `main`）。
@@ -70,15 +78,20 @@ npm run build                           # tsc -b 全量严格检查 + vite
 3. 预期：GT37 对应的物理显示器上出现蓝色圆角边框光圈，脉冲约 1.4s 后自动消失；
    窗口点击穿透，不影响 GT37 正常使用。
 4. 连续点击两次 → 光圈叠开两次，各自独立消失，无报错。
-5. 点 Mac 本机磁贴 → Mac 本机屏闪光圈（不受本次改动影响）。
+5. 点 Mac 本机磁贴 → Mac 每块本机屏（含外接屏）都闪光圈（`494b2e8` 已修复外接屏
+   不显示的问题）。
 6. 回归：鼠标穿越到 GT37 再返回、键盘输入、剪贴板同步均应正常（确认 FlashScreen
    没有干扰输入管线）。
-7. 旧版判别：`main` 上的存量构建对解码失败的输入包是零日志静默丢弃
-   （`decode_input_packet` 直接 `.ok()`），`mykvm.log` 不会留痕，只能靠
-   现象判：点击远端磁贴无光圈、其余功能（穿越/输入/剪贴板）全部正常 →
-   发送端比接收端新。本轮新增（暂未提交）了三 schema 全败后的限流 warn
-   （`dropped undecodable input datagram … from <addr>`）与计数器：
-   **接收端**装上含该改动的构建后，即可直接从日志判定混跑与来源地址。
+7. 日志核对：
+   - 旧版判别：存量构建对解码失败的输入包是零日志静默丢弃
+     （`decode_input_packet` 直接 `.ok()`），`mykvm.log` 不会留痕，只能靠
+     现象判：点击远端磁贴无光圈、其余功能（穿越/输入/剪贴板）全部正常 →
+     发送端比接收端新。含三 schema 全败后限流 warn
+     （`dropped undecodable input datagram … from <addr>`）与计数器的**接收端**
+     装上后，即可直接从日志判定混跑与来源地址；时间点恰为 Mac 点击远端磁贴的
+     解码失败计数即说明对端还是旧版本（未含 FlashScreen 解码）。
+   - Mac 端每次点选应有一条 `screen indicator covering display at cocoa ...`
+     （原生路径的选屏日志）。
 
 ## 4. 已知边界
 
@@ -89,4 +102,4 @@ npm run build                           # tsc -b 全量严格检查 + vite
   被控端按同序枚举映射到物理显示器。若发现光圈落在相邻的错位屏幕上，收集
   被控端 `detect` 相关日志另行排查（枚举顺序跨重启可能变化，与 Mac 端
   `restore_local_screen_layout` 的 id 保持机制是同一类问题）。
-- 本轮 Mac 端外接屏光圈仍在排查中（`screen indicator` 日志已带 frame/level 回读）。
+- Mac 端外接屏光圈已修复并验收（BUG-005，见 `Doc/Bug与需求记录.md`）。

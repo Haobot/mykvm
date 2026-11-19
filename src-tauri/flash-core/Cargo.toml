@@ -1,0 +1,19 @@
+[package]
+name = "mykvm-flash-core"
+version = "0.1.0"
+description = "布局点选磁贴的物理屏光圈实现（macOS 原生 NSWindow / Windows 分层窗）"
+license = "MIT"
+edition = "2021"
+publish = false
+
+[dependencies]
+log = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 版本对齐主工程（见主 Cargo.toml 的 objc2 版本锁定说明）。
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+core-graphics = { version = "0.25", features = ["highsierra"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
