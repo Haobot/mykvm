@@ -5,7 +5,7 @@
 > 服务端（Mac）与被控端（Windows）共用本仓库同一份代码；**被控端需要升级到包含
 > `fa5f6fc`（FlashScreen 事件）及之后提交的构建**才能响应光圈请求。
 
-## 1. 已实现内容（代码已在分支上，无需重复开发）
+## 1. 已实现内容（已合入 `main`，无需重复开发）
 
 - 协议：`shared_input.rs` 新增 `InputEvent::FlashScreen { screen_id }`（wire，camelCase
   `flashScreen`）与 `InputCommand::FlashScreen { x, y, width, height }`。
@@ -28,20 +28,28 @@
 
 ### 方式 A：GitHub dev-build 工作流（推荐，GT37 上无需装开发环境）
 
-1. 推送分支：`git push origin fix/layout-crossing-overlap`。
-2. 触发：`gh workflow run dev-build --ref fix/layout-crossing-overlap`（或网页 Actions →
-   Dev Build → Run workflow 选分支）。
-3. 等待构建完成，从该次 run 的 Artifacts 下载 `mykvm-windows-x64-setup`。
-4. 在 GT37 上运行安装包覆盖安装（先退出旧版 MyKVM）。
+> 功能已合入 `main`（原开发分支 `fix/layout-crossing-overlap` 已合并删除、
+> 不再存在），直接从 `main` 构建即可，无需推送任何分支。
+
+1. 触发：`gh workflow run dev-build --ref main`（或网页 Actions → Dev Build →
+   Run workflow 选 `main`）。
+2. 等待构建完成，从该次 run 的 Artifacts 下载 `mykvm-windows-x64-setup`。
+3. 在 GT37 上运行安装包覆盖安装（先退出旧版 MyKVM）。
 
 ### 方式 B：GT37 本地构建
 
 ```powershell
 # 前置：Node 18+ / npm、Rust stable（MSVC toolchain）、WebView2 运行时
+# （2026-11 实测 GT37 尚未安装 Rust/MSVC 工具链，本地构建前需先补齐前置）
 git fetch origin
-git checkout fix/layout-crossing-overlap
+git checkout main
 npm install
-npm run tauri -- build        # 产物在 src-tauri/target/release/bundle/nsis/
+npm run tauri -- build --ci -b nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+# ↑ dev 构建必须与 CI 同参关闭 updater 签名（本地无 TAURI_SIGNING_PRIVATE_KEY，
+#   裸 `npm run tauri -- build` 会卡死在打包阶段）。产物在
+#   src-tauri/target/release/bundle/nsis/
+# 网络：tauri 首次打包需从 GitHub 下载 NSIS 工具链；VPN 走系统代理时
+#   tauri 下载器不读 WinINET，需先 export http_proxy=<本地代理> https_proxy=<同>
 # 安装 nsis 产物后启动
 ```
 
@@ -65,8 +73,12 @@ npm run build                           # tsc -b 全量严格检查 + vite
 5. 点 Mac 本机磁贴 → Mac 本机屏闪光圈（不受本次改动影响）。
 6. 回归：鼠标穿越到 GT37 再返回、键盘输入、剪贴板同步均应正常（确认 FlashScreen
    没有干扰输入管线）。
-7. 日志核对：GT37 端 `mykvm.log` 若出现输入解码失败相关计数，且时间点恰为 Mac 点击
-   远端磁贴的时刻，说明对端还是旧版本（未含 FlashScreen 解码）。
+7. 旧版判别：`main` 上的存量构建对解码失败的输入包是零日志静默丢弃
+   （`decode_input_packet` 直接 `.ok()`），`mykvm.log` 不会留痕，只能靠
+   现象判：点击远端磁贴无光圈、其余功能（穿越/输入/剪贴板）全部正常 →
+   发送端比接收端新。本轮新增（暂未提交）了三 schema 全败后的限流 warn
+   （`dropped undecodable input datagram … from <addr>`）与计数器：
+   **接收端**装上含该改动的构建后，即可直接从日志判定混跑与来源地址。
 
 ## 4. 已知边界
 

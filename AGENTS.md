@@ -11,10 +11,19 @@
 ## 构建与运行（macOS 开发机）
 
 - Rust 不在默认 PATH：`export PATH="$HOME/.cargo/bin:$PATH"`。
-- 检查：`cd src-tauri && cargo test --lib`（当前 218 个测试）；前端 `npm test`。
+- 检查：`cd src-tauri && cargo test --lib`（macOS 当前 218 个测试，Windows 端 415）；前端 `npm test`。
 - 构建：`npm run tauri -- build --target aarch64-apple-darwin --bundles app --no-sign`。
 - 安装并运行：`sh scripts/install-mac-app.sh`（退出旧应用 → ditto → 本地自签名 → open）。
 - 日志：`~/Library/Logs/com.xzhpl.mykvm/mykvm.log`；配置：`~/Library/Application Support/com.xzhpl.mykvm/`。
+
+## 构建与运行（GT37 Windows 被控机，2026-11 已装齐工具链）
+
+- 工具链：VS Build Tools 2022（VCTools）+ rustup `stable-x86_64-pc-windows-msvc`；cargo 同样需 `export PATH="$HOME/.cargo/bin:$PATH"`。
+- **必须带参数构建**（本地无 updater 签名私钥，裸 build 卡死在打包）：
+  `npm run tauri -- build --ci -b nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'`
+- tauri 首次打包要下载 NSIS 工具链（GitHub）：VPN 走系统代理时 tauri 下载器不读 WinINET，需先 `export http_proxy=<本地代理> https_proxy=<同>`。
+- 装机 exe 与 `target/release/mykvm.exe` 哈希不同（NSIS patcher 打包后回写 target）属正常，别据此怀疑装错。
+- Windows 日志：`%LOCALAPPDATA%\com.xzhpl.mykvm\logs\mykvm.log`（时间戳 UTC）；安装位置 `%LOCALAPPDATA%\MyKVM`。
 
 ## 已知系统坑（务必牢记）
 
@@ -24,6 +33,7 @@
 4. **系统状态类阶段状态不能复用启动快照**：注入/捕获状态里的"当前系统是否有权限/是否开着安全键盘输入/QUIC 是否就绪"会随系统变化，而应用登录自启时会在 `.setup` 里 eager start 输入链路，很容易撞上锁屏/登录窗口的安全输入状态。客户端 inject 状态过去只在 `start_input` 算一次，导致「安全键盘输入已开启」提示在来源关闭后一直显示、且前端每 2s 轮询把用户关掉的弹窗重新打开（见 [2026-10 复盘](Doc/lessons/2026-10-安全键盘输入状态误报复盘.md)）。现在 `runtime_status_for_layout` 在 `started && inputMode=receive` 时每次读取都重新探测，前端 `src/runtimeBlocker.ts` 对同一阻塞原因只弹一次并在解除后自动关闭。新增类似提示时必须照此处理。
 5. **仓库约定**：遵循 [CONTRIBUTING.md](CONTRIBUTING.md) 的 Conventional Commits；push 到 `main` 会触发 Release workflow，`fix:`/`feat:` 会发版，纯文档用 `docs:`。
 6. **设备 id 内嵌 LAN 地址，换 IP 后输入会被静默丢弃**：本机/对端 id 由 `local_peer_id(hostname, ip)` 派生，重启或 DHCP 续租换地址后 id 随之改变，而配对控制器的 `device.id`（`update_device_from_peer` 只刷 host/端口/证书，**不刷 id**）仍是旧值，发来的输入包 `target_device_id` 就是旧 id。接收端 `packet_targets_local` 曾逐包精确匹配、不匹配就 `return true` 静默吞掉，表现为「对端显示在线、发现/QUIC 都正常、就是移不过去鼠标」，且日志零报错。修复：`packet_targets_local` 按 `peer-{hostname}-` 前缀放行同主机名的历史 id（鉴权在该检查之前已完成，此处只是路由消歧）。排查同类问题先看两端 id 是否同源漂移，别先怀疑网络。
+7. **Windows 无边框透明窗口的白闪是四层叠加**（光圈窗口实测，详见 [2026-11 复盘](Doc/lessons/2026-11-Win光圈窗口白闪复盘.md)）：① WebView2 首帧默认白底（`background_color` 全透明只治 webview 层）；② Win11 给无边框窗口仍画 ~1px DWM 白边框（`DWMWA_BORDER_COLOR=DWMWA_COLOR_NONE`）；③ Win11 开窗缩放动画把未合成的白底窗口从小放大上屏（`DWMWA_TRANSITIONS_FORCEDISABLED`）；④ `PageLoadEvent::Finished` ≠ 合成器已交首帧，立即 `show()` 仍露白。**唯一可靠形态：`visible(false)` 创建 + `Finished` 后再等 ~60ms 才 `show()`**——不可见的窗口不可能闪白。另：给静默丢弃路径新加观测时，第一波告警大概率照出自家合法流量（`warm_quic_peer` 的 0 字节预热包曾被新计数器每 4 秒误报一次，0 字节载荷按已知 no-op 跳过）。
 
 ## 改动输入/发现后的验证清单
 
