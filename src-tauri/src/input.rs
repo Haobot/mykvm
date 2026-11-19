@@ -131,6 +131,18 @@ static ADMITTED_CREDENTIALLESS_INPUT_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn admitted_credentialless_input_packets() -> u64 {
     ADMITTED_CREDENTIALLESS_INPUT_PACKETS.load(Ordering::Relaxed)
 }
+
+/// 两套已知 schema（input → input-control → halo focus）全部解不开而被丢弃的
+/// 输入包计数器。正常会话应恒为 0；若在新旧版本混跑时持续增长，说明有来源
+/// 在发本构建不认识的包（如旧被控端收到新控制端的 FlashScreen 事件）或纯
+/// 外来流量——配合 `note_undecodable_input_packet` 的限流日志定位源地址。
+static UNDECODABLE_INPUT_PACKETS: AtomicU64 = AtomicU64::new(0);
+
+#[allow(dead_code)] // 供测试与诊断读取；生产路径暂未接入 performance 采样
+pub fn undecodable_input_packets() -> u64 {
+    UNDECODABLE_INPUT_PACKETS.load(Ordering::Relaxed)
+}
+
 pub(crate) const NATIVE_INPUT_SUPPORTED: bool =
     cfg!(any(target_os = "macos", target_os = "windows"));
 
@@ -2915,11 +2927,13 @@ pub(crate) fn handle_input_datagram_with_sink(
     // P4 cross-machine focus: the last schema in the decode chain. A halo
     // focus packet is consumed here (authorized + dispatched to the halo
     // runtime's passive highlight) and returns true so the caller counts it
-    // as a transport packet; anything still undecoded stays a silent drop.
+    // as a transport packet; anything still undecoded after *all* schemas
+    // failed is counted and (rate-limited) logged before the drop.
     if crate::halo::focus_router::try_dispatch_received_focus(layout_state, payload) {
         return true;
     }
 
+    note_undecodable_input_packet(payload.len(), source);
     false
 }
 
@@ -3131,6 +3145,37 @@ fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
             "<set>"
         },
         reason
+    );
+}
+
+static LAST_UNDECODABLE_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
+
+/// Count one input datagram that no known schema (input, input-control, halo
+/// focus) could decode, and log it at most once every few seconds — a peer
+/// sending an unknown event tag floods datagrams just like a mouse move, so
+/// an unthrottled warn would drown the log. The drop itself stays silent
+/// (returns false upstream); the counter plus this line are the only traces
+/// of a mixed-version or foreign-traffic packet.
+fn note_undecodable_input_packet(len: usize, source: SocketAddr) {
+    // `warm_quic_peer` (lib.rs) path-probing datagrams are empty by design; no
+    // known schema encodes to zero bytes, so an empty payload is our own
+    // warm-up traffic, not a version mismatch — keep it a silent no-op.
+    if len == 0 {
+        return;
+    }
+    UNDECODABLE_INPUT_PACKETS.fetch_add(1, Ordering::Relaxed);
+
+    let cell =
+        LAST_UNDECODABLE_WARN.get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
+    if let Ok(mut last) = cell.lock() {
+        if last.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+        *last = Instant::now();
+    }
+
+    log::warn!(
+        "dropped undecodable input datagram ({len} bytes) from {source}: all known packet schemas failed to decode — likely a version mismatch (peer newer than this build sending unknown event tags) or foreign traffic"
     );
 }
 
@@ -9753,6 +9798,12 @@ fn inject_key(_key_code: u16, _down: bool) {}
 mod tests {
     use super::*;
 
+    /// Tests run in parallel and share the global `UNDECODABLE_INPUT_PACKETS`
+    /// counter, so every test that reads it (to assert an exact delta, or to
+    /// assert a zero delta) must hold this lock for the whole
+    /// before/after window — otherwise another test's tick lands in between.
+    static UNDECODABLE_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn scroll_speed_carries_the_fraction() {
         // 1x is untouched; 2x doubles.
@@ -12344,6 +12395,170 @@ mod tests {
             vec![InputCommand::SecureAttention]
         );
         assert_eq!(input_events.load(Ordering::Relaxed), 0);
+    }
+
+    /// Garbage no schema understands: still dropped (false), but it must leave
+    /// a trace — the global counter ticks so a mixed-version / foreign-traffic
+    /// flood is diagnosable. The counter is shared with the other tests running
+    /// in parallel, so this test holds `UNDECODABLE_COUNTER_TEST_LOCK` across
+    /// the before/after window and can assert the exact delta.
+    #[test]
+    fn undecodable_garbage_datagram_is_counted_and_still_dropped() {
+        let _counter_guard = UNDECODABLE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let layout = layout_for_target_tests();
+        let native = Arc::new(Mutex::new(layout.clone()));
+        let layout = Arc::new(Mutex::new(layout));
+        let events = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(Mutex::new(None));
+        let source: SocketAddr = "192.0.2.60:47834".parse().unwrap();
+
+        let before = undecodable_input_packets();
+        assert!(!handle_input_datagram_with_sink(
+            &layout,
+            &native,
+            b"\xc1\xff\x00garbage",
+            source,
+            &events,
+            &target,
+            &|_| panic!("undecodable garbage must never reach the sink"),
+        ));
+        let after = undecodable_input_packets();
+        assert_eq!(
+            after,
+            before + 1,
+            "undecodable counter did not tick exactly once: before={before} after={after}"
+        );
+        assert_eq!(events.load(Ordering::Relaxed), 0);
+    }
+
+    /// The real mixed-version case: a well-formed InputPacket from a newer
+    /// peer whose event tag this build does not know (old receiver, new
+    /// controller). Decode fails on the unknown tag, so it must hit the same
+    /// counted drop as garbage. Holds the counter lock so the delta is exact.
+    #[test]
+    fn unknown_future_event_tag_is_counted_as_undecodable() {
+        let _counter_guard = UNDECODABLE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let payload = rmp_serde::to_vec(&serde_json::json!({
+            "protocol": INPUT_PROTOCOL,
+            "targetDeviceId": "local-device",
+            "originDeviceId": "server",
+            "originPort": 47834,
+            "originTransportPublicKey": "server-key",
+            "originProtocolVersion": quic_transport::PROTOCOL_VERSION,
+            "clusterId": "cluster-test",
+            "pairSecret": "secret-test",
+            "event": { "type": "someFutureEvent" },
+        }))
+        .expect("encode future-event packet");
+        // Sanity: the unknown tag really does fail every schema in the chain.
+        assert!(decode_input_packet(&payload).is_none());
+        assert!(decode_input_control_packet(&payload).is_none());
+
+        let layout = layout_for_target_tests();
+        let native = Arc::new(Mutex::new(layout.clone()));
+        let layout = Arc::new(Mutex::new(layout));
+        let events = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(Mutex::new(None));
+        let source: SocketAddr = "192.0.2.61:47834".parse().unwrap();
+
+        let before = undecodable_input_packets();
+        assert!(!handle_input_datagram_with_sink(
+            &layout,
+            &native,
+            &payload,
+            source,
+            &events,
+            &target,
+            &|_| panic!("unknown future event must never reach the sink"),
+        ));
+        let after = undecodable_input_packets();
+        assert_eq!(
+            after,
+            before + 1,
+            "undecodable counter did not tick exactly once: before={before} after={after}"
+        );
+        assert_eq!(events.load(Ordering::Relaxed), 0);
+    }
+
+    /// A halo focus packet also fails `decode_input_packet`, but the tail
+    /// focus branch consumes it (returns true) *before* the undecodable
+    /// counting site — so it must stay a successful transport packet, never
+    /// a counted drop. Holds the counter lock for consistency with the other
+    /// counter tests (it asserts the return value, not a counter delta).
+    #[test]
+    fn halo_focus_packet_is_consumed_before_the_undecodable_counter() {
+        let _counter_guard = UNDECODABLE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let layout = layout_for_target_tests();
+        let native = Arc::new(Mutex::new(layout.clone()));
+        let layout = Arc::new(Mutex::new(layout));
+        let events = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(Mutex::new(None));
+        let source: SocketAddr = "192.0.2.62:47834".parse().unwrap();
+
+        let focus = crate::halo::HaloFocusPacket::new(
+            "server".into(),
+            "cluster-test".into(),
+            "secret-test".into(),
+            crate::halo::HaloFocusEvent::Clear,
+            1,
+        );
+        let payload = focus.encode().expect("encode halo focus packet");
+        assert!(decode_input_packet(&payload).is_none());
+
+        // `true` proves the tail focus branch fired, which is exactly the
+        // branch that returns before `note_undecodable_input_packet` — so
+        // this packet contributes nothing to the undecodable counter.
+        assert!(handle_input_datagram_with_sink(
+            &layout,
+            &native,
+            &payload,
+            source,
+            &events,
+            &target,
+            &|_| panic!("a focus packet carries no input command"),
+        ));
+        assert_eq!(events.load(Ordering::Relaxed), 0);
+    }
+
+    /// `warm_quic_peer` (lib.rs) probes the QUIC path with a 0-byte datagram
+    /// every few seconds. No known schema encodes to zero bytes, so an empty
+    /// payload is always our own warm-up traffic: it must be dropped silently
+    /// (false, sink untouched) and must never tick the undecodable counter or
+    /// emit the version-mismatch warn that used to flood the log.
+    #[test]
+    fn empty_warmup_datagram_is_a_silent_noop() {
+        let _counter_guard = UNDECODABLE_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let layout = layout_for_target_tests();
+        let native = Arc::new(Mutex::new(layout.clone()));
+        let layout = Arc::new(Mutex::new(layout));
+        let events = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(Mutex::new(None));
+        let source: SocketAddr = "192.0.2.63:47834".parse().unwrap();
+
+        let before = undecodable_input_packets();
+        assert!(!handle_input_datagram_with_sink(
+            &layout,
+            &native,
+            &[],
+            source,
+            &events,
+            &target,
+            &|_| panic!("an empty warm-up datagram must never reach the sink"),
+        ));
+        let after = undecodable_input_packets();
+        assert_eq!(
+            after, before,
+            "empty warm-up datagram must not tick the undecodable counter: before={before} after={after}"
+        );
+        assert_eq!(events.load(Ordering::Relaxed), 0);
     }
 
     #[test]
