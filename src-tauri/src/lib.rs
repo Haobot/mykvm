@@ -38,6 +38,7 @@ mod input_guard;
 mod local_capture_session;
 #[cfg(any(target_os = "windows", test))]
 mod native_drag;
+mod network_profile;
 mod performance;
 mod quic_transport;
 mod rich_clipboard;
@@ -362,6 +363,29 @@ struct LayoutState {
     /// 载入/保存路径各自钳制，不进 merge_runtime_owned_layout_fields。
     #[serde(default = "default_agent_channel")]
     agent_channel: agent_channel::AgentChannelConfig,
+    /// 后端所有：设备列表变更代数。后端每次改写 `devices[]`（换网档案切换、
+    /// 离线自动删除）自增；save_layout 比对前端回传值，不相等说明前端拿的是
+    /// 陈旧快照，其设备列表整体作废——没有这道闸，一次滞后的全量保存就能把
+    /// 后端刚做的删除/换网结果冲掉。
+    #[serde(default)]
+    layout_revision: u64,
+    /// 后端所有：当前 `devices[]` 归属的网络档案键（接口+子网指纹）。
+    /// 空串表示尚未采用（首次启动或网络未知）。
+    #[serde(default)]
+    active_network_key: String,
+    /// 后端所有：按网络分组记忆的远程设备列表。换网时把非 local/非 manual
+    /// 设备暂存进旧键档案、载入新键档案；手动设备与本地设备不进档案。
+    #[serde(default)]
+    network_profiles: HashMap<String, NetworkProfile>,
+}
+
+/// 一个网络档案：该网络下留下的远程设备配置（不含 local/manual 设备）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkProfile {
+    devices: Vec<Device>,
+    #[serde(default)]
+    saved_at_ms: u64,
 }
 
 fn default_agent_channel() -> agent_channel::AgentChannelConfig {
@@ -1293,6 +1317,9 @@ impl AppRuntime {
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let upgrading = Arc::clone(&self.upgrading);
         let transport_packets = Arc::clone(&self.transport_packets);
+        // 换网档案切换与离线自动删除都在发现线程里改写 devices[]，改完必须
+        // 落盘，否则下一次 load_app_state 会从旧磁盘内容把改动冲掉。
+        let config_path = self.config_path.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let heartbeat = Arc::new(DiscoveryHeartbeat::new());
@@ -1345,6 +1372,10 @@ impl AppRuntime {
             let mut last_input_ready = input_receive_enabled.load(Ordering::Relaxed);
             let mut last_upgrading = upgrading.load(Ordering::Relaxed);
             let mut last_probe_by_peer: HashMap<String, u64> = HashMap::new();
+            // 按网络记忆设备列表（接口+子网指纹连续两轮稳定才换档）与
+            // 离线设备重试计数都只活在本线程：循环停摆 = 不换档 = 不删设备。
+            let mut network_stability = network_profile::NetworkKeyStability::new();
+            let mut offline_tracker = network_profile::OfflineProbeTracker::new();
 
             while !thread_stop.load(Ordering::Relaxed) {
                 loop_heartbeat.tick();
@@ -1356,6 +1387,8 @@ impl AppRuntime {
                     // announce 分支立即发送（该分支同时重建 direct_targets
                     // 并对全部对端 probe，路径唯一，不复制发送代码）。
                     let current_addresses = collect_local_ip_addresses();
+                    // match 会 move current_addresses，空判断必须先取。
+                    let local_addresses_ready = !current_addresses.is_empty();
                     match &last_local_addresses {
                         None => last_local_addresses = Some(current_addresses),
                         Some(old) if ip_sets_differ(old, &current_addresses) => {
@@ -1369,6 +1402,95 @@ impl AppRuntime {
                         }
                         Some(_) => {}
                     }
+
+                    // 换网档案切换：指纹连续两轮稳定（≈20s）才采纳，WiFi 切换
+                    // 瞬态（接口 down/up、短暂拿到地址）不会在两个档案间抖动。
+                    // 空指纹 = 网络未知，observe 内部清空候选不触发。
+                    let fingerprint = network_profile::network_fingerprint();
+                    if let Some(stable_key) = network_stability.observe(&fingerprint) {
+                        let mut swapped = false;
+                        let mut device_count = 0;
+                        if let Ok(mut layout) = layout_state.lock() {
+                            if network_profile::swap_network_profile(&mut layout, stable_key) {
+                                swapped = true;
+                                device_count = layout.devices.len();
+                                // 换档改了 devices[]：必须落盘，否则下一次
+                                // load_app_state 从旧磁盘内容把列表冲回去。
+                                if let Err(error) = write_layout_to_disk(&config_path, &layout) {
+                                    log::warn!(
+                                        "network profile swap: layout persist failed: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        if swapped {
+                            // 新档案的设备从零开始攒离线欠账，不带旧网络的。
+                            offline_tracker.reset();
+                            log::info!(
+                                "network profile swapped key={stable_key} devices={device_count}"
+                            );
+                        }
+                    }
+
+                    // 离线设备重试轮（与身份刷新同拍，10s）：本地地址集合为空
+                    // = 网络没起来，整轮跳过——不计数、不探测、不删，防止开机/
+                    // WiFi 未连时把整表设备误删。
+                    if local_addresses_ready {
+                        let mut probe_targets: Vec<String> = Vec::new();
+                        if let Ok(mut layout) = layout_state.lock() {
+                            let (probes, removals) = offline_tracker.evaluate(&layout.devices);
+                            for device_id in &probes {
+                                let Some(device) =
+                                    layout.devices.iter().find(|device| &device.id == device_id)
+                                else {
+                                    continue;
+                                };
+                                let ports = known_peer_ports(desired_port, device.transport_port);
+                                push_host_discovery_targets(
+                                    &mut probe_targets,
+                                    &device.host,
+                                    &ports,
+                                );
+                            }
+                            if !removals.is_empty() {
+                                let ids: Vec<String> = removals
+                                    .iter()
+                                    .map(|(device_id, _)| device_id.clone())
+                                    .collect();
+                                let removed =
+                                    network_profile::remove_devices_by_id(&mut layout, &ids);
+                                if !removed.is_empty() {
+                                    // 先落盘再打日志：日志里报的删除必须是已经
+                                    // 持久化的事实，否则崩溃后设备又回来了。
+                                    if let Err(error) = write_layout_to_disk(&config_path, &layout)
+                                    {
+                                        log::warn!(
+                                            "offline device removal: layout persist failed: {error}"
+                                        );
+                                    }
+                                    for (device_id, name) in &removed {
+                                        let misses = removals
+                                            .iter()
+                                            .find(|(id, _)| id == device_id)
+                                            .map(|(_, count)| *count)
+                                            .unwrap_or_default();
+                                        log::info!(
+                                            "offline device auto-removed id={device_id} name={name} misses={misses}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        probe_targets.truncate(MAX_DIRECTED_TARGETS_PER_PEER * 4);
+                        for target in &probe_targets {
+                            if let Err(error) =
+                                send_discovery_packet(&socket, "probe", &local_peer, target)
+                            {
+                                log::debug!("offline probe to {target} failed: {error}");
+                            }
+                        }
+                    }
+
                     last_local_identity_refresh = Instant::now();
                 }
 
@@ -4296,6 +4418,31 @@ fn merge_runtime_owned_layout_fields(
     // only the GUI startup clears it, so a whole-layout save must not flip it.
     incoming.headless_paused = current.headless_paused;
 
+    // Backend-owned network profile state: the frontend only round-trips these
+    // fields, it never decides them (swap_network_profile / offline removal are
+    // the only writers).
+    incoming.active_network_key = current.active_network_key.clone();
+    incoming.network_profiles = current.network_profiles.clone();
+
+    // Revision gate: the backend bumps layout_revision every time it rewrites
+    // devices[] (network-profile swap, offline auto-removal). A save whose
+    // revision differs left the frontend before that rewrite, so its device
+    // list is a stale snapshot — dropping it is what keeps a late full-layout
+    // save from resurrecting an auto-removed device or overwriting a freshly
+    // swapped profile. Equal revisions keep the historical semantics: the
+    // incoming list wins, so user adds/removes/edits still persist.
+    if incoming.layout_revision != current.layout_revision {
+        log::warn!(
+            "save_layout: stale device list dropped (revision {} != {})",
+            incoming.layout_revision,
+            current.layout_revision
+        );
+        incoming.devices = current.devices.clone();
+        incoming.active_device_id = current.active_device_id.clone();
+        incoming.selected_screen_id = current.selected_screen_id.clone();
+    }
+    incoming.layout_revision = current.layout_revision;
+
     if current.machine_role == "client"
         && incoming.machine_role == "client"
         && !current.paired_controllers.is_empty()
@@ -4360,6 +4507,10 @@ fn merge_runtime_owned_device_fields(incoming: &mut LayoutState, current: &Layou
 }
 
 fn merge_disk_layout_into_runtime(mut disk: LayoutState, current: &LayoutState) -> LayoutState {
+    // layout_revision is a backend runtime counter, never a disk fact: a
+    // hand-edited or stale layout.json must not dial the generation backwards,
+    // or the frontend's next stale snapshot would pass the save_layout gate.
+    disk.layout_revision = current.layout_revision;
     if current.machine_role == "client"
         && disk.machine_role == "client"
         && disk.paired_controllers.is_empty()
@@ -7529,6 +7680,17 @@ fn normalized_transient_clone(layout: &LayoutState) -> LayoutState {
         device.upgrading = false;
         device.upgrading_until_ms = 0;
     }
+    // 网络档案里的设备同样是「此刻状态」的载体：换网暂存时它们带着 online
+    // 位进了 profile，落盘不清掉的话，下次载入会在任何 peer 被看到之前
+    // 显示一屏假在线。
+    for profile in layout.network_profiles.values_mut() {
+        for device in &mut profile.devices {
+            device.online = false;
+            device.input_ready = false;
+            device.upgrading = false;
+            device.upgrading_until_ms = 0;
+        }
+    }
     layout
 }
 
@@ -7792,6 +7954,9 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         focus_halo: halo::FocusHaloSettings::default(),
         headless_paused: false,
         agent_channel: default_agent_channel(),
+        layout_revision: 0,
+        active_network_key: String::new(),
+        network_profiles: HashMap::new(),
         devices: vec![Device {
             pointer_speed: 1.0,
             scroll_speed: 1.0,
@@ -7844,6 +8009,9 @@ fn detect_fallback_layout() -> LayoutState {
         focus_halo: halo::FocusHaloSettings::default(),
         headless_paused: false,
         agent_channel: default_agent_channel(),
+        layout_revision: 0,
+        active_network_key: String::new(),
+        network_profiles: HashMap::new(),
     }
 }
 
@@ -8212,6 +8380,12 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         // 状态决定是否落盘清除，丢了标记磁盘上的 true 就永远无人解除。
         headless_paused: saved_layout.headless_paused,
         agent_channel: saved_layout.agent_channel.sanitized(),
+        // 网络档案三件套原样穿过：revision 是后端与前端陈旧快照的对账依据，
+        // active_network_key/network_profiles 是换网暂存的载体，归一化丢任何
+        // 一个都会让下次 save_layout 误判或把档案清空。
+        layout_revision: saved_layout.layout_revision,
+        active_network_key: saved_layout.active_network_key,
+        network_profiles: saved_layout.network_profiles,
     }
 }
 
@@ -12234,6 +12408,10 @@ fn retarget_device_id(layout: &mut LayoutState, old_id: &str, new_id: &str) -> b
         layout.selected_screen_id = new_screen_id.clone();
     }
 
+    // id 漂移同样是后端对 devices[] 的改写：不自增 revision 的话，前端拿着
+    // 旧 id 的快照一保存就把 retarget 回滚掉（merge 按 id 匹配不上 current，
+    // incoming 原样保留），设备短暂回到旧 id 直到下一次 presence 再 retarget。
+    layout.layout_revision += 1;
     true
 }
 
@@ -14406,7 +14584,7 @@ mod tests {
         assert!(!consttime_eq(zh.as_bytes(), "共享密钥-机密".as_bytes()));
     }
 
-    fn test_screen(device_id: &str) -> Screen {
+    pub(crate) fn test_screen(device_id: &str) -> Screen {
         Screen {
             id: format!("{device_id}-display-1"),
             device_id: device_id.into(),
@@ -14759,7 +14937,7 @@ mod tests {
         );
     }
 
-    fn test_layout() -> LayoutState {
+    pub(crate) fn test_layout() -> LayoutState {
         LayoutState {
             lock_sync: false,
             input_protection: Default::default(),
@@ -14829,6 +15007,9 @@ mod tests {
             focus_halo: halo::FocusHaloSettings::default(),
             headless_paused: false,
             agent_channel: default_agent_channel(),
+            layout_revision: 0,
+            active_network_key: String::new(),
+            network_profiles: HashMap::new(),
         }
     }
 
@@ -15899,6 +16080,89 @@ mod tests {
             assert!(!device.online);
             assert!(!device.input_ready);
         }
+    }
+
+    /// 后端改写 devices[]（离线自动删除/换网档案）会自增 layout_revision；
+    /// 前端拿着改写前快照的整仓保存必须整体作废设备列表，否则一次滞后的
+    /// save_layout 就把刚删掉的设备复活了。
+    #[test]
+    fn stale_save_cannot_resurrect_auto_removed_device() {
+        let mut current = test_layout();
+        // 后端删除了 devices[1]（peer-client）并自增 revision。
+        current.devices.pop();
+        current.layout_revision = 7;
+
+        // 前端快照来自删除前：还带着 peer-client，revision 停在 6。
+        let mut incoming = test_layout();
+        incoming.layout_revision = 6;
+
+        let merged = merge_runtime_owned_layout_fields(incoming, &current);
+        assert_eq!(
+            merged.devices.len(),
+            1,
+            "stale device list must be dropped, not merged"
+        );
+        assert_eq!(merged.devices[0].id, "local-device");
+        assert_eq!(merged.layout_revision, 7, "revision must resync to backend");
+    }
+
+    /// revision 相等 = 前端快照晚于后端最后一次改写：设备列表照旧 incoming
+    /// 胜出，用户增删改设备的正常保存路径不受影响。
+    #[test]
+    fn fresh_save_keeps_incoming_device_edits() {
+        let current = test_layout();
+        let mut incoming = test_layout();
+        incoming.layout_revision = current.layout_revision;
+        incoming.devices[1].name = "Renamed".into();
+        incoming.devices.pop(); // 用户手动删了一台
+
+        let merged = merge_runtime_owned_layout_fields(incoming, &current);
+        assert_eq!(merged.devices.len(), 1, "user removal must persist");
+        assert_eq!(
+            merged.layout_revision, current.layout_revision,
+            "ordinary saves must not drift the revision"
+        );
+    }
+
+    /// 换网后 network_profiles/active_network_key 是后端所有的：前端陈旧
+    /// 快照里的旧档案不能覆盖刚切换的结果。
+    #[test]
+    fn stale_save_cannot_overwrite_swapped_profile() {
+        use std::collections::HashMap as StdHashMap;
+        let mut current = test_layout();
+        current.active_network_key = "en5=10.0.0.0/24".into();
+        current.network_profiles = StdHashMap::from([(
+            "en0=192.168.1.0/24".to_string(),
+            NetworkProfile {
+                devices: vec![test_device("peer-a", "Mac mini", "client", false)],
+                saved_at_ms: 1,
+            },
+        )]);
+        current.layout_revision = 3;
+
+        let mut incoming = test_layout();
+        incoming.active_network_key = "en0=192.168.1.0/24".into();
+        incoming.network_profiles = StdHashMap::new();
+        incoming.layout_revision = 2;
+
+        let merged = merge_runtime_owned_layout_fields(incoming, &current);
+        assert_eq!(merged.active_network_key, "en5=10.0.0.0/24");
+        assert_eq!(merged.network_profiles.len(), 1);
+        assert!(merged.network_profiles.contains_key("en0=192.168.1.0/24"));
+    }
+
+    /// 启动/刷新路径（磁盘 → 内存）不能把 revision 回拨：磁盘上的旧代数
+    /// 一旦覆盖内存，前端陈旧快照就能穿过 save_layout 的闸门。
+    #[test]
+    fn disk_merge_never_dials_revision_backwards() {
+        let mut current = test_layout();
+        current.layout_revision = 9;
+        let mut disk = test_layout();
+        disk.layout_revision = 4;
+        disk.devices.pop();
+
+        let merged = merge_disk_layout_into_runtime(disk, &current);
+        assert_eq!(merged.layout_revision, 9, "runtime revision must win");
     }
 
     /// P0-2b:强匹配命中且 id 漂移时,id 级联跟随;screens 的 x/y 摆放保留,

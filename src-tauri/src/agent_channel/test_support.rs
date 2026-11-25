@@ -43,6 +43,9 @@ pub(super) fn test_agent_layout(
         focus_halo: crate::halo::FocusHaloSettings::default(),
         headless_paused: false,
         agent_channel: AgentChannelConfig::default(),
+        layout_revision: 0,
+        active_network_key: String::new(),
+        network_profiles: Default::default(),
     }
 }
 
