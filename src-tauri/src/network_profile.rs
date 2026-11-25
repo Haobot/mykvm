@@ -6,7 +6,7 @@
 //! 设备计一轮 miss，满 `OFFLINE_PROBE_MAX_MISSES` 由调用方移除。所有
 //! 发包与落盘都留在 lib.rs，本模块只做可单测的决策。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -231,11 +231,23 @@ impl OfflineProbeTracker {
     /// 计一轮 miss 并列入本轮探测；满上限的转入删除列表（探测与删除同轮，
     /// 探测包是最后尽力一发，回复到达时设备已移除也无害——回复只合并 peer）。
     /// 已从设备表消失的 id 计数一并回收，防泄漏。
-    pub(crate) fn evaluate(&mut self, devices: &[Device]) -> (Vec<String>, Vec<(String, u32)>) {
+    ///
+    /// `guarded` = peer 表里存在同名/同 host 可见 peer 的设备 id（身份失配
+    /// 但机器在场，见 lib.rs `guarded_offline_device_ids`）。守卫内设备按
+    /// 在线处理：清零、不探测、不删——那是重新配对的修复场景，不是消失。
+    pub(crate) fn evaluate(
+        &mut self,
+        devices: &[Device],
+        guarded: &HashSet<String>,
+    ) -> (Vec<String>, Vec<(String, u32)>) {
         let mut probes = Vec::new();
         let mut removals = Vec::new();
         for device in devices {
-            if device.role == "local" || device.source == "manual" || device.upgrading {
+            if device.role == "local"
+                || device.source == "manual"
+                || device.upgrading
+                || guarded.contains(&device.id)
+            {
                 self.misses.remove(&device.id);
                 continue;
             }
@@ -463,7 +475,7 @@ mod tests {
         let offline = [device("peer-a", "client", "detected", false)];
         let mut last = 0;
         for round in 1..=OFFLINE_PROBE_MAX_MISSES {
-            let (probes, removals) = tracker.evaluate(&offline);
+            let (probes, removals) = tracker.evaluate(&offline, &HashSet::new());
             assert!(
                 probes.contains(&"peer-a".to_string()),
                 "第 {round} 轮要探测"
@@ -485,21 +497,21 @@ mod tests {
     fn offline_probe_counter_resets_when_device_returns_online() {
         let mut tracker = OfflineProbeTracker::new();
         let mut online = [device("peer-a", "client", "detected", false)];
-        tracker.evaluate(&online);
-        tracker.evaluate(&online);
-        let (_, removals) = tracker.evaluate(&online);
+        tracker.evaluate(&online, &HashSet::new());
+        tracker.evaluate(&online, &HashSet::new());
+        let (_, removals) = tracker.evaluate(&online, &HashSet::new());
         assert!(removals.is_empty());
 
         // 回到在线：计数清零，再离线从头攒。
         online[0].online = true;
-        let (probes, _) = tracker.evaluate(&online);
+        let (probes, _) = tracker.evaluate(&online, &HashSet::new());
         assert!(probes.is_empty(), "在线设备不探测");
         online[0].online = false;
         for _ in 0..OFFLINE_PROBE_MAX_MISSES - 1 {
-            let (_, removals) = tracker.evaluate(&online);
+            let (_, removals) = tracker.evaluate(&online, &HashSet::new());
             assert!(removals.is_empty(), "重新离线应重新攒满五轮");
         }
-        let (_, removals) = tracker.evaluate(&online);
+        let (_, removals) = tracker.evaluate(&online, &HashSet::new());
         assert_eq!(removals.len(), 1, "第五轮才删");
     }
 
@@ -513,25 +525,61 @@ mod tests {
         ];
         devices[2].upgrading = true;
         for _ in 0..OFFLINE_PROBE_MAX_MISSES + 2 {
-            let (probes, removals) = tracker.evaluate(&devices);
+            let (probes, removals) = tracker.evaluate(&devices, &HashSet::new());
             assert!(probes.is_empty(), "豁免设备不探测不计数");
             assert!(removals.is_empty(), "豁免设备绝不删除");
         }
         // 升级宽限结束后重新计数。
         devices[2].upgrading = false;
-        let (probes, removals) = tracker.evaluate(&devices);
+        let (probes, removals) = tracker.evaluate(&devices, &HashSet::new());
         assert!(probes.contains(&"peer-upgrading".to_string()));
         assert!(removals.is_empty());
     }
 
     #[test]
+    fn offline_probe_guarded_device_is_never_removed() {
+        // peer 表里有同名/同 host 可见 peer（身份失配但机器在场）：按在线
+        // 处理——清零、不探测、不删；守卫解除后从零重新攒。
+        let mut tracker = OfflineProbeTracker::new();
+        let devices = [device("peer-a", "client", "detected", false)];
+        let guarded: HashSet<String> = ["peer-a".to_string()].into_iter().collect();
+        for _ in 0..OFFLINE_PROBE_MAX_MISSES + 3 {
+            let (probes, removals) = tracker.evaluate(&devices, &guarded);
+            assert!(probes.is_empty(), "守卫内设备不探测");
+            assert!(removals.is_empty(), "守卫内设备绝不删除");
+        }
+
+        // 守卫解除（可见 peer 消失）：从零开始攒，满五轮才删。
+        let unguarded = HashSet::new();
+        for round in 1..OFFLINE_PROBE_MAX_MISSES {
+            let (probes, removals) = tracker.evaluate(&devices, &unguarded);
+            assert!(
+                probes.contains(&"peer-a".to_string()),
+                "第 {round} 轮要探测"
+            );
+            assert!(removals.is_empty(), "第 {round} 轮不该删");
+        }
+        let (_, removals) = tracker.evaluate(&devices, &unguarded);
+        assert_eq!(removals.len(), 1, "守卫解除后第五轮才删");
+    }
+
+    #[test]
     fn offline_probe_counter_drops_devices_gone_from_list() {
         let mut tracker = OfflineProbeTracker::new();
-        tracker.evaluate(&[device("peer-a", "client", "detected", false)]);
-        tracker.evaluate(&[device("peer-a", "client", "detected", false)]);
+        tracker.evaluate(
+            &[device("peer-a", "client", "detected", false)],
+            &HashSet::new(),
+        );
+        tracker.evaluate(
+            &[device("peer-a", "client", "detected", false)],
+            &HashSet::new(),
+        );
         // peer-a 被用户手动删除后列表不再包含它：计数随之回收。
-        tracker.evaluate(&[]);
-        let (probes, removals) = tracker.evaluate(&[device("peer-b", "client", "detected", false)]);
+        tracker.evaluate(&[], &HashSet::new());
+        let (probes, removals) = tracker.evaluate(
+            &[device("peer-b", "client", "detected", false)],
+            &HashSet::new(),
+        );
         assert!(!probes.contains(&"peer-a".to_string()));
         assert!(removals.is_empty());
     }
