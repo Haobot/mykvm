@@ -18,10 +18,13 @@
 //! macOS 把壳层画成叠放的 CAShapeLayer，Windows 按同一剖面逐像素填充，
 //! [`composite_pixel`] 的合成模型与 CA 的 source-over 逐层合成一致。
 
-/// 脊线距窗口边缘的内缩量（pt）。
+/// 脊线距窗口边缘的内缩量（pt）。只被平台绘制器消费（单测不引用），
+/// 豁免 Linux 全部构建形态的死代码告警。
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) const SPINE_INSET: f64 = 12.0;
 
-/// 脊线圆角半径（pt）。
+/// 脊线圆角半径（pt）。同 [`SPINE_INSET`]。
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) const SPINE_RADIUS: f64 = 18.0;
 
 /// 光晕颜色 `rgba(56, 150, 255)`（通道 0-255）。透明度由壳层剖面给出。
