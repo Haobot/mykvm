@@ -22,6 +22,11 @@
 
 use std::time::Duration;
 
+// 剖面只被 macOS/Windows 绘制器与单测消费；Linux（空实现平台）豁免死代码。
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code)
+)]
 pub(crate) mod glow;
 
 /// 光圈停留时长：与 3 拍脉冲动画（0.45s × 3 交替 ≈ 1.35s）对齐。
@@ -29,6 +34,10 @@ pub const FLASH_DURATION: Duration = Duration::from_millis(1400);
 
 /// CSS `0.45s ease-in-out 3 alternate`（透明度 0.35→1）的线性近似：
 /// 每拍在两端之间往返，奇数拍反向。纯函数，单测锁定端点。
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", test)),
+    allow(dead_code)
+)]
 pub(crate) fn pulse_alpha(elapsed_ms: f64) -> f64 {
     const HALF_MS: f64 = 450.0;
     const BEATS: f64 = 3.0;
