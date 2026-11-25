@@ -13879,7 +13879,9 @@ mod tests {
         current.devices[1].quic_port = 52001;
         current.devices[1].host = "10.0.0.99".into();
         current.devices[1].upgrading = true;
-        current.devices[1].upgrading_until_ms = now_ms() + 60_000;
+        // 时间戳只取一次：断言若再次调用 now_ms()，毫秒跳变会偶发失败。
+        let upgrading_until_ms = now_ms() + 60_000;
+        current.devices[1].upgrading_until_ms = upgrading_until_ms;
 
         let mut stale = current.clone();
         stale.devices[1].transport_public_key = "old-key".into();
@@ -13904,7 +13906,7 @@ mod tests {
             assert_eq!(merged.devices[1].quic_port, 52001);
             assert_eq!(merged.devices[1].host, "10.0.0.99");
             assert!(merged.devices[1].upgrading);
-            assert_eq!(merged.devices[1].upgrading_until_ms, now_ms() + 60_000);
+            assert_eq!(merged.devices[1].upgrading_until_ms, upgrading_until_ms);
             // 用户可编辑字段保持 incoming 优先。
             assert_eq!(merged.devices[1].name, "User renamed");
         }
