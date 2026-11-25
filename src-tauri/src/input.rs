@@ -9934,6 +9934,9 @@ fn inject_key(_key_code: u16, _down: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 父模块对 LEFT_BUTTON_MASK 的 use 是 cfg(macos/windows) 的，glob 取不到；
+    // 测试在全平台编译，这里显式再引一次（与 glob 同名时显式优先，无冲突）。
+    use crate::shared_input::LEFT_BUTTON_MASK;
 
     /// Tests run in parallel and share the global `UNDECODABLE_INPUT_PACKETS`
     /// counter, so every test that reads it (to assert an exact delta, or to
