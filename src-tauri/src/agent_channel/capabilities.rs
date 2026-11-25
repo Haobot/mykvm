@@ -210,7 +210,12 @@ fn read_stat_entries(path: &Path) -> Result<(Vec<Value>, bool), String> {
             (
                 entry.file_name().to_string_lossy().into_owned(),
                 metadata.as_ref().is_some_and(|metadata| metadata.is_dir()),
-                metadata.map(|metadata| metadata.len()).unwrap_or(0),
+                // 目录条目 sizeBytes 跨平台归零：st_size 对目录是文件系统
+                // 内部值（APFS 64/ext4 4096/Windows 0），对消费方没有意义。
+                metadata
+                    .filter(|metadata| !metadata.is_dir())
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
             )
         })
         .collect();
