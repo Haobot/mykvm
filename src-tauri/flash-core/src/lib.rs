@@ -6,25 +6,28 @@
 //! 的窗口框架回读全部正确但内容永不出现。改为两端都走 halo 浮层同款的
 //! 原生窗口路径——同构浮层在本机外接屏上实测可见：
 //!
-//! - macOS：无边框点击穿透 NSWindow + CAShapeLayer 圆角描边，Core
-//!   Animation 驱动 0.45s×3 交替脉冲，1.4s 后 orderOut+release。
+//! - macOS：无边框点击穿透 NSWindow + CAShapeLayer 双层虚化光晕
+//!   （外层弥散光晕 + 内层亮芯，见 [`glow`]），Core Animation 驱动
+//!   0.45s×3 交替脉冲，1.4s 后 orderOut+release。
 //! - Windows：WS_EX_LAYERED 分层窗 + GDI DIB 像素脉冲（复用 halo win32
 //!   的 paint/breathing 思路），自带消息循环线程，1.4s 自毁。
 //! - Linux：非运行平台，记日志即可。
+//!
+//! 全屏应用会把光圈挤下层级（Windows）或挤出 Space 前排（macOS），
+//! 两端在存活期内周期性重申置顶（macOS 300ms×4；Windows 随 100ms 重绘
+//! tick 逐次重申 HWND_TOPMOST）。
 //!
 //! 入口 [`flash_logical_rect`] 的矩形与 `detect_local_screens` 同一空间
 //! （逻辑坐标、左上原点、y 向下），可在任意线程调用。
 
 use std::time::Duration;
 
+pub(crate) mod glow;
+
 /// 光圈停留时长：与 3 拍脉冲动画（0.45s × 3 交替 ≈ 1.35s）对齐。
 pub const FLASH_DURATION: Duration = Duration::from_millis(1400);
 
-/// CSS 里的 `rgba(56, 150, 255, 0.92)`——与前端画布选中描边同色系。
-/// 通道统一存 0-255，alpha 同乘 255；两端渲染前各自归一。
-pub(crate) const RING_RGBA: (f64, f64, f64, f64) = (56.0, 150.0, 255.0, 0.92 * 255.0);
-
-/// CSS `0.45s ease-in-out 3 alternate`（透明度 0.4→1）的线性近似：
+/// CSS `0.45s ease-in-out 3 alternate`（透明度 0.35→1）的线性近似：
 /// 每拍在两端之间往返，奇数拍反向。纯函数，单测锁定端点。
 pub(crate) fn pulse_alpha(elapsed_ms: f64) -> f64 {
     const HALF_MS: f64 = 450.0;
@@ -36,9 +39,9 @@ pub(crate) fn pulse_alpha(elapsed_ms: f64) -> f64 {
     let beat = step.floor() as u32;
     let frac = step - f64::from(beat);
     if beat.is_multiple_of(2) {
-        0.4 + 0.6 * frac
+        0.35 + 0.65 * frac
     } else {
-        1.0 - 0.6 * frac
+        1.0 - 0.65 * frac
     }
 }
 
@@ -65,18 +68,20 @@ use windows_imp as imp;
 #[cfg(target_os = "macos")]
 mod macos_imp {
     use std::ffi::c_void;
+    use std::time::Duration;
 
     use core_graphics::geometry::{CGAffineTransform, CGPoint, CGRect, CGSize};
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
     use objc2_foundation::NSString;
 
-    use super::{pulse_alpha, FLASH_DURATION, RING_RGBA};
+    use super::{glow, pulse_alpha, FLASH_DURATION};
 
-    /// 光圈内缘离屏幕边的距离、描边宽与圆角（点），对齐原 html 的样式。
-    const RING_INSET: f64 = 8.0;
-    const RING_WIDTH: f64 = 10.0;
-    const RING_RADIUS: f64 = 18.0;
+    /// 存活期内置顶重申：全屏应用会把光圈挤出 Space 前排/压下层级，
+    /// 4 次 × 300ms 重申 + 尾部收尾 = 停留时长 1400ms。
+    const REASSERT_INTERVAL: Duration = Duration::from_millis(300);
+    const REASSERT_TIMES: u32 = 4;
+
     const PULSE_HALF_SECONDS: f64 = 0.45;
 
     // 与 NSRect 同布局（原点在主屏左下、y 向上，点坐标）。
@@ -105,6 +110,7 @@ mod macos_imp {
             corner_width: f64,
             corner_height: f64,
         );
+        fn CGPathRelease(path: *mut c_void);
         fn CGColorCreateGenericRGB(red: f64, green: f64, blue: f64, alpha: f64) -> *mut c_void;
     }
     #[link(name = "System")]
@@ -209,18 +215,6 @@ mod macos_imp {
         let _: () = msg_send![window_ref, setOpaque: false];
         let _: () = msg_send![window_ref, setHasShadow: false];
         let _: () = msg_send![window_ref, setIgnoresMouseEvents: true];
-        // tauri 的 always-on-top 是 floating 层（3），会被菜单栏（25）和
-        // 程序坞（20）遮住光圈的上/下边缘；抬到 NSScreenSaverWindowLevel。
-        //
-        // setLevel: 的参数 ABI 在 macOS 27 上实测也变了：按传统 CGFloat(f64)
-        // 传参时，实现从整数寄存器读值（读回 level 得到垃圾/1），层级实际
-        // 只有 ≈0~1，压不过副屏的全屏空间。改为先按 i64 设并回读，读不到
-        // 1000 再按 f64 兜底，两种 ABI 下都保证最终是 1000。
-        let _: () = msg_send![window_ref, setLevel: 1000_i64];
-        let probe: i64 = msg_send![window_ref, level];
-        if probe != 1000 {
-            let _: () = msg_send![window_ref, setLevel: 1000.0_f64];
-        }
         // CanJoinAllSpaces (1<<0) | FullScreenAuxiliary (1<<8)。
         //
         // 注意：setCollectionBehavior: 在 macOS 27 上也是整数 ABI（f64 兜底
@@ -237,7 +231,7 @@ mod macos_imp {
             let _: () = msg_send![view_ref, release];
             let host: *mut AnyObject = msg_send![view_ref, layer];
             if !host.is_null() {
-                attach_ring(&*host, frame, window_ref);
+                attach_glow(&*host, frame, window_ref);
             }
         }
         // 撑到目标全屏框（setFrame 的 rect 传参已证可靠），并把内容视图
@@ -256,29 +250,85 @@ mod macos_imp {
             frame_now.w,
             frame_now.h
         );
-        let _: () = msg_send![window_ref, orderFrontRegardless];
+        assert_flash_front(window_ref);
         Some(window)
     }
 
-    /// 圆角描边光圈层：内缩 RING_INSET 让描边完整落在窗内，只描边不填充，
-    /// 内部完全透明。path 与 strokeColor 都是 strong 属性，+1 引用直接移交。
-    unsafe fn attach_ring(host: &AnyObject, frame: NsRect, window: &AnyObject) {
+    /// 把光圈窗抬到 NSScreenSaverWindowLevel 并强制上屏。建窗收尾与
+    /// 存活期重申（[`schedule_close`]）共用同一条路径。
+    ///
+    /// tauri 的 always-on-top 是 floating 层（3），会被菜单栏（25）和
+    /// 程序坞（20）遮住光圈的上/下边缘；抬到 NSScreenSaverWindowLevel
+    /// （1000）。后台 app 建窗可能被 macOS 抑制显示，`orderFrontRegardless`
+    /// 绕过激活检查强制上屏；扩展屏跑应用全屏（全屏 Space）时也靠它把
+    /// 光圈从前排夺回。
+    ///
+    /// setLevel: 的参数 ABI 在 macOS 27 上实测也变了：按传统 CGFloat(f64)
+    /// 传参时，实现从整数寄存器读值（读回 level 得到垃圾/1），层级实际
+    /// 只有 ≈0~1，压不过副屏的全屏空间。改为先按 i64 设并回读，读不到
+    /// 1000 再按 f64 兜底，两种 ABI 下都保证最终是 1000。不要换回
+    /// set_always_on_top——那会把层级压回 floating 层。
+    fn assert_flash_front(window_ref: &AnyObject) {
+        unsafe {
+            let _: () = msg_send![window_ref, setLevel: 1000_i64];
+            let probe: i64 = msg_send![window_ref, level];
+            if probe != 1000 {
+                let _: () = msg_send![window_ref, setLevel: 1000.0_f64];
+            }
+            let _: () = msg_send![window_ref, orderFrontRegardless];
+        }
+    }
+
+    /// 双层虚化光晕：外层弥散光晕 + 内层亮芯，取代旧硬描边。壳层剖面
+    /// 见 [`glow`]——由外到内、先光晕后亮芯（与 CSS `.glow` → `.ring`
+    /// 层叠顺序一致），逐壳层 source-over 叠加等价于
+    /// [`glow::composite_pixel`] 的合成模型。只描边不填充，内部透明。
+    unsafe fn attach_glow(host: &AnyObject, frame: NsRect, window: &AnyObject) {
+        let path = rounded_rect_path(frame);
+        if path.is_null() {
+            return;
+        }
+        let scale: f64 = msg_send![window, backingScaleFactor];
+        for (width, alpha, rgb) in glow::GLOW_SHELLS
+            .iter()
+            .map(|(width, alpha)| (*width, *alpha, glow::GLOW_RGB))
+            .chain(
+                glow::CORE_SHELLS
+                    .iter()
+                    .map(|(width, alpha)| (*width, *alpha, glow::CORE_RGB)),
+            )
+        {
+            add_shell_layer(host, path, frame, scale, width, alpha, rgb);
+        }
+        // 各层 setPath: 都已 retain，交掉我们的 +1。
+        CGPathRelease(path);
+    }
+
+    /// 一圈固定宽度/透明度的描边壳层。path 与 strokeColor 都是 strong
+    /// 属性，+1 引用移交后释放我们的那份。
+    unsafe fn add_shell_layer(
+        host: &AnyObject,
+        path: *mut c_void,
+        frame: NsRect,
+        scale: f64,
+        width: f64,
+        alpha: f64,
+        rgb: (f64, f64, f64),
+    ) {
         let layer_alloc: *mut AnyObject = msg_send![class!(CAShapeLayer), alloc];
         let layer: *mut AnyObject = msg_send![layer_alloc, init];
         if layer.is_null() {
             return;
         }
         let layer_ref = &*layer;
-        let path = rounded_rect_path(frame) as *mut AnyObject;
-        let _: () = msg_send![layer_ref, setPath: path];
-        let (r, g, b, a) = RING_RGBA;
+        let _: () = msg_send![layer_ref, setPath: path as *mut AnyObject];
+        let (r, g, b) = rgb;
         let stroke =
-            CGColorCreateGenericRGB(r / 255.0, g / 255.0, b / 255.0, a / 255.0) as *mut AnyObject;
+            CGColorCreateGenericRGB(r / 255.0, g / 255.0, b / 255.0, alpha) as *mut AnyObject;
         let _: () = msg_send![layer_ref, setStrokeColor: stroke];
         let _: () = msg_send![layer_ref, setFillColor: std::ptr::null::<AnyObject>()];
-        let scale: f64 = msg_send![window, backingScaleFactor];
         let _: () = msg_send![layer_ref, setContentsScale: scale];
-        let _: () = msg_send![layer_ref, setLineWidth: RING_WIDTH];
+        let _: () = msg_send![layer_ref, setLineWidth: width];
         let _: () =
             msg_send![layer_ref, setFrame: NsRect { x: 0.0, y: 0.0, w: frame.w, h: frame.h }];
         start_pulse(layer_ref);
@@ -287,6 +337,8 @@ mod macos_imp {
         let _: () = msg_send![layer_ref, release];
     }
 
+    /// 脊线圆角矩形：内缩 [`glow::SPINE_INSET`]、圆角 [`glow::SPINE_RADIUS`]，
+    /// 各壳层以它为中心线按各自宽度对称铺开。
     unsafe fn rounded_rect_path(frame: NsRect) -> *mut c_void {
         let path = CGPathCreateMutable();
         if path.is_null() {
@@ -294,19 +346,25 @@ mod macos_imp {
         }
         let inner = CGRect {
             origin: CGPoint {
-                x: RING_INSET,
-                y: RING_INSET,
+                x: glow::SPINE_INSET,
+                y: glow::SPINE_INSET,
             },
             size: CGSize {
-                width: frame.w - RING_INSET * 2.0,
-                height: frame.h - RING_INSET * 2.0,
+                width: (frame.w - glow::SPINE_INSET * 2.0).max(0.0),
+                height: (frame.h - glow::SPINE_INSET * 2.0).max(0.0),
             },
         };
-        CGPathAddRoundedRect(path, std::ptr::null(), inner, RING_RADIUS, RING_RADIUS);
+        CGPathAddRoundedRect(
+            path,
+            std::ptr::null(),
+            inner,
+            glow::SPINE_RADIUS,
+            glow::SPINE_RADIUS,
+        );
         path
     }
 
-    /// 与 html 版同拍数的 Core Animation 脉冲：透明度 0.4↔1，0.45s 一拍，
+    /// 与 html 版同拍数的 Core Animation 脉冲：透明度 0.35↔1，0.45s 一拍，
     /// 自动往复 3 次（≈1.35s）。
     unsafe fn start_pulse(layer: &AnyObject) {
         let key = NSString::from_str("opacity");
@@ -335,12 +393,25 @@ mod macos_imp {
     }
 
     /// 倒计时归零后回主队列收尾：orderOut 再 release，窗与内容一起释放。
+    /// 存活期内每 [`REASSERT_INTERVAL`] 重申一次置顶/上屏——扩展屏跑
+    /// 应用全屏（全屏 Space）时，全屏应用会把光圈挤出前排，靠 4 次重申
+    /// 压回来（4×300ms 重申 + 尾部收尾 = 1400ms 停留）。
     fn schedule_close(window: *mut AnyObject) {
         let ptr = window as usize;
         std::thread::spawn(move || {
-            std::thread::sleep(FLASH_DURATION);
+            for _ in 0..REASSERT_TIMES {
+                std::thread::sleep(REASSERT_INTERVAL);
+                on_main(reassert_flash_front, ptr as *mut c_void);
+            }
+            std::thread::sleep(FLASH_DURATION.saturating_sub(REASSERT_INTERVAL * REASSERT_TIMES));
             on_main(close_flash, Box::into_raw(Box::new(ptr)) as *mut c_void);
         });
+    }
+
+    /// 重申回调：借用窗口指针（不转移所有权，收尾仍归 [`close_flash`]）。
+    extern "C" fn reassert_flash_front(ctx: *mut c_void) {
+        let window = unsafe { &*(ctx as *const AnyObject) };
+        assert_flash_front(window);
     }
 
     extern "C" fn close_flash(ctx: *mut c_void) {
@@ -373,19 +444,18 @@ mod windows_imp {
     use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        PostQuitMessage, RegisterClassW, SetTimer, ShowWindow, UpdateLayeredWindow, MSG,
-        SW_SHOWNOACTIVATE, ULW_ALPHA, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        PostQuitMessage, RegisterClassW, SetTimer, SetWindowPos, ShowWindow, UpdateLayeredWindow,
+        HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, ULW_ALPHA,
+        WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT, WS_POPUP,
     };
 
-    use super::{pulse_alpha, RING_RGBA};
+    use super::{glow, pulse_alpha};
 
-    // 光圈几何（逻辑点）：内缘离屏幕边 8、描边 10、圆角 18——描边中线
-    // 离边 13，画进位图时全部乘目标屏 DPI scale 变物理像素。
-    const RING_INSET: f64 = 8.0;
-    const RING_WIDTH: f64 = 10.0;
-    const RING_RADIUS: f64 = 18.0;
-    // 重绘节拍：100ms 一帧足够平滑，远轻于 halo 边框的 16ms。
+    // 重绘节拍：100ms 一帧足够平滑，远轻于 halo 边框的 16ms。每个 tick
+    // 顺带重申 HWND_TOPMOST——扩展屏跑应用全屏时，全屏应用会把光圈压下
+    // 层级，逐 tick 重申（SWP_NOMOVE|NOSIZE|NOACTIVATE，几乎零开销）保它
+    // 始终压在最上层。
     const TIMER_MS: u32 = 100;
 
     pub(super) fn flash(rect: (f64, f64, f64, f64)) {
@@ -433,7 +503,6 @@ mod windows_imp {
             DestroyWindow(hwnd);
             return;
         };
-        let (pad, band, radius) = ring_geometry(scale);
         log::info!(
             "screen indicator at physical ({x},{y}) [{width}x{height}] scale={scale} monitor=({},{},{},{})",
             rc.left,
@@ -454,20 +523,21 @@ mod windows_imp {
                     PostQuitMessage(0);
                     continue;
                 }
+                // 置顶重申：全屏应用可能在存活期内把光圈压下层级。
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
                 let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
                 let pixels = unsafe {
                     std::slice::from_raw_parts_mut(renderer.bits, (width * height) as usize)
                 };
-                paint_border(
-                    pixels,
-                    width,
-                    height,
-                    pad,
-                    band,
-                    radius,
-                    RING_RGBA,
-                    pulse_alpha(elapsed_ms),
-                );
+                paint_glow(pixels, width, height, scale, pulse_alpha(elapsed_ms));
                 renderer.present(hwnd, (x, y), 1.0);
                 continue;
             }
@@ -539,80 +609,41 @@ mod windows_imp {
         )
     }
 
-    fn ring_geometry(scale: f64) -> (i32, i32, i32) {
-        (
-            ((RING_INSET + RING_WIDTH / 2.0) * scale).round() as i32,
-            (RING_WIDTH * scale).round() as i32,
-            (RING_RADIUS * scale).round() as i32,
-        )
-    }
-
-    /// Non-premultiplied ARGB → premultiplied BGRA，额外乘一层描边透明度
-    /// （脉冲值），与 halo 渲染器的像素格式一致。
-    fn premultiply_argb(rgba: (f64, f64, f64, f64), coverage: f64) -> u32 {
-        let (r, g, b, a) = rgba;
-        let alpha = ((a / 255.0) * coverage).clamp(0.0, 1.0);
-        let scale = |channel: f64| ((channel / 255.0) * alpha * 255.0).round() as u32;
-        let alpha8 = (alpha * 255.0).round() as u32;
-        (alpha8 << 24) | (scale(r) << 16) | (scale(g) << 8) | scale(b)
-    }
-
-    /// 判断点是否落在圆角矩形内（含边界），容忍退化输入（w/h ≤ 0、圆角
-    /// 过大），与 halo 的实现同逻辑。
-    fn inside_rounded(px: f64, py: f64, x: f64, y: f64, w: f64, h: f64, r: f64) -> bool {
-        if w <= 0.0 || h <= 0.0 {
-            return false;
-        }
-        if px < x || px > x + w || py < y || py > y + h {
-            return false;
-        }
-        let r = r.max(0.0).min(w / 2.0).min(h / 2.0);
-        let cx = px.clamp(x + r, x + w - r);
-        let cy = py.clamp(y + r, y + h - r);
-        let dx = px - cx;
-        let dy = py - cy;
-        dx * dx + dy * dy <= r * r
-    }
-
-    /// 把空心圆角描边带画进 `pixels`（width × height，premultiplied BGRA，
-    /// top-down）。带骑在离边 `pad` 像素的圆角轮廓上，带宽 `band`，内部
-    /// 全透明。`alpha` 缩放描边（调用方喂脉冲值）。
-    #[allow(clippy::too_many_arguments)]
-    fn paint_border(
-        pixels: &mut [u32],
-        width: i32,
-        height: i32,
-        pad: i32,
-        band: i32,
-        radius: i32,
-        rgba: (f64, f64, f64, f64),
-        alpha: f64,
-    ) {
-        let outline_w = f64::from(width - 2 * pad);
-        let outline_h = f64::from(height - 2 * pad);
-        if outline_w <= 0.0 || outline_h <= 0.0 {
+    /// 把双层光晕描边画进 `pixels`（width × height，premultiplied BGRA，
+    /// top-down）。几何与合成见 [`glow`]：内缩 [`glow::SPINE_INSET`] 的
+    /// 圆角矩形是两族壳层的共同脊线，逐像素按到脊线的距离叠壳层覆盖率，
+    /// 亮芯 over 光晕合成，`pulse` 整体缩放透明度。覆盖足迹不随脉冲变，
+    /// 足迹外的像素始终不动（DIB 初始为零）；足迹内逐帧覆写，零脉冲会
+    /// 把上一帧清干净。
+    fn paint_glow(pixels: &mut [u32], width: i32, height: i32, scale: f64, pulse: f64) {
+        let inset = glow::SPINE_INSET * scale;
+        let radius = glow::SPINE_RADIUS * scale;
+        let spine_w = f64::from(width) - 2.0 * inset;
+        let spine_h = f64::from(height) - 2.0 * inset;
+        if spine_w <= 0.0 || spine_h <= 0.0 {
             return;
         }
-        let half_band = f64::from(band) / 2.0;
-        // 包住描边带的内外两个圆角矩形。
-        let outer = f64::from(pad) - half_band;
-        let outer_w = outline_w + f64::from(band);
-        let outer_h = outline_h + f64::from(band);
-        let outer_r = f64::from(radius) + half_band;
-        let inner = f64::from(pad) + half_band;
-        let inner_w = outline_w - f64::from(band);
-        let inner_h = outline_h - f64::from(band);
-        let inner_r = (f64::from(radius) - half_band).max(0.0);
-        let stroke = premultiply_argb(rgba, alpha);
+        // 壳层宽度换算到物理像素，透明度不变。
+        let glow_shells = glow::GLOW_SHELLS.map(|(width, alpha)| (width * scale, alpha));
+        let core_shells = glow::CORE_SHELLS.map(|(width, alpha)| (width * scale, alpha));
         for y in 0..height {
             for x in 0..width {
-                let px = f64::from(x) + 0.5;
-                let py = f64::from(y) + 0.5;
-                if inside_rounded(px, py, outer, outer, outer_w, outer_h, outer_r)
-                    && !inside_rounded(px, py, inner, inner, inner_w, inner_h, inner_r)
-                {
-                    pixels[(y * width + x) as usize] = stroke;
+                let sd = glow::sd_rounded_rect(
+                    f64::from(x) + 0.5,
+                    f64::from(y) + 0.5,
+                    inset,
+                    inset,
+                    spine_w,
+                    spine_h,
+                    radius,
+                )
+                .abs();
+                let ag = glow::coverage(sd, &glow_shells);
+                let ac = glow::coverage(sd, &core_shells);
+                if ag <= 0.0 && ac <= 0.0 {
+                    continue;
                 }
+                pixels[(y * width + x) as usize] = glow::composite_pixel(ac, ag, pulse);
             }
         }
     }
@@ -737,20 +768,23 @@ mod windows_imp {
         }
 
         #[test]
-        fn ring_geometry_straddles_the_outline() {
-            // pad = inset + half band；scale 1.0 时不放大。
-            assert_eq!(ring_geometry(1.0), (13, 10, 18));
-            assert_eq!(ring_geometry(1.25), (16, 13, 23));
+        fn paint_glow_keeps_the_far_interior_transparent() {
+            let mut pixels = vec![0u32; 200 * 200];
+            paint_glow(&mut pixels, 200, 200, 1.0, 1.0);
+            // 画布中心离脊线（内缩 12）足够远，必须保持透明。
+            assert_eq!(pixels[100 * 200 + 100], 0, "光圈内部必须全透明");
+            // 脊线（右缘内 12px 处）上必须有可见像素。
+            let spine = pixels[100 * 200 + (200 - 12)];
+            assert!(spine >> 24 > 0, "脊线上必须有可见像素");
         }
 
         #[test]
-        fn paint_border_leaves_interior_transparent() {
-            let mut pixels = vec![0u32; 40 * 30];
-            paint_border(&mut pixels, 40, 30, 3, 2, 2, (0.0, 0.0, 255.0, 255.0), 1.0);
-            let center = pixels[15 * 40 + 20];
-            assert_eq!(center, 0, "光圈内部必须全透明");
-            // 描边带上至少有一条不透明像素。
-            assert!(pixels.iter().any(|p| (*p >> 24) > 0));
+        fn paint_glow_zero_pulse_clears_the_previous_frame() {
+            let mut pixels = vec![0u32; 60 * 60];
+            paint_glow(&mut pixels, 60, 60, 1.0, 1.0);
+            assert!(pixels.iter().any(|p| *p >> 24 > 0), "峰值脉冲必须画出像素");
+            paint_glow(&mut pixels, 60, 60, 1.0, 0.0);
+            assert!(pixels.iter().all(|p| *p == 0), "零脉冲必须清掉上一帧");
         }
     }
 }
@@ -772,18 +806,18 @@ mod tests {
 
     #[test]
     fn pulse_starts_dim_and_hits_full_by_first_turn() {
-        assert!((pulse_alpha(0.0) - 0.4).abs() < 1e-9);
-        assert!((pulse_alpha(225.0) - 0.7).abs() < 1e-9);
+        assert!((pulse_alpha(0.0) - 0.35).abs() < 1e-9);
+        assert!((pulse_alpha(225.0) - 0.675).abs() < 1e-9);
         assert!((pulse_alpha(450.0) - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn pulse_alternates_within_bounds_and_settles_at_full() {
         // 第二拍反向：中点从 1.0 回落。
-        assert!((pulse_alpha(675.0) - 0.7).abs() < 1e-9);
+        assert!((pulse_alpha(675.0) - 0.675).abs() < 1e-9);
         for ms in [0.0, 100.0, 450.0, 900.0, 1349.0] {
             let alpha = pulse_alpha(ms);
-            assert!((0.4..=1.0).contains(&alpha), "alpha {alpha} at {ms}ms");
+            assert!((0.35..=1.0).contains(&alpha), "alpha {alpha} at {ms}ms");
         }
         // 三拍后定格在 1.0。
         assert!((pulse_alpha(1400.0) - 1.0).abs() < 1e-9);

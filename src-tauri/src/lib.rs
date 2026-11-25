@@ -2012,35 +2012,6 @@ fn spawn_flash_helper(rect: (f64, f64, f64, f64)) -> Result<(), String> {
         .map_err(|error| format!("spawn: {error}"))
 }
 
-/// 置顶重申：Windows 直接重申 HWND_TOPMOST；macOS 不能用
-/// `set_always_on_top`（它会把层级压回 floating(3)，盖掉光圈窗刻意抬到的
-/// NSScreenSaverWindowLevel），改为回主线程重设层级 + `orderFrontRegardless`。
-fn reassert_screen_indicator_front(window: &tauri::WebviewWindow) {
-    #[cfg(target_os = "windows")]
-    {
-        if let Err(error) = window.set_always_on_top(true) {
-            log::debug!("screen indicator topmost reassert failed: {error}");
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let Ok(ns_window) = window.ns_window() else {
-            return;
-        };
-        // objc 指针不是 Send：以 usize 过线程，主线程回调里再换回指针
-        // （同 halo/macos.rs 的静态指针存法）。
-        let ns_window = ns_window as usize;
-        let app = window.app_handle().clone();
-        if let Err(error) = app.run_on_main_thread(move || {
-            bring_screen_indicator_front(ns_window as *mut std::ffi::c_void);
-        }) {
-            log::debug!("screen indicator front reassert dispatch failed: {error}");
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = window;
-}
-
 /// 布局画布点选远端（被控）磁贴：通过 QUIC 输入通道向对端发 FlashScreen
 /// 事件，由被控机在自己的对应物理屏上闪光圈。
 #[tauri::command]
