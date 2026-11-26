@@ -344,7 +344,8 @@ jobs:
             data.version = version;
             if (file === 'src-tauri/tauri.conf.json' && channel === 'beta') {
               data.plugins.updater.endpoints = [
-                'https://github.com/XxMinor/mykvm/releases/download/beta/latest.json',
+                'https://dl.davenger.cloud/mykvm/beta/latest.json',
+                'https://github.com/Haobot/mykvm/releases/download/beta/latest.json',
               ];
             }
             fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
@@ -585,7 +586,6 @@ jobs:
 
       - name: Generate latest.json
         env:
-          REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
           VERSION: ${{ needs.prepare.outputs.version }}
           RELEASE_NOTES: ${{ needs.prepare.outputs.release_notes }}
@@ -600,7 +600,8 @@ jobs:
           const tag = process.env.TAG;
           const version = process.env.VERSION;
           const notes = process.env.RELEASE_NOTES || `Release ${tag}`;
-          const baseUrl = `https://github.com/${process.env.REPO}/releases/download/${tag}`;
+          // 更新包从下载站分发（国内可达），GitHub Releases 只作清单备份源。
+          const baseUrl = `https://dl.davenger.cloud/mykvm/${tag}`;
           const assetUrl = (name) => `${baseUrl}/${encodeURIComponent(name)}`;
           const signatureFor = (name) => {
             const sigName = `${name}.sig`;
@@ -719,6 +720,55 @@ jobs:
             fi
           fi
 
+      - name: Stage assets for the download site
+        shell: bash
+        run: |
+          set -euo pipefail
+          # dl/（安装包 + .sig）连同 latest.json 交给 publish-cos 任务上传 dl.davenger.cloud。
+          cp latest.json dl/latest.json
+
+      - name: Upload staged assets artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ needs.prepare.outputs.tag }}
+          path: dl/
+          compression-level: 0
+          if-no-files-found: error
+
+  publish-cos:
+    name: Publish to download site
+    needs:
+      - prepare
+      - assemble-latest-json
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download staged release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ needs.prepare.outputs.tag }}
+          path: dl
+
+      - name: Upload installers, manifest and web page to dl.davenger.cloud
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+        run: |
+          set -euo pipefail
+          node scripts/publish-to-cos.mjs \
+            --assets dl \
+            --web web \
+            --screenshots docs/screenshots \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --channel "$CHANNEL"
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -726,9 +776,9 @@ jobs:
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           set -euo pipefail
-          # Now that every platform bundle AND latest.json are attached, flip the
-          # draft to published. Only at this point does releases/latest advance to
-          # this tag, so the in-app updater never sees a manifest-less release.
+          # 现在每个平台的产物、latest.json 都已附上，且下载站已就绪，把
+          # draft 翻正。只有到这一步 releases/latest 才前进到本 tag，应用内
+          # 更新器永远看不到没有清单的 release。
           if [[ "$CHANNEL" == "beta" ]]; then
             gh release edit "$TAG" --draft=false --prerelease --latest=false --repo "$GITHUB_REPOSITORY"
           else

@@ -13,6 +13,8 @@ import { request as httpsRequest } from 'node:https';
 import { pathToFileURL } from 'node:url';
 
 export const IMMUTABLE_CACHE = 'public, max-age=31536000, immutable';
+// 截图文件名固定、内容可能随版本更新，给一天缓存而不是 immutable。
+export const SHORT_CACHE = 'public, max-age=86400';
 export const NO_CACHE = 'no-cache';
 
 const DEFAULT_BUCKET = 'voicestick-dl-1329978361';
@@ -163,7 +165,7 @@ export function buildUploadPlan({
     uploads.push({
       localPath,
       cosKey: `mykvm/assets/${name}`,
-      cacheControl: IMMUTABLE_CACHE,
+      cacheControl: SHORT_CACHE,
       contentType: contentTypeFor(name),
     });
   }
