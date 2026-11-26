@@ -26,6 +26,7 @@
 | BUG-004 | Bug | 切换屏幕分辨率后，「屏幕排布」界面中屏幕可能重叠导致错误 | 高 | 待验收 | 2026-11-18 |
 | BUG-005 | Bug | 布局点选磁贴的光圈在 Mac 外接屏上不显示（仅主屏能闪） | 中 | 已关闭 | 2026-11-18 |
 | BUG-007 | Bug | 拔插孪生扩展屏后「显示器布局」两屏顺序变化，鼠标穿越出错 | 高 | 待排查 | 2026-11-25 |
+| BUG-008 | Bug | Halo 光环在扭头切屏/保存布局后消失（画板坐标被当 CG 原生坐标） | 高 | 待验收 | 2026-11-26 |
 
 ---
 
@@ -265,6 +266,44 @@
 
 ---
 
+## BUG-008 Halo 光环在扭头切屏/保存布局后消失（画板坐标被当 CG 原生坐标）
+
+- 类型：Bug　严重度：高　状态：待验收　记录日期：2026-11-26
+- 发现方式：真机使用（用户报告「Halo 光环在扭头后消失」；与 11-07「回看 mac 屏光环消失」同源）
+
+**现象**
+
+- FocusHalo 光环在扭头切屏（region 切换）后从屏幕上消失，之后怎么切换都不恢复；重开应用/重开跟踪后光环复现，再切一次又消失。
+- 同一缺陷的另一触发路径：保存布局（`save_layout` → `SetScreens`）后光环同样消失。
+
+**定位结论（2026-11-26，CGWindowList 窗口取证 + 日志实锤）**
+
+- **画板坐标 ≠ CG 原生坐标**：本机两块屏的画板位置相对 CG 恒定平移 `(-3036,-448)`（两屏平移量一致，实测）。分叉不是 11-25 才有——轮转日志显示 **11-07 联调期画板已在 `(17160,5120)`**（CG 在 `(0,0)`，差 ~17000，与 070f9fc 复盘里「板面坐标系各自本地化」一致）；此后每次拔插/重排只是换了平移量。`apply_detected_local_screens` 保留画布 x/y 只刷新宽高，画板与 CG 只会越走越远。
+- **mac 端 halo 把画板当 CG 恒等**：引擎初始几何来自 `native_layout`（真 CG），而 `halo_screen_entries` 屏幕表来自画板（`halo_native_origin` mac 分支恒等返回 `screen.x`）→ 两者几何对不上 → 保存布局/region 切换触发「tracked screen left the layout」重锚到画板矩形（日志 11-26 03:12:13 实锤）→ 光环窗被摆到「画板坐标解释的 CG 位置」`(-2350,-27)`，两块真实显示器均不覆盖（CGWindowList：`onscreen=true` 但落在死区，肉眼不可见），此后所有切换都停在错误坐标上。**23dd6b0 采样看到的「y=6032、屏底 6102」正是画板坐标**（当时画板屏底 = 5120+982），旧复盘归因于 norm 投影出屏只说对了一半——更深一层是整套坐标空间错位。
+- **同族连带缺陷（一并修复）**：
+  1. region 提交光标 warp 落点 `(-1524,534)` 同样出屏；且 `board_to_native` 把 Retina `scale=2.0` 乘进本应 points 恒等的换算（warp.rs 文档自己写明 "On macOS scale is 1"）——转头落点/光标跳转验收项长期不过的第二层根因。
+  2. mac 窗口枚举假设「CG == 画板」直接透传帧（`windows_layer/macos.rs`），分叉后命中测试点空间与帧空间错位，dwell 切窗/候选边框跟着错。
+  3. 校准向导 badge（`halo_screen_cal_begin`）同拿画板当 native，分叉后向导徽标飞出屏。
+- 接收侧 `halo_focus_screens_with_native_geometry` 早已是正确模式（注释原话 "Board coordinates are not native desktop coordinates"），**引擎路径漏改**——本次修复就是把引擎四条路径拉回同一契约。
+
+**修复（分支 `feature/halo-screen-warp`，基于 main `2170fad`）**
+
+- 引擎屏幕表 / 初始几何 / P0 测试钩子 / 校准 badge 统一「board(画布) + native(检测)」规范对，且 tracking 几何与对应 entry 字节相等（杜绝首帧 `SetScreens` 误判重锚）；
+- mac 窗口枚举帧经 `native_rect_to_logical` 转画板空间（Windows 语义不变）；
+- 新增 `halo_geometry_scale`：mac 的 native/board 比率恒 1.0（CG points），修 warp/land 的 2× 偏移；Windows DPI 透传不变。
+- 验证：619 测试全绿（+3：画板分叉、tracking==entry、scale 契约）；装机后连续 `save_layout` **无 re-anchoring 日志**、CGWindowList 复核光环窗 `onscreen=true` 且落在内建屏内并随视线移动。
+
+**验收要点**
+
+1. 扭头切到本机另一块屏 / 对端屏：光环始终可见；切到对端屏时停靠共享边缘，回看即刻滑回注视点。
+2. region 提交的光标跳转落在目标屏内（不再出屏/落错屏）。
+3. 保存布局、拔插屏后光环不消失。
+4. **前置**：当前校准因拓扑变化（11-26 又换了外接屏组合）被门控（日志 `multi-screen switching suspended until recalibration`），需先跑一遍多屏校准向导恢复 region 切换——向导各屏徽标应显示在对应物理屏正确位置（badge 修复的验收点）。
+
+**关联**：BUG-007（拔插屏是画板分叉/平移量变化的触发源）、BUG-005（macOS 27 窗口可见性家族，取证方法沿用 CGWindowList 差分）。
+
+---
+
 ## 变更记录
 
 | 日期 | 变更 |
@@ -275,3 +314,4 @@
 | 2026-11-18 | BUG-003/004 定位并修复（`fad8272`，分支 `fix/layout-crossing-overlap`）→ 待验收；BUG-002 补分支考证结论（复现构建不含修复，属旧问题）；BUG-001 补真机取证方案 |
 | 2026-11-18 | 登记 BUG-005（点选磁贴光圈在 Mac 外接屏不显示），定位为透明 WebView 跨显示器移动不重绘，修复改双端原生窗口（`494b2e8`，分支 `fix/native-screen-flash`）→ 待验收 |
 | 2026-11-25 | 登记 BUG-007（拔插孪生扩展屏后「显示器布局」两屏顺序变化、穿越出错），疑似 BUG-006 复现/未覆盖场景，待确认复现构建后并入或升级 |
+| 2026-11-26 | 登记 BUG-008（Halo 光环扭头/保存后消失），定位为画板坐标被当 CG 原生坐标（分叉至少自 11-07 存在），修复引擎几何走 board+native 规范对 + mac 枚举转画板 + scale 契约（分支 `feature/halo-screen-warp`）→ 待验收 |
