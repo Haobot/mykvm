@@ -1163,6 +1163,15 @@ fn run_loop(
     overlay.set_screen(state.screen);
     probe.set_keyboard_suspends(state.settings.keyboard_suspends);
     overlay.set_ring_visible(state.settings.show_halo);
+    log::info!(
+        "halo engine: run_loop start show_halo={} diameter={} screen=({},{},{}x{})",
+        state.settings.show_halo,
+        state.settings.halo_diameter,
+        state.screen.x,
+        state.screen.y,
+        state.screen.width,
+        state.screen.height
+    );
     // S3: the overlay is re-hosted only when the tracked screen actually
     // changes (region switch or a SetScreen command) — deduplication by
     // geometry equality keeps unchanged ticks at zero set_screen calls.
@@ -1268,6 +1277,7 @@ fn run_loop(
 
     // Clear the border unconditionally: shutdown can happen mid-candidate,
     // and the border window must not outlive the pipeline.
+    log::info!("halo engine: run_loop exit; hiding overlay");
     overlay.set_border(None);
     overlay.hide();
 }

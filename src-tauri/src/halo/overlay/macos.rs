@@ -437,6 +437,33 @@ extern "C" fn create_and_show(ctx: *mut c_void) {
         }
         if RING_VISIBLE.load(Ordering::Relaxed) {
             send(window, sel(b"orderFrontRegardless\0"));
+            log::info!("halo ring: create_and_show ordered front (window={window:p})");
+            // macOS 27 compositing quirk (same family as border_reveal /
+            // badge_reveal): a freshly built status-level window can miss the
+            // composited list on its first order; re-assert once on a later
+            // main-queue turn. One-shot: create_and_show runs once per
+            // window build.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                on_main(ring_order_reassert, std::ptr::null_mut());
+            });
+        } else {
+            log::info!("halo ring: create_and_show skipped order-front (RING_VISIBLE=false)");
+        }
+    }
+}
+
+/// One-shot delayed re-order for the macOS 27 fresh-window compositing quirk
+/// (see the spawn site in [`create_and_show`]).
+extern "C" fn ring_order_reassert(_ctx: *mut c_void) {
+    let window = WINDOW.load(Ordering::Relaxed) as *mut c_void;
+    if window.is_null() {
+        return;
+    }
+    unsafe {
+        if RING_VISIBLE.load(Ordering::Relaxed) {
+            send(window, sel(b"orderFrontRegardless\0"));
+            log::info!("halo ring: delayed order re-assert done (window={window:p})");
         }
     }
 }
@@ -448,13 +475,16 @@ extern "C" fn create_and_show(ctx: *mut c_void) {
 extern "C" fn ring_order_front_or_out(_ctx: *mut c_void) {
     let window = WINDOW.load(Ordering::Relaxed) as *mut c_void;
     if window.is_null() {
+        log::info!("halo ring: order_front_or_out no-op (window not built yet)");
         return;
     }
     unsafe {
         if RING_VISIBLE.load(Ordering::Relaxed) {
             send(window, sel(b"orderFrontRegardless\0"));
+            log::info!("halo ring: orderFrontRegardless (window={window:p})");
         } else {
             send1(window, sel(b"orderOut:\0"), std::ptr::null_mut());
+            log::info!("halo ring: orderOut (window={window:p})");
         }
     }
 }
@@ -465,6 +495,7 @@ extern "C" fn order_out(_ctx: *mut c_void) {
         unsafe {
             send1(window, sel(b"orderOut:\0"), std::ptr::null_mut());
         }
+        log::info!("halo ring: hide() ordered out (window={window:p})");
     }
 }
 
@@ -557,6 +588,16 @@ pub(crate) unsafe fn make_click_through_window(rect: NsRect) -> (*mut c_void, *m
     let set_behavior: extern "C" fn(*mut c_void, *mut c_void, u64) =
         std::mem::transmute(objc_msgSend as *const ());
     set_behavior(window, sel(b"setCollectionBehavior:\0"), 1 | 16);
+    // macOS 27 lesson: numeric setters get set+readback verification — a
+    // silently dropped collectionBehavior pins the ring to the space it was
+    // ordered into, which reads as "the halo vanished" whenever the user
+    // switches Space (the user runs ~29 spaces).
+    let get_behavior: extern "C" fn(*mut c_void, *mut c_void) -> u64 =
+        std::mem::transmute(objc_msgSend as *const ());
+    let behavior = get_behavior(window, sel(b"collectionBehavior\0"));
+    log::info!(
+        "halo ring: collectionBehavior={behavior:#x} (want 0x11 canJoinAllSpaces|stationary)"
+    );
 
     // Layer-backed content view.
     let view_alloc = send(cls(b"NSView\0"), sel(b"alloc\0"));
