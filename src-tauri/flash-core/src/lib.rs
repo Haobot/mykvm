@@ -560,14 +560,16 @@ mod windows_imp {
     unsafe fn pick_monitor(target: (f64, f64, f64, f64)) -> Option<(RECT, f64)> {
         let (tx, ty, tw, th) = target;
         let mut monitors: Vec<(HMONITOR, RECT, f64)> = Vec::new();
-        let list = Box::into_raw(Box::new(&mut monitors));
+        // 直接传 &mut monitors 的裸指针：EnumDisplayMonitors 是同步回调，
+        // 栈借用活到调用返回。曾误用 Box::into_raw(Box::new(&mut monitors))
+        // 把「装着引用的 8 字节堆单元」当 *mut Vec 传入，回调按 24 字节
+        // Vec 头解读越界堆内存，push 写野指针 0xc0000005。
         EnumDisplayMonitors(
             std::ptr::null_mut(),
             std::ptr::null(),
             Some(enum_monitor),
-            list as LPARAM,
+            &mut monitors as *mut Vec<(HMONITOR, RECT, f64)> as LPARAM,
         );
-        drop(Box::from_raw(list));
         monitors
             .into_iter()
             .map(|(_, rc, scale)| {
@@ -794,6 +796,44 @@ mod windows_imp {
             assert!(pixels.iter().any(|p| *p >> 24 > 0), "峰值脉冲必须画出像素");
             paint_glow(&mut pixels, 60, 60, 1.0, 0.0);
             assert!(pixels.iter().all(|p| *p == 0), "零脉冲必须清掉上一帧");
+        }
+
+        /// 回归（2026-11-26 配对后 0xc0000005）：pick_monitor 曾把
+        /// `Box::into_raw(Box::new(&mut monitors))`（一个装着引用的 8 字节
+        /// 堆单元）直接当 `*mut Vec` 传给回调，回调按 24 字节 Vec 头解读，
+        /// cap/len 读到越界堆垃圾，push 写 `垃圾指针 + 垃圾长度*32` 直接
+        /// 访问违规。必须直接传 `&mut monitors` 的裸指针（EnumDisplayMonitors
+        /// 是同步回调，栈借用活到调用返回）。
+        #[test]
+        fn pick_monitor_hits_a_real_monitor() {
+            // 先用正确指针姿势枚举一次，拿到真实显示器的逻辑矩形。
+            let mut probes: Vec<(HMONITOR, RECT, f64)> = Vec::new();
+            unsafe {
+                EnumDisplayMonitors(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    Some(enum_monitor),
+                    &mut probes as *mut Vec<(HMONITOR, RECT, f64)> as LPARAM,
+                );
+            }
+            let Some((_, rc, scale)) = probes.into_iter().next() else {
+                return; // 无显示器环境没有可断言的对象
+            };
+            let rect = (
+                f64::from(rc.left) / scale,
+                f64::from(rc.top) / scale,
+                f64::from(rc.right - rc.left) / scale,
+                f64::from(rc.bottom - rc.top) / scale,
+            );
+
+            let (hit_rc, hit_scale) =
+                unsafe { pick_monitor(rect) }.expect("pick_monitor 必须命中已知存在的显示器");
+            assert_eq!(
+                (hit_rc.left, hit_rc.top, hit_rc.right, hit_rc.bottom),
+                (rc.left, rc.top, rc.right, rc.bottom),
+                "必须返回喂进去的那块显示器"
+            );
+            assert_eq!(hit_scale, scale, "DPI scale 必须一致");
         }
     }
 }
