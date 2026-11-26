@@ -80,8 +80,9 @@ const TRANSPORT_PORT_MAX: u16 = 65_535;
 // ports starting from the configured base, so two peers that landed on different
 // ports (e.g. 47833 and 47834) still reach each other.
 const DISCOVERY_PORT_SPAN: u16 = 8;
-const REPOSITORY_URL: &str = "https://github.com/XxMinor/mykvm";
-const RELEASES_URL: &str = "https://github.com/XxMinor/mykvm/releases/latest";
+const REPOSITORY_URL: &str = "https://github.com/Haobot/mykvm";
+// 下载与宣传页：dl.davenger.cloud（腾讯云 COS 静态站），更新清单与安装包都从这里分发。
+const RELEASES_URL: &str = "https://dl.davenger.cloud/mykvm/";
 const DISCOVERY_PROTOCOL: &str = "mykvm.discovery.v1";
 // UDP discovery is a heartbeat, not the transport itself. Keep peers through
 // short announce gaps so online clients do not flicker offline in the UI.

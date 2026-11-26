@@ -1,5 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
-import { APP_VERSION, RELEASES_URL, REPOSITORY_URL } from './constants'
+import { APP_VERSION, DOWNLOAD_PAGE_URL, REPOSITORY_URL } from './constants'
 import { defaultLayout } from './defaultLayout'
 import {
   agentChannelAuditVia,
@@ -511,7 +511,7 @@ export async function openRepositoryUrl(): Promise<void> {
 
 export async function openUpdateReleasePage(): Promise<void> {
   if (!isTauri()) {
-    window.open(RELEASES_URL, '_blank', 'noopener,noreferrer')
+    window.open(DOWNLOAD_PAGE_URL, '_blank', 'noopener,noreferrer')
     return
   }
 

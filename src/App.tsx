@@ -4093,7 +4093,7 @@ function App() {
                     onClick={openUpdateDownloads}
                     disabled={updateStatus === "installing"}
                   >
-                    {ui.settings.openReleases}
+                    {ui.settings.openDownloadPage}
                   </button>
                 </div>
               </section>

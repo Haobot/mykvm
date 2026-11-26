@@ -6,10 +6,10 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 
 Linux builds are available, but Linux keyboard/mouse capture and injection are not implemented yet ([#11](https://github.com/XxMinor/mykvm/issues/11), [#31](https://github.com/XxMinor/mykvm/issues/31)).
 
-[![Download](https://img.shields.io/github/v/release/XxMinor/mykvm?label=Download&style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
-[![Stars](https://img.shields.io/github/stars/XxMinor/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/stargazers)
-[![Forks](https://img.shields.io/github/forks/XxMinor/mykvm?label=Forks&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/forks)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-2786ff?style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
+[![Download](https://img.shields.io/github/v/release/Haobot/mykvm?label=Download&style=for-the-badge)](https://dl.davenger.cloud/mykvm/)
+[![Stars](https://img.shields.io/github/stars/Haobot/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/Haobot/mykvm/stargazers)
+[![Forks](https://img.shields.io/github/forks/Haobot/mykvm?label=Forks&logo=github&style=for-the-badge)](https://github.com/Haobot/mykvm/forks)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-2786ff?style=for-the-badge)](https://dl.davenger.cloud/mykvm/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](./LICENSE)
 [![LINUX DO](https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+&style=for-the-badge)](https://linux.do/)
 [![XQAPI](https://img.shields.io/badge/XQAPI-AI-2786FF.svg?logo=data%3aimage%2fpng%3bbase64%2ciVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2f9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAACkElEQVQ4EZVTTUhUURT%2b3pvne%2fPn5MZo1Ewc1MUMJE1t8o9oHZQTBQpty8pdQbQp6Fcq%2bqEoopD%2bFoW%2f7YoWiaUoTjALNQMHrLHAmphxGuf33du5V2coCMID591zz%2fnOd8859z4Fa8I5LyHTnclkNMMweMH%2f50oxhXBmOGz95vUq2WIsl8vtZIyNMpPFSRNkSzVNMyH35DOFfzUWp%2fj7VCrVKgmI0c1Mc4HWdQmRRFaiK1Uqnb5HUdVq8H9WXayyaAgcqaIolVqp1q4JQwRFukI6MDiM5y%2f6yMHQ2dkBi6ri8dNntGUIBNpx8MB%2byicCgVcsVRqtjFQw4sHDXvQ%2beoLTp07C0A2cu3AJ2Vye9ifgdDpx%2fmIPfkSjONZ1WKSQECu1cEY0H4vFeHPbbv5xbo4z2g8ODfOpYJBHIos8nU7z%2fv4BPjY%2bzptadvFo9KdI4ZR7WV1lAggIh8OBhvp6TExMYt%2feAEZGRlFZWYFXr99Q%2bQHMzMzC7d5E2Mhamooigd1uRz7PSPOwGgacZWVwuVwSaLdZYXVsgE5tpdIZCGxBigTV1ZvhKnXg7r37aGzcivF3b7Hw%2bQuuXL2OtrZWBCfHsLT0nUhKUFOzZS2fQREz0DTtrPDMz4dx5Gi3bMXQdVg0TU4%2fm82SbUF8OYHbN6%2bhrq5OwEW1PeIWZBU0E3g8tXg51Iep4AeEQiF4amuhWjRMT09jx3Y%2f%2fP5tsnyBFbdGqapGzzVGFch7FQGbzYaW5iZsLC%2fHjVt3wMw8uo93wefziUPlG5AGfWhmMSwvpxvonccpeV1CB%2f9KJBJeSZZKZTrobS%2bS%2fpdEYEi%2f0s90SCSLRqQkk8kKXdcbAJoW8gX3Xyt1SmXDpMF%2foqtcFMHfSC7T5ZzIvHoAAAAASUVORK5CYII%3d&style=for-the-badge)](https://xqapi.com/)
@@ -26,7 +26,7 @@ Linux builds are available, but Linux keyboard/mouse capture and injection are n
 
 ## Quick Start
 
-1. **Install on both machines.** Download the installer for each OS from the [latest release](https://github.com/XxMinor/mykvm/releases/latest).
+1. **Install on both machines.** Download the installer for each OS from the [download page](https://dl.davenger.cloud/mykvm/).
 2. **Pick roles.** On the machine whose keyboard and mouse you want to share, open MyKVM and keep **Server** mode (the default). On the other machine, open MyKVM and switch to **Client** mode in Settings.
 3. **Connect.** On the same LAN the two find each other automatically. Otherwise open **Devices**, type the other machine's IP (optionally `IP:port`), and click **Add**. Only devices that report their screen info join the layout.
 4. **Arrange screens.** Open **Layout** and drag the monitors so their touching edges match how they sit on your desk.
@@ -66,11 +66,11 @@ Linux builds are available, but Linux keyboard/mouse capture and injection are n
 - Provides light, dark, and system theme modes.
 - Includes English and Simplified Chinese UI.
 - Supports tray behavior for hiding and restoring the main window.
-- Checks GitHub Releases and updates itself in place.
+- Checks the download site for updates and updates itself in place.
 
 ## Current Status
 
-MyKVM is an experimental early release. It is useful for local testing and iteration, but it is not hardened for untrusted networks. See the [Releases page](https://github.com/XxMinor/mykvm/releases) for the current version and installers.
+MyKVM is an experimental early release. It is useful for local testing and iteration, but it is not hardened for untrusted networks. See the [download page](https://dl.davenger.cloud/mykvm/) for the current version and installers.
 
 - License: MIT
 - Default ports: UDP `47833` (discovery) and UDP `47834` (QUIC transport)
@@ -184,7 +184,7 @@ git commit -m "feat: initial desktop release"
 git push origin main
 ```
 
-The workflow creates the git tag, builds macOS, Windows, and Linux bundles, then publishes a GitHub Release with the generated installers.
+The workflow creates the git tag, builds macOS, Windows, and Linux bundles, publishes a GitHub Release, and mirrors the installers to the download site (`dl.davenger.cloud/mykvm`).
 
 ## Project Layout
 

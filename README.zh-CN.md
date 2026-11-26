@@ -6,10 +6,10 @@
 
 Linux 提供安装包，但 Linux 键鼠采集和注入尚未实现（[#11](https://github.com/XxMinor/mykvm/issues/11)、[#31](https://github.com/XxMinor/mykvm/issues/31)）。
 
-[![下载](https://img.shields.io/github/v/release/XxMinor/mykvm?label=%E4%B8%8B%E8%BD%BD&style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
-[![Stars](https://img.shields.io/github/stars/XxMinor/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/stargazers)
-[![Forks](https://img.shields.io/github/forks/XxMinor/mykvm?label=Forks&logo=github&style=for-the-badge)](https://github.com/XxMinor/mykvm/forks)
-[![平台](https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-2786ff?style=for-the-badge)](https://github.com/XxMinor/mykvm/releases/latest)
+[![下载](https://img.shields.io/github/v/release/Haobot/mykvm?label=%E4%B8%8B%E8%BD%BD&style=for-the-badge)](https://dl.davenger.cloud/mykvm/)
+[![Stars](https://img.shields.io/github/stars/Haobot/mykvm?label=Stars&logo=github&style=for-the-badge)](https://github.com/Haobot/mykvm/stargazers)
+[![Forks](https://img.shields.io/github/forks/Haobot/mykvm?label=Forks&logo=github&style=for-the-badge)](https://github.com/Haobot/mykvm/forks)
+[![平台](https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-2786ff?style=for-the-badge)](https://dl.davenger.cloud/mykvm/)
 [![许可证: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](./LICENSE)
 [![LINUX DO](https://img.shields.io/badge/LINUX-DO-FFB003.svg?logo=data:image/svg%2bxml;base64,DQo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiPjxwYXRoIGQ9Ik00Ni44Mi0uMDU1aDYuMjVxMjMuOTY5IDIuMDYyIDM4IDIxLjQyNmM1LjI1OCA3LjY3NiA4LjIxNSAxNi4xNTYgOC44NzUgMjUuNDV2Ni4yNXEtMi4wNjQgMjMuOTY4LTIxLjQzIDM4LTExLjUxMiA3Ljg4NS0yNS40NDUgOC44NzRoLTYuMjVxLTIzLjk3LTIuMDY0LTM4LjAwNC0yMS40M1EuOTcxIDY3LjA1Ni0uMDU0IDUzLjE4di02LjQ3M0MxLjM2MiAzMC43ODEgOC41MDMgMTguMTQ4IDIxLjM3IDguODE3IDI5LjA0NyAzLjU2MiAzNy41MjcuNjA0IDQ2LjgyMS0uMDU2IiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZWNlY2VjO2ZpbGwtb3BhY2l0eToxIi8+PHBhdGggZD0iTTQ3LjI2NiAyLjk1N3EyMi41My0uNjUgMzcuNzc3IDE1LjczOGE0OS43IDQ5LjcgMCAwIDEgNi44NjcgMTAuMTU3cS00MS45NjQuMjIyLTgzLjkzIDAgOS43NS0xOC42MTYgMzAuMDI0LTI0LjM4N2E2MSA2MSAwIDAgMSA5LjI2Mi0xLjUwOCIgc3R5bGU9InN0cm9rZTpub25lO2ZpbGwtcnVsZTpldmVub2RkO2ZpbGw6IzE5MTkxOTtmaWxsLW9wYWNpdHk6MSIvPjxwYXRoIGQ9Ik03Ljk4IDcwLjkyNmMyNy45NzctLjAzNSA1NS45NTQgMCA4My45My4xMTNRODMuNDI2IDg3LjQ3MyA2Ni4xMyA5NC4wODZxLTE4LjgxIDYuNTQ0LTM2LjgzMi0xLjg5OC0xNC4yMDMtNy4wOS0yMS4zMTctMjEuMjYyIiBzdHlsZT0ic3Ryb2tlOm5vbmU7ZmlsbC1ydWxlOmV2ZW5vZGQ7ZmlsbDojZjlhZjAwO2ZpbGwtb3BhY2l0eToxIi8+PC9zdmc+&style=for-the-badge)](https://linux.do/)
 [![XQAPI](https://img.shields.io/badge/XQAPI-AI-2786FF.svg?logo=data%3aimage%2fpng%3bbase64%2ciVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2f9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAACkElEQVQ4EZVTTUhUURT%2b3pvne%2fPn5MZo1Ewc1MUMJE1t8o9oHZQTBQpty8pdQbQp6Fcq%2bqEoopD%2bFoW%2f7YoWiaUoTjALNQMHrLHAmphxGuf33du5V2coCMID591zz%2fnOd8859z4Fa8I5LyHTnclkNMMweMH%2f50oxhXBmOGz95vUq2WIsl8vtZIyNMpPFSRNkSzVNMyH35DOFfzUWp%2fj7VCrVKgmI0c1Mc4HWdQmRRFaiK1Uqnb5HUdVq8H9WXayyaAgcqaIolVqp1q4JQwRFukI6MDiM5y%2f6yMHQ2dkBi6ri8dNntGUIBNpx8MB%2byicCgVcsVRqtjFQw4sHDXvQ%2beoLTp07C0A2cu3AJ2Vye9ifgdDpx%2fmIPfkSjONZ1WKSQECu1cEY0H4vFeHPbbv5xbo4z2g8ODfOpYJBHIos8nU7z%2fv4BPjY%2bzptadvFo9KdI4ZR7WV1lAggIh8OBhvp6TExMYt%2feAEZGRlFZWYFXr99Q%2bQHMzMzC7d5E2Mhamooigd1uRz7PSPOwGgacZWVwuVwSaLdZYXVsgE5tpdIZCGxBigTV1ZvhKnXg7r37aGzcivF3b7Hw%2bQuuXL2OtrZWBCfHsLT0nUhKUFOzZS2fQREz0DTtrPDMz4dx5Gi3bMXQdVg0TU4%2fm82SbUF8OYHbN6%2bhrq5OwEW1PeIWZBU0E3g8tXg51Iep4AeEQiF4amuhWjRMT09jx3Y%2f%2fP5tsnyBFbdGqapGzzVGFch7FQGbzYaW5iZsLC%2fHjVt3wMw8uo93wefziUPlG5AGfWhmMSwvpxvonccpeV1CB%2f9KJBJeSZZKZTrobS%2bS%2fpdEYEi%2f0s90SCSLRqQkk8kKXdcbAJoW8gX3Xyt1SmXDpMF%2foqtcFMHfSC7T5ZzIvHoAAAAASUVORK5CYII%3d&style=for-the-badge)](https://xqapi.com/)
@@ -26,7 +26,7 @@ Linux 提供安装包，但 Linux 键鼠采集和注入尚未实现（[#11](http
 
 ## 快速开始
 
-1. **两台机器都安装。** 从 [最新发布](https://github.com/XxMinor/mykvm/releases/latest) 下载各自系统的安装包。
+1. **两台机器都安装。** 从 [下载页](https://dl.davenger.cloud/mykvm/) 下载各自系统的安装包。
 2. **选择角色。** 在要共享键鼠的那台机器上打开 MyKVM，保持 **服务端**（默认）。在另一台机器上打开 MyKVM，到设置里切换为 **客户端**。
 3. **建立连接。** 同一局域网下两台会自动发现。否则打开 **设备**，输入对方 IP（可加 `IP:端口`），点 **添加**。只有上报了屏幕信息的设备才会加入布局。
 4. **排列屏幕。** 打开 **布局**，拖动各显示器，让相邻边缘和它们在桌面上的实际位置一致。
@@ -66,11 +66,11 @@ Linux 提供安装包，但 Linux 键鼠采集和注入尚未实现（[#11](http
 - 支持浅色、深色和跟随系统主题。
 - 支持英文和简体中文界面。
 - 支持托盘隐藏和恢复主窗口。
-- 支持检查 GitHub Release 并原地自动更新。
+- 支持检查下载站更新并原地自动更新。
 
 ## 当前状态
 
-MyKVM 是一个实验性的早期版本，适合在本地可信网络中测试和迭代，但还没有面向不可信网络做生产级加固。当前版本和安装包见 [Releases 页面](https://github.com/XxMinor/mykvm/releases)。
+MyKVM 是一个实验性的早期版本，适合在本地可信网络中测试和迭代，但还没有面向不可信网络做生产级加固。当前版本和安装包见 [下载页](https://dl.davenger.cloud/mykvm/)。
 
 - 许可证：MIT
 - 默认端口：UDP `47833`（发现）和 UDP `47834`（QUIC 传输）
@@ -184,7 +184,7 @@ git commit -m "feat: initial desktop release"
 git push origin main
 ```
 
-工作流会自动创建 git tag，构建 macOS、Windows 和 Linux 安装包，然后发布到 GitHub Release。
+工作流会自动创建 git tag，构建 macOS、Windows 和 Linux 安装包，发布到 GitHub Release，并镜像同步到下载站（`dl.davenger.cloud/mykvm`）。
 
 ## 项目结构
 
