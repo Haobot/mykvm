@@ -8,8 +8,10 @@
 //! logical coordinate math) so every decision rule is unit-tested here on any
 //! host. Coordinates everywhere are the layout board's logical space —
 //! identical to `OverlayScreenGeometry` (`x, y, width, height`, origin top
-//! left); on macOS CG global points already match that space (identity), on
-//! Windows [`native_rect_to_logical`] converts physical pixels per screen.
+//! left); both platform backends convert their native frames into that space
+//! through [`native_rect_to_logical`] (macOS CG points need only the
+//! per-screen origin pair — identity while board == native; Windows adds the
+//! DPI scale).
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;

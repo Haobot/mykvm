@@ -3,9 +3,13 @@
 //! Accessibility fallback for titles (`AXWindows` matched by frame), and
 //! NSWorkspace for the frontmost pid plus pid-to-app-name resolution.
 //!
-//! CG global points already are the layout board's logical coordinates (same
-//! top-left origin, 1 pt units), so frames pass through unchanged — the same
-//! identity convention the P0 overlay uses. The raw objc_msgSend style is the
+//! CG global points and the layout board share the same unit (points,
+//! top-left origin) but not necessarily the same origin: the canvas keeps its
+//! arranged positions across display re-detection, so board and CG drift
+//! apart after display churn. Every enumerated frame is therefore converted
+//! through the screen set (`native_rect_to_logical`, identity while the two
+//! still agree) — the same board-space contract the Windows backend honors.
+//! The raw objc_msgSend style is the
 //! `input_guard_macos.rs` / overlay precedent; a live desktop integration
 //! test sits at the bottom (`cargo test --lib -- --ignored`).
 
@@ -24,7 +28,9 @@ use core_graphics::window::{
     kCGWindowOwnerPID,
 };
 
-use super::{CachedService, ForegroundMatch, RawEnumerator, RawWindow, WindowCache};
+use super::{
+    native_rect_to_logical, CachedService, ForegroundMatch, RawEnumerator, RawWindow, WindowCache,
+};
 use crate::halo::overlay::OverlayScreenGeometry;
 
 /// Collect at most this many on-screen candidates (z-order top first) before
@@ -417,10 +423,11 @@ impl MacOSWindowService {
 impl RawEnumerator for MacOSWindowService {
     fn enumerate_raw(
         &mut self,
-        _screens: &[OverlayScreenGeometry],
+        screens: &[OverlayScreenGeometry],
     ) -> Result<(Vec<RawWindow>, ForegroundMatch), String> {
-        // macOS frames pass through: CG global points == layout-board logical
-        // coordinates, so the screen set is only used by the pure filter.
+        // CG frames are collected as-is below (the AX title pass matches them
+        // against CG-space AX frames) and converted into board space just
+        // before returning — see the module header.
         let array = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
             .ok_or_else(|| "CGWindowListCopyWindowInfo returned no array".to_string())?;
         unsafe {
@@ -523,6 +530,14 @@ impl RawEnumerator for MacOSWindowService {
             }
 
             objc_autoreleasePoolPop(pool);
+            // Board contract: `WindowInfo::frame` is layout-board logical.
+            // CG global points equal board space only while the canvas still
+            // mirrors the live arrangement; after display churn they differ
+            // by a constant translation, which is exactly when a pass-through
+            // would misplace every hit-test and candidate border.
+            for window in &mut raw {
+                window.frame = native_rect_to_logical(window.frame, screens);
+            }
             Ok((raw, ForegroundMatch::Process(frontmost_pid)))
         }
     }

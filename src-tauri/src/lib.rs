@@ -2105,21 +2105,26 @@ fn save_layout(
                 saved_layout.focus_halo.enabled
             );
         }
-    } else if let Ok(mut halo) = state.halo.lock() {
-        // S3: the saved layout can also change this machine's screen list,
-        // so the engine's region-switch targets follow the saved topology
-        // in both branches (the multi-screen calibration itself rides
-        // inside SetSettings). `halo_engine_settings` additionally gates a
-        // stale calibration (topology changed since capture) out of the
-        // engine in both branches.
-        halo.set_screens(halo_screen_entries(&saved_layout));
-        let gated = halo_engine_settings(&saved_layout.focus_halo, &saved_layout);
-        if halo.is_running() {
-            // Parameters take effect immediately on save while tracking runs.
-            halo.set_settings(gated);
-        } else {
-            // Disabled: just refresh the snapshot the P0 test overlay reads.
-            halo.configure(gated);
+    } else {
+        // Native snapshot first: lock order everywhere is native/layout
+        // before the halo lock (see the contract above).
+        let native_layout = state.native_layout();
+        if let Ok(mut halo) = state.halo.lock() {
+            // S3: the saved layout can also change this machine's screen list,
+            // so the engine's region-switch targets follow the saved topology
+            // in both branches (the multi-screen calibration itself rides
+            // inside SetSettings). `halo_engine_settings` additionally gates
+            // a stale calibration (topology changed since capture) out of the
+            // engine in both branches.
+            halo.set_screens(halo_screen_entries(&saved_layout, &native_layout));
+            let gated = halo_engine_settings(&saved_layout.focus_halo, &saved_layout);
+            if halo.is_running() {
+                // Parameters take effect immediately on save while tracking runs.
+                halo.set_settings(gated);
+            } else {
+                // Disabled: just refresh the snapshot the P0 test overlay reads.
+                halo.configure(gated);
+            }
         }
     }
     Ok(state.snapshot())
@@ -2143,6 +2148,27 @@ fn halo_native_origin(screen: &Screen) -> (f64, f64) {
     (screen.x as f64, screen.y as f64)
 }
 
+/// Native-units-per-board-unit ratio for an [`halo::OverlayScreenGeometry`],
+/// the `scale` contract `warp.rs` documents (`native = origin + local *
+/// scale`). On macOS both spaces are CG points, so the ratio is 1 —
+/// `Screen.scale` there is the Retina backing factor (2.0) and must not leak
+/// into coordinate mapping (it used to double every warp offset). Windows
+/// keeps the DPI factor (logical board → physical pixels); other hosts pass
+/// the sanitized value through so cross-platform tests stay host-neutral.
+#[cfg(target_os = "macos")]
+fn halo_geometry_scale(_screen: &Screen) -> f64 {
+    1.0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn halo_geometry_scale(screen: &Screen) -> f64 {
+    if screen.scale.is_finite() && screen.scale > 0.0 {
+        screen.scale
+    } else {
+        1.0
+    }
+}
+
 /// P0 manual test hook: draw one halo frame on a detected local screen at a
 /// screen-local logical point. The configure call first refreshes the
 /// diameter/opacity snapshot so this entry point follows the user's settings.
@@ -2164,12 +2190,30 @@ fn halo_test_overlay_show(
         .and_then(|device| device.screens.iter().find(|screen| screen.id == screen_id))
         .ok_or_else(|| format!("screen {screen_id} not found on this machine"))?;
     let (native_x, native_y) = halo_native_origin(screen);
+    // Canonical geometry contract (same as halo_focus_screens_with_native_geometry):
+    // x/y are the arranged layout-board origin, native_* the live CG origin.
+    // The board pair can diverge from CG after display churn (the canvas
+    // keeps user/arranged positions across re-detection), so it is looked up
+    // on the saved layout instead of assuming identity.
+    let board = {
+        let layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        layout
+            .devices
+            .iter()
+            .flat_map(|device| device.screens.iter())
+            .find(|candidate| candidate.id == screen_id)
+            .map(|candidate| (candidate.x as f64, candidate.y as f64))
+    };
+    let (board_x, board_y) = board.unwrap_or((screen.x as f64, screen.y as f64));
     let geometry = halo::OverlayScreenGeometry {
-        x: screen.x as f64,
-        y: screen.y as f64,
+        x: board_x,
+        y: board_y,
         width: screen.width as f64,
         height: screen.height as f64,
-        scale: screen.scale,
+        scale: halo_geometry_scale(screen),
         native_x,
         native_y,
     };
@@ -2234,11 +2278,30 @@ fn halo_test_overlay_hide(state: tauri::State<'_, AppRuntime>) -> Result<(), Str
 // releases before the next acquisition.
 // ---------------------------------------------------------------------------
 
-/// Resolve the overlay geometry for the tracking engine: the local device's
-/// primary screen (or its first screen as fallback), converted with the same
-/// origin rule as the P0 test overlay.
+/// Resolve the overlay geometry for the tracking engine (lock wrapper around
+/// [`halo_tracking_geometry_from`]).
 fn halo_tracking_geometry(state: &AppRuntime) -> Result<halo::OverlayScreenGeometry, String> {
     let native_layout = state.native_layout();
+    let layout = state
+        .layout
+        .lock()
+        .map_err(|_| "layout state lock poisoned".to_string())?;
+    halo_tracking_geometry_from(&layout, &native_layout)
+}
+
+/// Engine initial geometry in the canonical contract: board x/y from the
+/// arranged layout, native origin/size/scale from the live detected topology
+/// — the same two sources [`halo_screen_entries`] builds entries from, so the
+/// initial `state.screen` is byte-equal to its own entry. Divergence here
+/// made the first `SetScreens` believe the tracked screen had left the layout
+/// and re-anchor onto a board-only rectangle: with board ≠ CG (display churn
+/// keeps canvas positions) the ring window then sat at board coordinates
+/// interpreted as CG global — off every display, i.e. "the halo disappeared
+/// after turning my head".
+fn halo_tracking_geometry_from(
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+) -> Result<halo::OverlayScreenGeometry, String> {
     let device = native_layout
         .devices
         .iter()
@@ -2251,12 +2314,22 @@ fn halo_tracking_geometry(state: &AppRuntime) -> Result<halo::OverlayScreenGeome
         .or_else(|| device.screens.first())
         .ok_or_else(|| "FocusHalo: no local screen detected on this machine".to_string())?;
     let (native_x, native_y) = halo_native_origin(screen);
+    // Board origin by id from the saved canvas; a canvas that no longer
+    // lists the screen (stale edge) falls back to the native origin, which
+    // is exactly the pre-correction behavior for that case.
+    let (board_x, board_y) = layout
+        .devices
+        .iter()
+        .flat_map(|device| device.screens.iter())
+        .find(|candidate| candidate.id == screen.id)
+        .map(|candidate| (candidate.x as f64, candidate.y as f64))
+        .unwrap_or((screen.x as f64, screen.y as f64));
     Ok(halo::OverlayScreenGeometry {
-        x: screen.x as f64,
-        y: screen.y as f64,
+        x: board_x,
+        y: board_y,
         width: screen.width as f64,
         height: screen.height as f64,
-        scale: screen.scale,
+        scale: halo_geometry_scale(screen),
         native_x,
         native_y,
     })
@@ -2280,7 +2353,7 @@ fn halo_focus_screens(layout: &LayoutState) -> Vec<halo::FocusScreen> {
                     y: screen.y as f64,
                     width: screen.width as f64,
                     height: screen.height as f64,
-                    scale: screen.scale,
+                    scale: halo_geometry_scale(screen),
                     native_x,
                     native_y,
                 },
@@ -2311,7 +2384,7 @@ fn halo_focus_screens_with_native_geometry(
         let (native_x, native_y) = halo_native_origin(native);
         focus.geometry.width = native.width as f64;
         focus.geometry.height = native.height as f64;
-        focus.geometry.scale = native.scale;
+        focus.geometry.scale = halo_geometry_scale(native);
         focus.geometry.native_x = native_x;
         focus.geometry.native_y = native_y;
     }
@@ -2319,9 +2392,15 @@ fn halo_focus_screens_with_native_geometry(
 }
 
 /// All of this machine's screens as engine `ScreenEntry`s (S3): the same
-/// enumeration as [`halo_focus_screens`], minus the P4 `FocusScreen` wrapper.
-fn halo_screen_entries(layout: &LayoutState) -> Vec<halo::ScreenEntry> {
-    halo_focus_screens(layout)
+/// enumeration as [`halo_focus_screens`], minus the P4 `FocusScreen` wrapper,
+/// with the native correction applied — the engine's screen list feeds both
+/// overlay hosting (`native_*`) and board-space hit-testing (`x/y`), so it
+/// must carry the canonical board+native pair just like the receive path.
+fn halo_screen_entries(
+    layout: &LayoutState,
+    native_layout: &LayoutState,
+) -> Vec<halo::ScreenEntry> {
+    halo_focus_screens_with_native_geometry(layout, native_layout)
         .into_iter()
         .map(|screen| halo::ScreenEntry {
             screen_id: screen.id,
@@ -2421,6 +2500,9 @@ fn apply_halo_enabled(state: &AppRuntime, enabled: bool) -> Result<String, Strin
     // Settings + screen entries in one layout hold: `halo_engine_settings`
     // also gates a stale multi-screen calibration out of the engine (the
     // topology flag lives in lib because the engine cannot see peers).
+    // Native layout is snapshotted first (lock order: native → layout → halo)
+    // so the entries carry the canonical board+native pair.
+    let native_layout = state.native_layout();
     let (settings, screen_entries) = {
         let layout = state
             .layout
@@ -2428,7 +2510,7 @@ fn apply_halo_enabled(state: &AppRuntime, enabled: bool) -> Result<String, Strin
             .map_err(|_| "layout state lock poisoned".to_string())?;
         (
             halo_engine_settings(&layout.focus_halo, &layout),
-            halo_screen_entries(&layout),
+            halo_screen_entries(&layout, &native_layout),
         )
     };
     let geometry = halo_tracking_geometry(state)?;
@@ -3331,7 +3413,10 @@ fn screen_cal_progress(state: &ScreenCalWizardState) -> HaloScreenCalProgress {
 fn halo_screen_cal_begin(
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<Vec<HaloScreenCalPlanItem>, String> {
-    // 1. Layout snapshot (layout lock taken alone).
+    // 1. Layout snapshot (native lock first, then layout — the repo lock
+    // order; the badge geometries need the live CG origin of each screen
+    // because the canvas can have drifted from it after display churn).
+    let native_layout = state.native_layout();
     let (plan, badge_screens, badge_indices) = {
         let layout = state
             .layout
@@ -3356,7 +3441,20 @@ fn halo_screen_cal_begin(
                 badge_indices.push(None);
                 continue;
             }
-            let (native_x, native_y) = halo_native_origin(&source.screen);
+            // Canonical pair: board x/y from the canvas, native origin from
+            // the live detection (identity only while the two still agree).
+            let native_screen = native_layout
+                .devices
+                .iter()
+                .filter(|device| device.role == "local")
+                .flat_map(|device| device.screens.iter())
+                .find(|candidate| candidate.id == source.screen.id);
+            let (native_x, native_y) = native_screen
+                .map(halo_native_origin)
+                .unwrap_or_else(|| halo_native_origin(&source.screen));
+            let scale = native_screen
+                .map(halo_geometry_scale)
+                .unwrap_or_else(|| halo_geometry_scale(&source.screen));
             badge_indices.push(Some(badge_screens.len()));
             badge_screens.push(halo::BadgeScreen {
                 geometry: halo::OverlayScreenGeometry {
@@ -3364,7 +3462,7 @@ fn halo_screen_cal_begin(
                     y: source.screen.y as f64,
                     width: source.screen.width as f64,
                     height: source.screen.height as f64,
-                    scale: source.screen.scale,
+                    scale,
                     native_x,
                     native_y,
                 },
@@ -7986,8 +8084,10 @@ fn refresh_local_screens(app: &AppHandle) {
         // strand a stale multi-screen calibration in the engine (or make a
         // stored one valid again), and the gate in `halo_engine_settings`
         // needs the layout to decide.
+        // Native snapshot before the halo lock (lock order: native → halo).
+        let native_layout = state.native_layout();
         if let Ok(mut halo) = state.halo.lock() {
-            halo.set_screens(halo_screen_entries(&snapshot));
+            halo.set_screens(halo_screen_entries(&snapshot, &native_layout));
             let gated = halo_engine_settings(&snapshot.focus_halo, &snapshot);
             if halo.is_running() {
                 halo.set_settings(gated);
@@ -14682,7 +14782,14 @@ mod tests {
         let two = screens[1].geometry;
         assert_eq!((two.x, two.y), (-2480.0, -2160.0));
         assert_eq!((two.native_x, two.native_y), native_two_origin);
-        assert_eq!((two.width, two.height, two.scale), (1920.0, 1280.0, 1.25));
+        assert_eq!((two.width, two.height), (1920.0, 1280.0));
+        // `scale` is the native-per-board ratio, not the Retina backing
+        // factor: Windows converts logical board → physical pixels with the
+        // DPI factor, macOS maps points → points (always 1.0).
+        #[cfg(target_os = "macos")]
+        assert_eq!(two.scale, 1.0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(two.scale, 1.25);
     }
 
     #[test]
@@ -19010,7 +19117,11 @@ mod tests {
         layout.devices = vec![test_device("local-device", "local", "local", false)];
         layout.devices[0].screens =
             vec![wizard_screen("left", 0, 0), wizard_screen("right", 1920, 0)];
-        let entries = halo_screen_entries(&layout);
+        let mut native = test_layout();
+        native.devices = vec![test_device("local-device", "local", "local", false)];
+        native.devices[0].screens =
+            vec![wizard_screen("left", 0, 0), wizard_screen("right", 1920, 0)];
+        let entries = halo_screen_entries(&layout, &native);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].screen_id, "left");
         assert_eq!(entries[0].geometry.x, 0.0);
@@ -19018,6 +19129,57 @@ mod tests {
         assert_eq!(entries[1].geometry.x, 1920.0);
         // Native origins are the identity on non-Windows (macOS points).
         assert_eq!(entries[1].geometry.native_x, 1920.0);
+    }
+
+    /// The canvas can drift from the live topology (display churn keeps the
+    /// arranged positions while detection reports the real CG rects — the
+    /// user-visible "halo disappears after turning my head" bug). Entries and
+    /// the tracking geometry must then carry the canonical pair: board x/y
+    /// for hit-testing, native origin for overlay/warp hosting — and be
+    /// byte-equal so the first `SetScreens` never treats the tracked screen
+    /// as having left the layout.
+    #[test]
+    fn halo_screen_entries_and_tracking_survive_board_native_divergence() {
+        let mut layout = test_layout();
+        layout.devices = vec![test_device("local-device", "local", "local", false)];
+        layout.devices[0].screens = vec![wizard_screen("left", -3036, -448)];
+        let mut native = test_layout();
+        native.devices = vec![test_device("local-device", "local", "local", false)];
+        native.devices[0].screens = vec![wizard_screen("left", 0, 0)];
+
+        let entries = halo_screen_entries(&layout, &native);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].geometry.x, -3036.0, "board origin stays canvas");
+        assert_eq!(
+            entries[0].geometry.native_x, 0.0,
+            "native origin from detection"
+        );
+
+        let tracking = halo_tracking_geometry_from(&layout, &native).expect("tracking geometry");
+        assert_eq!(
+            tracking, entries[0].geometry,
+            "initial state.screen must equal its own entry (no re-anchor)"
+        );
+    }
+
+    /// macOS maps points → points: the Retina backing factor stored in
+    /// `Screen.scale` must never become the geometry's native-per-board ratio
+    /// (it used to double every warp offset).
+    #[test]
+    fn halo_geometry_scale_is_native_per_board_ratio() {
+        let screen = wizard_screen("left", 0, 0);
+        #[cfg(target_os = "macos")]
+        assert_eq!(halo_geometry_scale(&screen), 1.0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(halo_geometry_scale(&screen), 1.0);
+        let hidpi = Screen {
+            scale: 2.5,
+            ..wizard_screen("hidpi", 0, 0)
+        };
+        #[cfg(target_os = "macos")]
+        assert_eq!(halo_geometry_scale(&hidpi), 1.0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(halo_geometry_scale(&hidpi), 2.5);
     }
 
     // ---- S4: remote switch target resolution ----
