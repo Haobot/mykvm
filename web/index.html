@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MyKVM — 一套键鼠，跨机共享</title>
+<meta name="description" content="MyKVM 在同一局域网内的 Mac 与 Windows 之间共享键盘、鼠标和剪贴板。不需要 KVM 硬件，也不用插线。">
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-soft: #151b25;
+    --card: #1a2230;
+    --border: #2a3446;
+    --text: #e8edf5;
+    --text-dim: #9fb0c3;
+    --accent: #2786ff;
+    --accent-strong: #4d9bff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent-strong); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* Hero */
+  header {
+    padding: 96px 0 72px;
+    background: radial-gradient(1200px 480px at 50% -10%, rgba(39, 134, 255, 0.22), transparent 70%);
+    text-align: center;
+  }
+  .eyebrow {
+    display: inline-block;
+    padding: 4px 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-dim);
+    font-size: 13px;
+    letter-spacing: 0.12em;
+    margin-bottom: 22px;
+  }
+  h1 { font-size: clamp(30px, 5vw, 52px); line-height: 1.25; font-weight: 700; }
+  .lede {
+    max-width: 720px;
+    margin: 20px auto 0;
+    color: var(--text-dim);
+    font-size: clamp(16px, 2.2vw, 19px);
+  }
+  .cta { margin-top: 36px; display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 13px 26px;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 600;
+    border: 1px solid transparent;
+    transition: filter 0.15s ease, background 0.15s ease;
+    cursor: pointer;
+  }
+  .btn:hover { text-decoration: none; filter: brightness(1.1); }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-ghost { background: transparent; color: var(--text); border-color: var(--border); }
+  .version { margin-top: 16px; color: var(--text-dim); font-size: 14px; }
+  .version strong { color: var(--text); font-weight: 600; }
+  .note { margin-top: 10px; color: var(--text-dim); font-size: 13px; }
+
+  /* Sections */
+  section { padding: 64px 0; }
+  section h2 { font-size: clamp(22px, 3vw, 30px); text-align: center; margin-bottom: 12px; }
+  .section-lede { text-align: center; color: var(--text-dim); max-width: 640px; margin: 0 auto 40px; }
+
+  /* Features */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 24px;
+  }
+  .card h3 { font-size: 17px; margin-bottom: 8px; }
+  .card p { color: var(--text-dim); font-size: 14.5px; }
+  .card .icon { font-size: 22px; margin-bottom: 12px; display: block; }
+
+  /* Screenshots */
+  .hero-shot { width: 100%; border-radius: 14px; border: 1px solid var(--border); display: block; }
+  .shots {
+    margin-top: 18px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 18px;
+  }
+  .shots img { width: 100%; border-radius: 12px; border: 1px solid var(--border); display: block; }
+  .shots figcaption { text-align: center; color: var(--text-dim); font-size: 13px; margin-top: 8px; }
+
+  /* Steps */
+  .steps { counter-reset: step; display: grid; gap: 14px; max-width: 760px; margin: 0 auto; }
+  .step {
+    counter-increment: step;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 22px 18px 62px;
+    position: relative;
+  }
+  .step::before {
+    content: counter(step);
+    position: absolute;
+    left: 18px; top: 16px;
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 14px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step h3 { font-size: 16px; margin-bottom: 2px; }
+  .step p { color: var(--text-dim); font-size: 14.5px; }
+
+  /* Permissions */
+  .perm { max-width: 760px; margin: 0 auto; display: grid; gap: 12px; }
+  .perm li {
+    list-style: none;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    font-size: 14.5px;
+    color: var(--text-dim);
+  }
+  .perm li strong { color: var(--text); }
+
+  /* Footer */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 36px 0 48px;
+    color: var(--text-dim);
+    font-size: 14px;
+    text-align: center;
+  }
+  footer .links { margin-bottom: 10px; display: flex; gap: 22px; justify-content: center; flex-wrap: wrap; }
+
+  @media (max-width: 640px) {
+    header { padding: 64px 0 48px; }
+    .cta .btn { width: 100%; justify-content: center; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <span class="eyebrow">局域网键鼠共享 · 免 KVM 硬件</span>
+    <h1>一套键盘、一只鼠标、<br>一份剪贴板</h1>
+    <p class="lede">
+      在同一局域网内的 Mac 与 Windows 之间共享。把光标推出屏幕边缘，
+      它就落到下一台机器上，键盘随之切换，剪贴板自动同步——不需要 KVM 硬件，也不用插线。
+    </p>
+    <div class="cta">
+      <a class="btn btn-primary" id="dl-windows" href="https://github.com/Haobot/mykvm/releases/latest">下载 Windows 版</a>
+      <a class="btn btn-ghost" id="dl-macos" href="https://github.com/Haobot/mykvm/releases/latest">下载 macOS 版</a>
+      <a class="btn btn-ghost" href="https://github.com/Haobot/mykvm">查看源码</a>
+    </div>
+    <p class="version" id="version-line" hidden>当前版本 <strong id="version"></strong></p>
+    <p class="note">macOS 版为免费自签名，首次打开请右键 → 打开。仅限可信局域网使用。</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>为什么选 MyKVM</h2>
+    <p class="section-lede">软件即可用的 KVM：延迟低、配置少、开箱即用。</p>
+    <div class="grid">
+      <div class="card">
+        <span class="icon">🖱️</span>
+        <h3>跨屏切换</h3>
+        <p>光标推出屏幕边缘即落到下一台机器，键盘自动跟随。按住 Alt（=Command）长按还能触发对端微信输入法语音。</p>
+      </div>
+      <div class="card">
+        <span class="icon">📋</span>
+        <h3>剪贴板同步</h3>
+        <p>文本、图片、HTML、RTF 双向自动同步，复制即得，无需额外操作。</p>
+      </div>
+      <div class="card">
+        <span class="icon">📁</span>
+        <h3>文件拖拽</h3>
+        <p>两端开启文件传输后，复制的文件或文件夹自动传到另一台电脑，在资源管理器或 Finder 直接粘贴（单个上限 2 GiB）。</p>
+      </div>
+      <div class="card">
+        <span class="icon">🔒</span>
+        <h3>加密直连</h3>
+        <p>输入与剪贴板走 QUIC / TLS 1.3 加密连接，证书锁定对端，局域网内直连，不经任何中转服务器。</p>
+      </div>
+      <div class="card">
+        <span class="icon">🖥️</span>
+        <h3>多显示器布局</h3>
+        <p>自动发现各机屏幕，拖拽排列让相邻边缘与桌面实际位置一致，多屏也能顺畅穿越。</p>
+      </div>
+      <div class="card">
+        <span class="icon">🌏</span>
+        <h3>双语双主题</h3>
+        <p>中英文界面，浅色 / 深色 / 跟随系统主题，托盘常驻、开机自启。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>界面预览</h2>
+    <p class="section-lede">拖出屏幕边缘的那一刻，两台机器就成了一台。</p>
+    <img class="hero-shot" src="assets/tour.gif" alt="MyKVM 跨机演示">
+    <div class="shots">
+      <figure>
+        <img src="assets/layout.png" alt="显示器布局">
+        <figcaption>显示器布局：拖拽排列各机屏幕</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/devices.png" alt="连接设备">
+        <figcaption>连接设备：局域网自动发现</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/settings.png" alt="设置">
+        <figcaption>设置：角色、剪贴板、文件传输</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>快速开始</h2>
+    <p class="section-lede">两台机器、几分钟、五步搞定。</p>
+    <div class="steps">
+      <div class="step">
+        <h3>两台机器都安装</h3>
+        <p>从本页下载对应系统的安装包，Mac 和 Windows 各装一份。</p>
+      </div>
+      <div class="step">
+        <h3>选择角色</h3>
+        <p>共享谁的键鼠，谁保持「服务端」（默认）；另一台在设置里切换为「客户端」。</p>
+      </div>
+      <div class="step">
+        <h3>建立连接</h3>
+        <p>同一局域网自动发现。否则打开「设备」，输入对方 IP（可加端口）点添加。</p>
+      </div>
+      <div class="step">
+        <h3>排列屏幕</h3>
+        <p>打开「布局」，拖动各显示器，让相邻边缘和实际桌面位置一致。</p>
+      </div>
+      <div class="step">
+        <h3>跨屏切换</h3>
+        <p>把光标推出相邻边缘，它就切到另一台机器；键盘跟随，复制粘贴双向可用。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>权限与须知</h2>
+    <ul class="perm">
+      <li><strong>macOS（服务端）：</strong>在 系统设置 → 隐私与安全性 中授予「辅助功能」和「输入监控」，捕获与注入键鼠输入必需。更新后授权会保留；万一掉了，关掉再打开即可。</li>
+      <li><strong>macOS 首次打开：</strong>版本为免费自签名（未经 Apple 公证），首次会被 Gatekeeper 拦截。右键应用 → 打开 → 打开，放行一次即可。</li>
+      <li><strong>Windows：</strong>常规使用无需特殊权限；只有需要控制管理员窗口时才以管理员身份运行。</li>
+      <li><strong>安全边界：</strong>配对验证码与证书绑定已支持，但发现通道仍是明文。请勿把端口暴露到公网或不可信网络。</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/Haobot/mykvm">GitHub 仓库</a>
+      <a href="https://github.com/Haobot/mykvm/blob/main/CHANGELOG.md">更新日志</a>
+      <a href="https://github.com/Haobot/mykvm/blob/main/LICENSE">MIT 许可证</a>
+    </div>
+    <p>MyKVM · 开源软件，欢迎 Issue 与 PR。</p>
+  </div>
+</footer>
+
+<script>
+  // 下载按钮与版本号由同目录 downloads.json 渲染（每次发版由发布脚本生成）。
+  // 清单缺失时降级到 GitHub Releases，保证页面始终可用。
+  (function () {
+    var fallback = 'https://github.com/Haobot/mykvm/releases/latest';
+    fetch('downloads.json')
+      .then(function (res) { return res.ok ? res.json() : Promise.reject(new Error('missing')); })
+      .then(function (data) {
+        var files = data.files || {};
+        if (data.version) {
+          document.getElementById('version').textContent = 'v' + data.version;
+          document.getElementById('version-line').hidden = false;
+        }
+        if (files['windows-setup']) {
+          document.getElementById('dl-windows').href = files['windows-setup'];
+        }
+        if (files['macos-dmg']) {
+          document.getElementById('dl-macos').href = files['macos-dmg'];
+        }
+      })
+      .catch(function () {
+        document.getElementById('dl-windows').href = fallback;
+        document.getElementById('dl-macos').href = fallback;
+      });
+  })();
+</script>
+
+</body>
+</html>
