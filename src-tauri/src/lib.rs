@@ -1437,8 +1437,13 @@ impl AppRuntime {
                     // WiFi 未连时把整表设备误删。
                     if local_addresses_ready {
                         let mut probe_targets: Vec<String> = Vec::new();
+                        // 守卫快照先于 layout 锁取（与 sync_layout_peer_presence
+                        // 相同的 peers→layout 顺序，不嵌套持锁）。
+                        let peer_snapshot = active_peer_snapshot(&peers);
                         if let Ok(mut layout) = layout_state.lock() {
-                            let (probes, removals) = offline_tracker.evaluate(&layout.devices);
+                            let guarded = guarded_offline_device_ids(&layout, &peer_snapshot);
+                            let (probes, removals) =
+                                offline_tracker.evaluate(&layout.devices, &guarded);
                             for device_id in &probes {
                                 let Some(device) =
                                     layout.devices.iter().find(|device| &device.id == device_id)
@@ -12346,6 +12351,35 @@ fn log_unmatched_devices(layout: &LayoutState, peers: &[LanPeer]) {
     }
 }
 
+/// 离线删除守卫：peer 表里存在同名或同 host 的可见 peer 时，该设备不算
+/// 「消失」——机器在网，只是身份失配（证书/集群漂移，即上面
+/// "peer visible but device unmatched" 的场景），该走重新配对修复而不是
+/// 删除。与 weak_device_match 刻意不同：这里不做 cluster/pairing 门控，
+/// 那些门控正是失配的成因。返回受守卫的设备 id 集合。
+fn guarded_offline_device_ids(layout: &LayoutState, peers: &[LanPeer]) -> HashSet<String> {
+    let mut guarded = HashSet::new();
+    if peers.is_empty() {
+        return guarded;
+    }
+    for device in layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+    {
+        let device_name = device.name.trim().to_ascii_lowercase();
+        let visible = peers.iter().any(|peer| {
+            let peer_name = peer.name.trim().to_ascii_lowercase();
+            (!device_name.is_empty() && device_name == peer_name)
+                || same_host(&device.host, &peer.host)
+                || same_host(&device.host, &peer.ip)
+        });
+        if visible {
+            guarded.insert(device.id.clone());
+        }
+    }
+    guarded
+}
+
 /// Rewrites a device id and cascades every reference to it: the device entry,
 /// its screens (ids and `device_id`), the active device and the selected
 /// screen. Screen placement (x/y) is preserved via prefix replacement of the
@@ -16362,6 +16396,34 @@ mod tests {
         assert!(unmatched_warn_due("dev-a", 1_000 + 30_000, &mut last));
         // 另一设备独立限频。
         assert!(unmatched_warn_due("dev-b", 1_001, &mut last));
+    }
+
+    /// 离线删除守卫：同名或同 host 的可见 peer 在场 = 机器在网只是身份失配，
+    /// 设备 id 进守卫集合（evaluate 按在线处理）；不相干 peer 不守卫。
+    #[test]
+    fn offline_guard_catches_visible_lookalike_peers() {
+        let layout = test_layout();
+
+        // 空 peer 表 = 无证据，不守卫。
+        assert!(guarded_offline_device_ids(&layout, &[]).is_empty());
+
+        // 同名 peer（test_peer name=Client == 设备名）→ 守卫远端设备。
+        let guarded = guarded_offline_device_ids(&layout, &[test_peer()]);
+        assert!(guarded.contains("peer-client-10-0-0-2"));
+        assert!(!guarded.contains("local-device"), "本地设备不进守卫");
+
+        // 同 host 不同名：peer 名改掉，但 host 仍命中设备 host。
+        let mut renamed = test_peer();
+        renamed.name = "Other box".into();
+        let guarded = guarded_offline_device_ids(&layout, &[renamed]);
+        assert!(guarded.contains("peer-client-10-0-0-2"), "同 host 也守卫");
+
+        // 完全不相干的 peer：名称、host、ip 全不同 → 不守卫。
+        let mut stranger = test_peer();
+        stranger.name = "Someone else".into();
+        stranger.host = "other-box".into();
+        stranger.ip = "10.9.9.9".into();
+        assert!(guarded_offline_device_ids(&layout, &[stranger]).is_empty());
     }
 
     /// P1-2:时钟前跳超过保护窗口 → 跳过本轮删除;恢复正常后照常删除。
