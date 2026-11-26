@@ -218,6 +218,22 @@ export interface LayoutState {
   focusHalo?: FocusHaloSettings
   /** 跨机 Agent 通道配置；旧快照缺省时后端落默认（enabled=true, readonly）。 */
   agentChannel?: AgentChannelConfig
+  /**
+   * 后端所有：设备列表变更代数。后端每次改写 devices[]（换网档案切换、
+   * 离线自动删除、id 漂移 retarget）自增；save_layout 比对前端回传值，
+   * 不相等说明前端拿的是陈旧快照，其设备列表整体作废。
+   */
+  layoutRevision?: number
+  /** 后端所有：当前 devices[] 归属的网络档案键（接口+子网指纹）。 */
+  activeNetworkKey?: string
+  /** 后端所有：按网络分组记忆的远程设备列表。 */
+  networkProfiles?: Record<string, NetworkProfile>
+}
+
+/** 一个网络档案：该网络下留下的远程设备配置（不含 local/manual 设备）。 */
+export interface NetworkProfile {
+  devices: Device[]
+  savedAtMs?: number
 }
 
 export interface InputProtection {

@@ -33,6 +33,11 @@ export const defaultLayout: LayoutState = {
   modifierMap: { control: 'meta', alt: 'same', meta: 'control' },
   edgeSwitchHotkey: 'alt+shift+k',
   screenSwitchHotkeys: { left: 'alt+left', right: 'alt+right', up: 'alt+up', down: 'alt+down' },
+  // 后端所有的网络档案三件套：浏览器兜底布局里给安全空值，桌面端由
+  // load_app_state 覆盖为后端真实值（round-trip 原样回传）。
+  layoutRevision: 0,
+  activeNetworkKey: '',
+  networkProfiles: {},
   focusHalo: {
     enabled: false,
     dwellMs: 900,
